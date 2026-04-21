@@ -1,0 +1,57 @@
+# Local-only notes and secrets
+CLAUDE.md
+
+# Personal drafts
+email_to_sylvain.md
+
+# Captured media and diagnostic artifacts — regenerable, not worth versioning
+captures/
+*.h264
+*.mp4
+*.jpg
+*.jpeg
+*.png
+# (PDFs in repo root are reference docs and ARE tracked — see !*.pdf below)
+
+# Build outputs
+build/
+out/
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.obj
+*.d
+*.a
+
+# Downloaded vendor source / SDKs (large, fetched by build script)
+vendor/
+sdk/
+third_party/
+.deps/
+
+# Logs and transient runtime files
+*.log
+*.tmp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Keep the datasheet PDFs in the repo root
+!*.pdf
