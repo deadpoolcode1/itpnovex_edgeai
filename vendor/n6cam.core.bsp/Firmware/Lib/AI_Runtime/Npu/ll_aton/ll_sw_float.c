@@ -24,6 +24,7 @@
 #include <stdio.h>
 
 #include "ll_sw.h"
+#include "ll_sw_float.h"
 
 #include "ai_datatypes_internal.h"
 #include "ai_math_helpers.h"
@@ -64,8 +65,9 @@ static int helper_emit_shape_index_axis(int onnx_axis)
 
 //##########################################################################################
 /** Conv forward function */
-void ll_sw_forward_conv(Conv_sw_info *sw_info)
+void ll_sw_forward_conv(/* int processor, */ void *sw_info_struct)
 {
+  Conv_sw_info *sw_info = (Conv_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -140,8 +142,9 @@ void ll_sw_forward_conv(Conv_sw_info *sw_info)
 
 //##########################################################################################
 /** GEMM forward function */
-void ll_sw_forward_gemm(Gemm_sw_info *sw_info)
+void ll_sw_forward_gemm(/* int processor, */ void *sw_info_struct)
 {
+  Gemm_sw_info *sw_info = (Gemm_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -194,8 +197,9 @@ void ll_sw_forward_gemm(Gemm_sw_info *sw_info)
 
 //##########################################################################################
 /** MatMul forward function */
-void ll_sw_forward_matmul(Matmul_sw_info *sw_info)
+void ll_sw_forward_matmul(/* int processor, */ void *sw_info_struct)
 {
+  Matmul_sw_info *sw_info = (Matmul_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -237,8 +241,9 @@ void ll_sw_forward_matmul(Matmul_sw_info *sw_info)
 
 //##########################################################################################
 /** Resize forward function */
-void ll_sw_forward_resize(Resize_sw_info *sw_info)
+void ll_sw_forward_resize(/* int processor, */ void *sw_info_struct)
 {
+  Resize_sw_info *sw_info = (Resize_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -309,8 +314,10 @@ void ll_sw_forward_resize(Resize_sw_info *sw_info)
 
 //##########################################################################################
 /** Softmax forward function */
-void ll_sw_forward_softmax(Softmax_sw_info *sw_info)
+void ll_sw_forward_softmax(/* int processor, */ void *sw_info_struct)
 {
+  Softmax_sw_info *sw_info = (Softmax_sw_info *)sw_info_struct;
+
   // array init
   int32_t format = sw_info->general.input.format.is_signed ? (AI_ARRAY_FORMAT_S8 | AI_FMT_FLAG_IS_IO)
                                                            : (AI_ARRAY_FORMAT_U8 | AI_FMT_FLAG_IS_IO);
@@ -358,8 +365,9 @@ void ll_sw_forward_softmax(Softmax_sw_info *sw_info)
 
 //##########################################################################################
 /** activ forward function  */
-void ll_sw_forward_activ(Activ_sw_info *sw_info)
+void ll_sw_forward_activ(/* int processor, */ void *sw_info_struct)
 {
+  Activ_sw_info *sw_info = (Activ_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -678,8 +686,9 @@ void ll_sw_forward_activ(Activ_sw_info *sw_info)
 
 //##########################################################################################
 /** activ forward function  */
-void ll_sw_forward_arith(Arith_sw_info *sw_info)
+void ll_sw_forward_arith(/* int processor, */ void *sw_info_struct)
 {
+  Arith_sw_info *sw_info = (Arith_sw_info *)sw_info_struct;
   // array init
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
@@ -837,8 +846,9 @@ void ll_sw_forward_arith(Arith_sw_info *sw_info)
 
 //##########################################################################################
 /** pool forward function  */
-void ll_sw_forward_pool(Pool_sw_info *sw_info)
+void ll_sw_forward_pool(/* int processor, */ void *sw_info_struct)
 {
+  Pool_sw_info *sw_info = (Pool_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(pool_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -886,8 +896,9 @@ void ll_sw_forward_pool(Pool_sw_info *sw_info)
 
 //##########################################################################################
 /** Globalpool forward function  */
-void ll_sw_forward_global_pool(Global_pool_sw_info *sw_info)
+void ll_sw_forward_global_pool(/* int processor, */ void *sw_info_struct)
 {
+  Global_pool_sw_info *sw_info = (Global_pool_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(pool_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -932,8 +943,9 @@ void ll_sw_forward_global_pool(Global_pool_sw_info *sw_info)
 
 //##########################################################################################
 /** ArgMax forward function  */
-void ll_sw_forward_argmax(Argmax_sw_info *sw_info)
+void ll_sw_forward_argmax(/* int processor, */ void *sw_info_struct)
 {
+  Argmax_sw_info *sw_info = (Argmax_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(argmax_output_array, AI_ARRAY_FORMAT_S32, sw_info->general.output.mem.start_offset,
@@ -964,8 +976,9 @@ void ll_sw_forward_argmax(Argmax_sw_info *sw_info)
 
 //##########################################################################################
 /** Gather forward function  */
-void ll_sw_forward_gather(Gather_sw_info *sw_info)
+void ll_sw_forward_gather(/* int processor, */ void *sw_info_struct)
 {
+  Gather_sw_info *sw_info = (Gather_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(indexes_array, AI_ARRAY_FORMAT_S32, sw_info->operand.mem.start_offset,
@@ -1006,8 +1019,9 @@ void ll_sw_forward_gather(Gather_sw_info *sw_info)
 
 //##########################################################################################
 /** ArgMin forward function  */
-void ll_sw_forward_argmin(Argmin_sw_info *sw_info)
+void ll_sw_forward_argmin(/* int processor, */ void *sw_info_struct)
 {
+  Argmin_sw_info *sw_info = (Argmin_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(argmin_output_array, AI_ARRAY_FORMAT_S32, sw_info->general.output.mem.start_offset,
@@ -1038,8 +1052,9 @@ void ll_sw_forward_argmin(Argmin_sw_info *sw_info)
 
 //##########################################################################################
 /** Reduce forward function  */
-void ll_sw_forward_reduce(Reduce_sw_info *sw_info)
+void ll_sw_forward_reduce(/* int processor, */ void *sw_info_struct)
 {
+  Reduce_sw_info *sw_info = (Reduce_sw_info *)sw_info_struct;
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(reduce_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1113,8 +1128,10 @@ void ll_sw_forward_reduce(Reduce_sw_info *sw_info)
 
 //##########################################################################################
 /** Batch Norm forward function  */
-void ll_sw_forward_bn(Bn_sw_info *sw_info)
+void ll_sw_forward_bn(/* int processor, */ void *sw_info_struct)
 {
+  Bn_sw_info *sw_info = (Bn_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(bn_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1199,8 +1216,10 @@ void ll_sw_forward_bn(Bn_sw_info *sw_info)
 
 //##########################################################################################
 /** Instance Norm forward function  */
-void ll_sw_forward_instance_normalization(Instance_normalization_sw_info *sw_info)
+void ll_sw_forward_instance_normalization(/* int processor, */ void *sw_info_struct)
 {
+  Instance_normalization_sw_info *sw_info = (Instance_normalization_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(instanceNorm_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1251,8 +1270,10 @@ void ll_sw_forward_instance_normalization(Instance_normalization_sw_info *sw_inf
 
 //##########################################################################################
 /** Lp Norm forward function  */
-void ll_sw_forward_lpnormalization(Lpnormalization_sw_info *sw_info)
+void ll_sw_forward_lpnormalization(/* int processor, */ void *sw_info_struct)
 {
+  Lpnormalization_sw_info *sw_info = (Lpnormalization_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(lpNormm_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1285,8 +1306,10 @@ void ll_sw_forward_lpnormalization(Lpnormalization_sw_info *sw_info)
 
 //##########################################################################################
 /** Sign forward function  */
-void ll_sw_forward_sign(Sign_sw_info *sw_info)
+void ll_sw_forward_sign(/* int processor, */ void *sw_info_struct)
 {
+  Sign_sw_info *sw_info = (Sign_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(sign_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1318,8 +1341,10 @@ void ll_sw_forward_sign(Sign_sw_info *sw_info)
 
 //##########################################################################################
 /** LRN Local Response Normalization forward function  */
-void ll_sw_forward_lrn(Lrn_sw_info *sw_info)
+void ll_sw_forward_lrn(/* int processor, */ void *sw_info_struct)
 {
+  Lrn_sw_info *sw_info = (Lrn_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(LRN_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1357,8 +1382,10 @@ void ll_sw_forward_lrn(Lrn_sw_info *sw_info)
 
 //##########################################################################################
 /** Tile forward function  */
-void ll_sw_forward_tile(Tile_sw_info *sw_info)
+void ll_sw_forward_tile(/* int processor, */ void *sw_info_struct)
 {
+  Tile_sw_info *sw_info = (Tile_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(tile_output_array, FORMAT, sw_info->general.output.mem.start_offset,
@@ -1395,8 +1422,10 @@ void ll_sw_forward_tile(Tile_sw_info *sw_info)
 
 //##########################################################################################
 /** concat forward function  */
-void ll_sw_forward_concat(Concat_sw_info *sw_info)
+void ll_sw_forward_concat(/* int processor, */ void *sw_info_struct)
 {
+  Concat_sw_info *sw_info = (Concat_sw_info *)sw_info_struct;
+
   AI_ARRAY_OBJ_DECLARE(input_output_array, FORMAT, sw_info->general.input.mem.start_offset,
                        sw_info->general.input.mem.start_offset, sw_info->general.input.dim.num_elem, )
   AI_ARRAY_OBJ_DECLARE(concat_output_array, FORMAT, sw_info->general.output.mem.start_offset,

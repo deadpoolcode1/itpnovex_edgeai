@@ -53,7 +53,7 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        3U
+#define REGISTRY_VERSION        4U
 
 /* Wifi */
 #define WIFI_SSID_LEN           31U
@@ -146,6 +146,15 @@ typedef struct
   uint8_t   motion_sensitivity;   /* 0..100 */
   uint32_t  motion_no_motion_timeout_s;
 
+  /* V4 — safe-boot bootloop counter (flash-backed because TAMP + SRAM
+   * are both wiped on this kit's NVIC_SystemReset path). The shell task
+   * bumps it on boot, clears it after ~60 s of healthy uptime. If we
+   * reach BOOTLOOP_THRESHOLD before that healthy point, the previous
+   * boot(s) crashed before becoming healthy — typically nn_task hitting
+   * a bad model — and the App switches to safe mode (skip auto-detect)
+   * so the user can push a fix over CDC. */
+  uint8_t   boot_count;
+
 } t_registry_data;
 
 /*-------------------------------------------------------------------------*//**
@@ -188,6 +197,7 @@ const t_registry_data registry_defaults =
   .img_chroma                  = 0U,     /* 4:4:4 */
   .motion_sensitivity          = 50U,
   .motion_no_motion_timeout_s  = 30U,
+  .boot_count                  = 0U,
 
   /* Wifi */
   .wifi_mode            = 0U,

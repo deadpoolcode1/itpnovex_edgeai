@@ -322,6 +322,12 @@ static const t_lwshell_cmd  _shell_cmd[] = {
 static __ALIGN_BEGIN uint8_t _fwupd_app_buf  [FWUPD_APP_MAX_SIZE]   __ALIGN_END IN_PSRAM;
 static __ALIGN_BEGIN uint8_t _fwupd_model_buf[FWUPD_MODEL_MAX_SIZE] __ALIGN_END IN_PSRAM;
 
+/* Boot-guard threshold — after this many crash-reboots, App enters safe
+ * mode (NN auto-start suppressed). The counter is in the flash-backed
+ * registry (TAMP backup and SRAM_UNCACHED both wipe on this kit's
+ * NVIC_SystemReset path; flash is the only thing that actually persists). */
+#define BOOT_GUARD_THRESHOLD    3U
+
 /* CRC32 (zlib-compatible, poly 0xEDB88320, reflected). Software table-based;
  * vendor's bsp_crc is CRC-16-CCITT which won't match what `zlib.crc32` on the
  * host produces, so we roll our own here. */
@@ -427,16 +433,57 @@ void _shell_task_init(void)
     Error_Handler();
   }
 
-  /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) */
+  /* ── Safe-boot guard ───────────────────────────────────────────
+   *
+   * TAMP->BKP1R is a bootloop counter that survives reset. We bump it on
+   * every boot and clear it ~60 s later (see _shell_safe_boot_clear in
+   * the main loop). Threshold = 3 — three crashes in a row → don't
+   * auto-start NN so the kit stays reachable on CDC for the user to
+   * push a fix via 'update [app|model]'. No more SWD recoveries.
+   *
+   * IMPORTANT: TAMP backup-register access on STM32N6 requires
+   * HAL_PWR_EnableBkUpAccess() + RTC APB clock first — otherwise writes
+   * silently no-op and reads return 0.
+   */
+  uint8_t boot_n = 0U;
+  bool safe_mode = false;
+
+  /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) + bump
+   * bootloop counter under the same registry lock. */
   {
     t_registry_data *reg = registry_acquire();
     if (reg)
     {
       lwshell_echo_set(reg->shell_echo_enable != 0U);
-      nn_task_detect_set(reg->detect_enable != 0U);
+
+      /* Bump counter. */
+      boot_n = (uint8_t)(reg->boot_count + 1U);
+      reg->boot_count = boot_n;
+      safe_mode = (boot_n >= BOOT_GUARD_THRESHOLD);
+
+      bool persisted_detect = (reg->detect_enable != 0U);
+      nn_task_detect_set(safe_mode ? false : persisted_detect);
+      if (safe_mode)
+      {
+        LERROR(TRACE_SHELL,
+          "*** SAFE BOOT *** %u consecutive crash-reboots detected. "
+          "NN auto-start suppressed; issue 'detect start' explicitly to resume.",
+          (unsigned)boot_n);
+      }
+      else
+      {
+        LINFO(TRACE_SHELL, "Boot %u/%u — auto-detect=%d",
+              (unsigned)boot_n, (unsigned)BOOT_GUARD_THRESHOLD,
+              (int)persisted_detect);
+      }
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
       registry_release();
+      /* SYNCHRONOUS save — registry_request_save() only queues an event
+       * for the registry task, and a NN crash within the next ~tens of
+       * ms means the counter never lands in flash. Calling registry_save()
+       * directly here forces a flush before we proceed to NN init. */
+      (void)registry_save();
     }
   }
 
@@ -456,6 +503,13 @@ static void _shell_task_run(uint32_t args)
   /* Initialize task */
   _shell_task_init();
 
+  /* Healthy-boot watchdog: the shell task is now running; if we reach
+   * ~30 s of uptime without a reboot, clear the bootloop counter so the
+   * next reboot starts at 1 again. SHELL_UPDATE_TIMEOUT is ~100 ms per
+   * iteration → 300 iterations ≈ 30 s. */
+  uint32_t healthy_ticks = 0U;
+  const uint32_t HEALTHY_BOOT_TICKS = 300U;
+
   /* Shell task */
   while (1)
   {
@@ -464,6 +518,28 @@ static void _shell_task_run(uint32_t args)
     {
       _shell.update = false;
       lwshell_stream_change(_shell.stream);
+    }
+
+    /* Clear bootloop counter once we've clearly survived the danger zone. */
+    if (healthy_ticks <= HEALTHY_BOOT_TICKS)
+    {
+      healthy_ticks++;
+      if (healthy_ticks == HEALTHY_BOOT_TICKS)
+      {
+        t_registry_data *reg = registry_acquire();
+        if (reg && reg->boot_count != 0U)
+        {
+          LINFO(TRACE_SHELL, "Healthy boot reached at ~60 s; clearing bootloop counter (was %u)",
+                (unsigned)reg->boot_count);
+          reg->boot_count = 0U;
+          registry_release();
+          registry_request_save();
+        }
+        else if (reg)
+        {
+          registry_release();
+        }
+      }
     }
   }
 }

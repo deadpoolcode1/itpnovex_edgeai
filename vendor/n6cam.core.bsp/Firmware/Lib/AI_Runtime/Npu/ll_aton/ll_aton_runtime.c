@@ -58,7 +58,7 @@
 LL_ATON_WEAK void dump_dma_state(void){};
 
 /* Global variable for the current ATON IP owner */
-const NN_Instance_TypeDef *volatile __ll_current_aton_ip_owner = NULL;
+NN_Instance_TypeDef *volatile __ll_current_aton_ip_owner = NULL;
 #ifndef NDEBUG
 /* Current wait mask set */
 uint32_t volatile __ll_current_wait_mask = 0;
@@ -112,8 +112,9 @@ static inline void __LL_ATON_RT_ExecStartEpochBlock(const LL_ATON_RT_EpochBlockI
     __LL_ATON_RT_Start_AtoNN_Epoch(nn_instance);
   }
 
-  /* Grab ATON IP lock in case it's a HW epoch or an epoch blob */
-  if (EpochBlock_IsEpochPureHW(eb)) // epoch blobs are flagged as pure HW, so checking for epoch blob is not necessary
+  /* Grab ATON IP lock in case not a pure SW or internal epoch */
+  if (EpochBlock_IsEpochPureHW(eb) || // epoch blobs are flagged as pure HW, so checking for epoch blob is not necessary
+      EpochBlock_IsEpochHybrid(eb))
   {
     __ll_set_aton_owner(nn_instance);
   }
@@ -153,14 +154,14 @@ static inline void __LL_ATON_RT_ExecStartEpochBlock(const LL_ATON_RT_EpochBlockI
 #if defined(LL_ATON_RT_RELOC)
     if (nn_instance->exec_state.inst_reloc != 0)
     {
-      ai_rel_call_start_end_function(nn_instance->exec_state.inst_reloc, eb->start_epoch_block, eb, nn_instance);
+      ai_rel_call_start_end_function(nn_instance->exec_state.inst_reloc, eb->start_epoch_block, (const void *)eb);
     }
     else
     {
-      eb->start_epoch_block(eb, nn_instance);
+      eb->start_epoch_block((const void *)eb);
     }
 #else
-    eb->start_epoch_block(eb, nn_instance);
+    eb->start_epoch_block((const void *)eb);
 #endif
   }
 
@@ -232,28 +233,33 @@ static inline void __LL_ATON_RT_ExecEndEpochBlock(const LL_ATON_RT_EpochBlockIte
 #if defined(LL_ATON_RT_RELOC)
     if (nn_instance->exec_state.inst_reloc != 0)
     {
-      ai_rel_call_start_end_function(nn_instance->exec_state.inst_reloc, eb->end_epoch_block, eb, nn_instance);
+      ai_rel_call_start_end_function(nn_instance->exec_state.inst_reloc, eb->end_epoch_block, eb);
     }
     else
     {
-      eb->end_epoch_block(eb, nn_instance);
+      eb->end_epoch_block((const void *)eb);
     }
 #else
-    eb->end_epoch_block(eb, nn_instance);
+    eb->end_epoch_block((const void *)eb);
 #endif
   }
 
-  if (EpochBlock_IsEpochPureHW(eb)) // epoch blobs are flagged as pure HW, so checking for epoch blob is not necessary
+  /* Reset wait mask */
+  if (EpochBlock_IsEpochPureHW(eb) ||
+      EpochBlock_IsEpochInternal(eb)) // epoch blobs are flagged as pure HW, so checking for epoch blob is not necessary
   {
     LL_ATON_ASSERT(nn_instance == __ll_current_aton_ip_owner);
-
-    /* Reset wait mask */
     __LL_ATON_RT_SetWaitMask(0);
-
-    /* Release ATON IP lock in case it's a pure HW epoch */
-    __ll_clear_aton_owner(nn_instance, false);
   }
 
+  /* Release ATON IP lock in case it's a pure HW epoch */
+  if (EpochBlock_IsEpochPureHW(eb) || ((EpochBlock_IsEpochHybrid(eb) || EpochBlock_IsEpochInternal(eb)) &&
+                                       (nn_instance->exec_state.saved_current_epoch_block == NULL) &&
+                                       (nn_instance->exec_state.next_epoch_block ==
+                                        NULL))) /* hybrid has finished after that last part has been executed in SW */
+  {
+    __ll_clear_aton_owner(nn_instance, false);
+  }
   LL_ATON_ASSERT(EpochBlock_IsEpochInternal(eb) || EpochBlock_IsEpochHybrid(eb) ||
                  (__ll_current_aton_ip_owner != nn_instance));
 
@@ -682,7 +688,7 @@ LL_ATON_RT_RetValues_t LL_ATON_RT_RunEpochBlock(NN_Instance_TypeDef *nn_instance
       if (nn_instance->exec_state.saved_current_epoch_block != NULL)
       {
         /* return from inserted epoch block */
-        __LL_ATON_RT_RetFromLibEpochBlockArray(nn_instance);
+        __LL_ATON_RT_RetFromLibEpochBlockArray(true, nn_instance);
 
         /* advance epoch block */
         nn_instance->exec_state.current_epoch_block++;
@@ -927,7 +933,7 @@ static inline void __LL_ATON_RT_IrqEpochBlock(uint32_t irqs)
         _tmp_triggered_events |= (1 << i);
       }
     }
-    ((NN_Instance_TypeDef *)__ll_current_aton_ip_owner)->exec_state.triggered_events = _tmp_triggered_events;
+    __ll_current_aton_ip_owner->exec_state.triggered_events = _tmp_triggered_events;
   }
 }
 
@@ -949,7 +955,7 @@ static inline void __LL_ATON_RT_IrqEpochBlob(uint32_t irqs)
     /* Handle RT integration */
     uint32_t _tmp_triggered_events = __ll_current_aton_ip_owner->exec_state.triggered_events;
     _tmp_triggered_events |= (1 << ecId);
-    ((NN_Instance_TypeDef *)__ll_current_aton_ip_owner)->exec_state.triggered_events = _tmp_triggered_events;
+    __ll_current_aton_ip_owner->exec_state.triggered_events = _tmp_triggered_events;
   }
 }
 #endif // ATON_EPOCHCTRL_NUM
