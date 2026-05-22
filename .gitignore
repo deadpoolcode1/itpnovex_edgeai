@@ -11,6 +11,8 @@ captures/
 *.jpg
 *.jpeg
 *.png
+# Test images for the algorithm regression group ARE tracked — small, deterministic, NASA-PD + scikit-image samples
+!tests/images/*.jpg
 # (PDFs in repo root are reference docs and ARE tracked — see !*.pdf below)
 
 # Build outputs (catch-all)
