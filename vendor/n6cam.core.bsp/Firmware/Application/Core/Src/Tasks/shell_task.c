@@ -199,6 +199,19 @@ static int32_t  _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 static int32_t  _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Object detection (SoW §3.1, §4.2) */
 static int32_t  _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* Notifications (SoW §3.1, §4.2, §6) */
+static int32_t  _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+
+/* Notification numerator (rolls over at 0xFFFF per SoW §6). */
+static uint32_t _notify_num = 0U;
+
+/* Emit a JSON notification on the shell stream per SoW §6.
+ *   rsn — bitmask reason code
+ *   rsd — extra data (e.g., detected count)
+ *   mtn — motion state (0|1)
+ * Prefixed with '+SDVRNTF: ' so the host can parse it the same way it
+ * parses the modem-side URC once the modem is wired. */
+static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
 
 /* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
  * user can see the command landing during bring-up; the actual IR LED GPIO
@@ -262,6 +275,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
   {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query]" },
+  {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -577,6 +591,94 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   CMD_PRINTF(stream, "irled: %u%s", _irled_state ? 1U : 0U, lwshell_eol());
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
+}
+
+static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+{
+  t_datetime dt = { 0 };
+  (void)bsp_rtc_get_time(&dt);
+  /* 32-bit MCU UID low word as serial */
+  uint32_t ser = HAL_GetUIDw0();
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf),
+    "+SDVRNTF: {\"ser\":%lu,\"num\":%lu,\"rsn\":%lu,\"rsd\":%lu,"
+    "\"tim\":\"20%02u%02u%02u%02u%02u%02u\",\"mtn\":%u,"
+    "\"mod\":\"\",\"bat\":0.0,\"vol\":0.0}\r\n",
+    (unsigned long)ser, (unsigned long)_notify_num,
+    (unsigned long)rsn, (unsigned long)rsd,
+    (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day,
+    (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
+    mtn ? 1U : 0U);
+  if ((n > 0) && (_shell.stream != NULL))
+  {
+    stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+  }
+  _notify_num = (_notify_num + 1U) & 0xFFFFU;
+}
+
+/* SoW §3.1 / §4.2: notify enable <mask> | disable | trigger <code> |
+ *                  period <seconds> | query.
+ *
+ * Bitmask values (SoW §4.2):
+ *   x1   Network registration
+ *   x2   Motion Start
+ *   x4   Motion Stop
+ *   x8   Periodic
+ *   x10  People detected
+ *   x20  Vehicle detected
+ *
+ * 'trigger <code>' immediately emits a JSON notification with rsn=code.
+ * Periodic notifications wire into the system_task heartbeat later. */
+static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
+
+  if ((strcmp(sub, "enable") == 0) && (argc >= 3U))
+  {
+    unsigned long mask = strtoul((char*)argv[2], NULL, 0);
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->notify_enable_mask = (uint32_t)mask; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "notify enable: 0x%08lx%s", mask, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "disable") == 0)
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->notify_enable_mask = 0U; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "notify enable: 0x00000000%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if ((strcmp(sub, "trigger") == 0) && (argc >= 3U))
+  {
+    unsigned long code = strtoul((char*)argv[2], NULL, 0);
+    _notify_emit((uint32_t)code, 0U, false);
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if ((strcmp(sub, "period") == 0) && (argc >= 3U))
+  {
+    long s = atol((char*)argv[2]);
+    if (s < 0) return LWSHELL_ERROR_SYNTAX_CMD;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->notify_period_s = (uint32_t)s; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "notify period: %lds%s", s, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "query") == 0)
+  {
+    uint32_t m = 0U, p = 0U;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { m = reg->notify_enable_mask; p = reg->notify_period_s; registry_release(); }
+    CMD_PRINTF(stream, "notify: enable_mask=0x%08lx period=%lus num=%lu%s",
+               (unsigned long)m, (unsigned long)p, (unsigned long)_notify_num, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /* SoW §3.1 / §4.2: detect start | stop | profile <det_msk> <action_msk> |
