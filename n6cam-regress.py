@@ -42,6 +42,7 @@ CLASS_NAMES = {0: "person", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 # Regex parsers for the kit's shell replies
 RE_RUN_COUNT = re.compile(r"frame run:\s+(\d+)\s+detection")
+RE_NN_TIME   = re.compile(r"NN\s+([\d.]+)\s*ms")
 RE_BOX = re.compile(
     r"\[(\d+)\]\s+class=(-?\d+)\s+conf=([\d.]+)\s+bbox=\(([\d.]+),([\d.]+),([\d.]+),([\d.]+)\)"
 )
@@ -145,7 +146,9 @@ def run_inference(port):
             "conf": float(bm.group(3)),
             "bbox": tuple(float(bm.group(i)) for i in (4, 5, 6, 7)),
         })
-    return count, boxes, dt, reply
+    nn_m = RE_NN_TIME.search(reply)
+    nn_ms = float(nn_m.group(1)) if nn_m else None
+    return count, boxes, dt, nn_ms, reply
 
 
 def main() -> int:
@@ -170,7 +173,7 @@ def main() -> int:
 
     print(f"\nTesting {len(sources)} image(s) against {args.tty}")
     print("=" * 78)
-    print(f"{'image':40s} {'boxes':>6s} {'classes':>10s} {'lat_ms':>8s}")
+    print(f"{'image':40s} {'boxes':>6s} {'classes':>10s} {'wall':>8s} {'NN':>8s}")
     print("-" * 78)
 
     totals = {"images": 0, "detections": 0, "by_class": {}}
@@ -184,7 +187,7 @@ def main() -> int:
         if not ok:
             print(f"{src.name:40s}  UPLOAD-FAIL")
             continue
-        count, boxes, lat, raw = run_inference(port)
+        count, boxes, lat, nn_ms, raw = run_inference(port)
         per_cls = {}
         for b in boxes:
             per_cls[b['class']] = per_cls.get(b['class'], 0) + 1
@@ -192,7 +195,8 @@ def main() -> int:
             f"{CLASS_NAMES.get(c, str(c))}={n}"
             for c, n in sorted(per_cls.items())
         ) or "-"
-        print(f"{src.name:40s}  {count:>4d}  {cls_summary:>10s}  {lat:>6.1f}ms")
+        nn_str = f"{nn_ms:>6.1f}ms" if nn_ms is not None else "       -"
+        print(f"{src.name:40s}  {count:>4d}  {cls_summary:>10s}  {lat:>6.1f}ms  {nn_str}")
         totals["images"] += 1
         totals["detections"] += max(count, 0)
         for b in boxes:

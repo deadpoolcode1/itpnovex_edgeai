@@ -772,16 +772,17 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       return LWSHELL_OK;
     }
 
-    /* Route NN input to our test buffer and give it a few camera ticks to
-     * process. At ~22 Hz camera FPS, 250 ms ~= 5 NN cycles, more than
-     * enough to capture a few inference runs. */
+    /* Route NN input to our test buffer and give it ~2 camera ticks
+     * (~90 ms at 22 Hz) for at least one full inference to complete. */
     nn_task_set_test_frame(_frame_test_buf);
-    HAL_Delay(250);
+    HAL_Delay(100);
 
     uint32_t boxes = nn_task_get_box_count();
     t_nn_box  buf[NN_BOXES_MAX_NUM];
     uint32_t  got = nn_get_detections(buf);
-    CMD_PRINTF(stream, "frame run: %lu detection(s)%s", (unsigned long)boxes, lwshell_eol());
+    float nn_ms = stat_value(STAT_TIME_NN_TOTAL);
+    CMD_PRINTF(stream, "frame run: %lu detection(s), NN %.1fms%s",
+               (unsigned long)boxes, nn_ms, lwshell_eol());
     for (uint32_t i = 0; (i < got) && (i < 10U); i++)
     {
       CMD_PRINTF(stream, "  [%lu] class=%ld conf=%.2f bbox=(%.2f,%.2f,%.2f,%.2f)%s",
