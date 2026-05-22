@@ -102,15 +102,20 @@
 #define UART_RECOV_BUF_SIZE         32U
 #define UART_RECOV_MAGIC_STR        "recovery"
 
-/* Firmware self-updater: reads a new signed Application image over CDC,
- * writes it to xSPI flash, then resets. Avoids needing the boot switch +
- * SWD for the daily-iteration flash cycle. */
+/* Firmware self-updater: reads a new signed Application image (or model
+ * weights binary) over CDC, writes it to xSPI flash, then resets. Avoids
+ * needing the boot switch + SWD for the daily-iteration flash cycle —
+ * AND for swapping the NN model weights now too (SLOT1_WEIGHTS). */
 #define FWUPD_MAGIC                 "UPDT"     /* 4-byte header magic */
 #define FWUPD_HDR_SIZE              12U        /* magic(4) + size_le(4) + crc32_le(4) */
-#define FWUPD_MAX_SIZE              (1024U * 1024U)  /* SLOT1_APP region size */
-#define FWUPD_XSPI_OFFSET           0x00400000U      /* Application region, chip-relative */
+/* App target */
+#define FWUPD_APP_MAX_SIZE          (1024U * 1024U)        /* SLOT1_APP region size */
+#define FWUPD_APP_XSPI_OFFSET       0x00400000U            /* SLOT1_APP, chip-relative */
+/* Model target */
+#define FWUPD_MODEL_MAX_SIZE        (16U * 1024U * 1024U)  /* upper bound for our PSRAM stash; SLOT1_WEIGHTS is 28 MB */
+#define FWUPD_MODEL_XSPI_OFFSET     0x00600000U            /* SLOT1_WEIGHTS, chip-relative */
 #define FWUPD_HDR_READ_TIMEOUT_MS   10000U
-#define FWUPD_PAYLOAD_TIMEOUT_MS    60000U
+#define FWUPD_PAYLOAD_TIMEOUT_MS    600000U                /* 10 min — model can be tens of MB */
 
 /* Common -------------------------------------*/
 #define OPT_AUTO                "auto"
@@ -303,17 +308,19 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
-  {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
+  {.run = _update_cmd             , .name = "update"    , .help = "[app | model] - Receive new firmware/model over CDC and reflash xSPI (default: app)" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
   #if defined(N6CAM_WIFI_MURATA)
   {.run = _wifi_cmd               , .name = "wifi"      , .help = "WiFi control"    },
   #endif /* N6CAM_WIFI_MURATA */
 };
 
-/* Firmware-update receive buffer: lives in PSRAM (xSPI1, 32 MB) so we have
- * room for the full 1 MB image without touching SRAM. NOLOAD section, no
- * init cost. Cache-aligned for DMA-safe CDC RX. */
-static __ALIGN_BEGIN uint8_t _fwupd_buf[FWUPD_MAX_SIZE] __ALIGN_END IN_PSRAM;
+/* Firmware-update receive buffers: live in PSRAM (xSPI1, 32 MB). Separate
+ * buffers per target so the App update path can't accidentally overflow
+ * the model buffer or vice-versa. NOLOAD section, no init cost.
+ * Cache-aligned for DMA-safe CDC RX. */
+static __ALIGN_BEGIN uint8_t _fwupd_app_buf  [FWUPD_APP_MAX_SIZE]   __ALIGN_END IN_PSRAM;
+static __ALIGN_BEGIN uint8_t _fwupd_model_buf[FWUPD_MODEL_MAX_SIZE] __ALIGN_END IN_PSRAM;
 
 /* CRC32 (zlib-compatible, poly 0xEDB88320, reflected). Software table-based;
  * vendor's bsp_crc is CRC-16-CCITT which won't match what `zlib.crc32` on the
@@ -1282,17 +1289,25 @@ static int32_t _stream_read_exact(const t_stream *stream, uint8_t *buf, size_t s
 }
 
 /**
- * Danger zone: disable xSPI memory-mapped mode, erase 16x64KB blocks of the
- * Application region, write `size` bytes from _fwupd_buf, then NVIC_SystemReset.
- * Caller must have verified the buffer (magic + CRC) before calling this.
+ * Danger zone: disable xSPI memory-mapped mode, erase enough 64KB blocks to
+ * cover `size` at `xspi_offset`, write the payload from `src`, then
+ * NVIC_SystemReset. Caller must have verified the buffer (magic + CRC).
+ *
+ * For the model target we erase only the blocks needed to hold `size`
+ * (otherwise erasing the full 28 MB SLOT1_WEIGHTS could take ~4 minutes).
  *
  * Note: We do NOT disable interrupts globally — the CDC mutex and watchdog
- * refresh both rely on RTOS. We do kick the IWDG inside the loop so the
- * ~5s erase doesn't trigger a reset before we want one.
+ * refresh both rely on RTOS. The vendor watchdog_task preempts during HAL
+ * polling so the dog stays fed on its own cadence.
  */
-static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
+static int32_t _fwupd_flash_and_reset(const t_stream *stream,
+                                      const uint8_t *src,
+                                      uint32_t xspi_offset,
+                                      size_t size)
 {
   int32_t status;
+  /* Number of 64KB blocks needed (round up). */
+  uint32_t blocks = (uint32_t)((size + 0xFFFFU) / 0x10000U);
 
   /* Suspend the NN task FIRST: it's the only consumer that does memory-mapped
    * reads into xSPI NOR (model weights at 0x70600000). If we disable MMP while
@@ -1301,7 +1316,6 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
    * xSPI2 NOR, so they're not affected. */
   CMD_PRINTF(stream, "Suspending NN task...%s", lwshell_eol());
   (void)nn_task_suspend_thread();
-  /* Give any in-flight inference a moment to wind down before we yank the bus */
   HAL_Delay(50);
 
   CMD_PRINTF(stream, "Disabling xSPI memory-mapped mode...%s", lwshell_eol());
@@ -1312,18 +1326,11 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
     return status;
   }
 
-  /* Erase the full SLOT1_APP region (1 MB = 16 blocks of 64 KB). Iterating
-   * is faster than per-4K-sector. We always erase the whole slot — keeps the
-   * code simple and is only ~5s. */
-  CMD_PRINTF(stream, "Erasing 16x64KB blocks at xSPI offset 0x%08lx...%s",
-             (unsigned long)FWUPD_XSPI_OFFSET, lwshell_eol());
-  for (uint32_t b = 0; b < 16U; b++)
+  CMD_PRINTF(stream, "Erasing %lux64KB blocks at xSPI offset 0x%08lx...%s",
+             (unsigned long)blocks, (unsigned long)xspi_offset, lwshell_eol());
+  for (uint32_t b = 0; b < blocks; b++)
   {
-    /* Don't call bsp_watchdog_refresh here — it ignores the WWDG window and
-     * spurious refreshes during the upper-counter region trigger reset. The
-     * vendor watchdog_task (lower priority but preempts during HAL polling)
-     * keeps the dog fed on its own cadence. */
-    status = BSP_XSPI_NOR_Erase_Block(0, FWUPD_XSPI_OFFSET + (b * 0x10000U), BSP_XSPI_NOR_ERASE_64K);
+    status = BSP_XSPI_NOR_Erase_Block(0, xspi_offset + (b * 0x10000U), BSP_XSPI_NOR_ERASE_64K);
     if (status != BSP_OK)
     {
       CMD_PRINTF(stream, "ERROR: erase block %lu failed (%ld)%s", (unsigned long)b, (long)status, lwshell_eol());
@@ -1331,9 +1338,8 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
     }
   }
 
-  /* Write the new image. BSP_XSPI_NOR_Write handles page-boundary splitting. */
   CMD_PRINTF(stream, "Writing %lu bytes...%s", (unsigned long)size, lwshell_eol());
-  status = BSP_XSPI_NOR_Write(0, _fwupd_buf, FWUPD_XSPI_OFFSET, (uint32_t)size);
+  status = BSP_XSPI_NOR_Write(0, (uint8_t*)src, xspi_offset, (uint32_t)size);
   if (status != BSP_OK)
   {
     CMD_PRINTF(stream, "ERROR: write failed (%ld)%s", (long)status, lwshell_eol());
@@ -1354,12 +1360,24 @@ static int32_t _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   uint32_t got_crc;
   int32_t  n;
 
-  UNUSED(argv);
-  UNUSED(argc);
+  /* Target selection: 'update' (legacy) and 'update app' = SLOT1_APP;
+   * 'update model' = SLOT1_WEIGHTS. */
+  const char *tgt = (argc >= 2U) ? (const char*)argv[1] : "app";
+  bool     is_model = (strcmp(tgt, "model") == 0);
+  bool     is_app   = (strcmp(tgt, "app")   == 0) || (argc < 2U);
+  if (!is_model && !is_app)
+  {
+    return LWSHELL_ERROR_SYNTAX_CMD;
+  }
+
+  uint32_t xspi_offset = is_model ? FWUPD_MODEL_XSPI_OFFSET : FWUPD_APP_XSPI_OFFSET;
+  uint32_t max_size    = is_model ? FWUPD_MODEL_MAX_SIZE    : FWUPD_APP_MAX_SIZE;
+  uint8_t *buf         = is_model ? _fwupd_model_buf        : _fwupd_app_buf;
+  const char *target_str = is_model ? "model" : "app";
 
   CMD_PRINTF(stream,
-    "Ready. Send: 'UPDT' + size_le(4) + crc32_le(4) + payload (max %lu B)%s",
-    (unsigned long)FWUPD_MAX_SIZE, lwshell_eol());
+    "Ready (target=%s). Send: 'UPDT' + size_le(4) + crc32_le(4) + payload (max %lu B)%s",
+    target_str, (unsigned long)max_size, lwshell_eol());
 
   /* Read 12-byte header */
   n = _stream_read_exact(stream, hdr, FWUPD_HDR_SIZE, FWUPD_HDR_READ_TIMEOUT_MS);
@@ -1378,17 +1396,18 @@ static int32_t _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   size = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
   expect_crc = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
 
-  if ((size == 0U) || (size > FWUPD_MAX_SIZE))
+  if ((size == 0U) || (size > max_size))
   {
-    CMD_PRINTF(stream, "ERROR: bad size %lu (max %lu)%s",
-               (unsigned long)size, (unsigned long)FWUPD_MAX_SIZE, lwshell_eol());
+    CMD_PRINTF(stream, "ERROR: bad size %lu (max %lu for %s)%s",
+               (unsigned long)size, (unsigned long)max_size,
+               target_str, lwshell_eol());
     return LWSHELL_OK;
   }
   CMD_PRINTF(stream, "Receiving %lu bytes (expected CRC32 0x%08lx)...%s",
              (unsigned long)size, (unsigned long)expect_crc, lwshell_eol());
 
-  /* Read payload into PSRAM buffer */
-  n = _stream_read_exact(stream, _fwupd_buf, (size_t)size, FWUPD_PAYLOAD_TIMEOUT_MS);
+  /* Read payload into the target's PSRAM buffer */
+  n = _stream_read_exact(stream, buf, (size_t)size, FWUPD_PAYLOAD_TIMEOUT_MS);
   if (n != (int32_t)size)
   {
     CMD_PRINTF(stream, "ERROR: payload short (got %ld/%lu bytes)%s",
@@ -1397,17 +1416,17 @@ static int32_t _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   }
 
   /* Verify CRC32 */
-  got_crc = _crc32(_fwupd_buf, (size_t)size);
+  got_crc = _crc32(buf, (size_t)size);
   if (got_crc != expect_crc)
   {
     CMD_PRINTF(stream, "ERROR: CRC32 mismatch (got 0x%08lx, expected 0x%08lx)%s",
                (unsigned long)got_crc, (unsigned long)expect_crc, lwshell_eol());
     return LWSHELL_OK;
   }
-  CMD_PRINTF(stream, "CRC32 OK. Flashing...%s", lwshell_eol());
+  CMD_PRINTF(stream, "CRC32 OK. Flashing %s...%s", target_str, lwshell_eol());
 
   /* Point of no return: erase + write + reset */
-  _fwupd_flash_and_reset(stream, (size_t)size);
+  _fwupd_flash_and_reset(stream, buf, xspi_offset, (size_t)size);
   return LWSHELL_OK;  /* unreachable */
 }
 
