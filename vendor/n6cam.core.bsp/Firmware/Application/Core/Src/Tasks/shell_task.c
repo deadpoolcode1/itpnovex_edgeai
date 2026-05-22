@@ -880,6 +880,27 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     return LWSHELL_OK;
   }
 
+  /* frame dump — print raw head/tail of the most-recent NN output tensor.
+   * Helps diagnose detection failures: if values look like garbage / zeros /
+   * all the same → the model isn't producing usable output for the post-
+   * processor regardless of conf threshold. */
+  if (strcmp(sub, "dump") == 0)
+  {
+    float head[16], tail[16];
+    uint32_t bytes = 0U;
+    nn_task_dump_output(head, tail, &bytes);
+    CMD_PRINTF(stream, "NN output: %lu bytes (%lu floats)%s",
+               (unsigned long)bytes, (unsigned long)(bytes / 4U), lwshell_eol());
+    CMD_PRINTF(stream, "  head[0..15]:%s    ", lwshell_eol());
+    for (int i = 0; i < 16; i++) CMD_PRINTF(stream, "%.3f ", head[i]);
+    CMD_PRINTF(stream, "%s", lwshell_eol());
+    CMD_PRINTF(stream, "  tail[-16..-1]:%s    ", lwshell_eol());
+    for (int i = 0; i < 16; i++) CMD_PRINTF(stream, "%.3f ", tail[i]);
+    CMD_PRINTF(stream, "%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
   return LWSHELL_ERROR_SYNTAX_CMD;
 }
 

@@ -62,7 +62,7 @@ extern "C" {
 /* Postprocessing YOLOv8 object detection configuration */
 
 /**  Number of classes in the detection model. */
-#define AI_OD_YOLOV8_PP_NB_CLASSES               (80)
+#define AI_OD_YOLOV8_PP_NB_CLASSES               (1)
 
 /**  Total number of boxes predicted by the model.
  * These are evaluated by the post-processing algorithm.
@@ -133,11 +133,7 @@ typedef struct
  *    ...
  */
 static const t_sai_class SAI_CLASSES[SAI_CLASS_NB] = {
-  [0]  = { "person"     , 0x00FF00FFu },
-  [2]  = { "car"        , 0x0000FFFFu },
-  [3]  = { "motorcycle" , 0x00FFFFFFu },
-  [5]  = { "bus"        , 0xFFFF00FFu },
-  [7]  = { "truck"      , 0xFF7F00FFu },
+  [0]  = { "person" , 0xFFFFFFFF }
 };
 
 

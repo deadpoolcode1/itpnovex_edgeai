@@ -175,6 +175,13 @@ void nn_task_set_test_frame(uint8_t *frame);
  */
 uint32_t nn_task_get_box_count(void);
 
+/**
+ * @brief Debug: copy out a snapshot of the most recent NN output tensor.
+ *        First 16 floats + last 16 floats + total byte count. Used by
+ *        the 'nn dump' shell command to diagnose detection failures.
+ */
+void nn_task_dump_output(float *head_out, float *tail_out, uint32_t *bytes_out);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

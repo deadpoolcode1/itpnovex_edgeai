@@ -216,6 +216,20 @@ static uint8_t * volatile _nn_test_frame_override = NULL;
 void nn_task_set_test_frame(uint8_t *frame) { _nn_test_frame_override = frame; }
 uint32_t nn_task_get_box_count(void)        { return (uint32_t)_pp_box_count; }
 
+/* Debug: snapshot of the model's most recent output tensor. The NN loop
+ * memcpy's a small head/tail of _nn_out[0] into here after each inference;
+ * the shell can read it for sanity-checking model behaviour without an
+ * SWD debugger. Just the first 16 + last 16 floats; enough to spot
+ * total-garbage cases vs sensible distributions. */
+typedef struct { float head[16]; float tail[16]; uint32_t bytes; } t_nn_dump;
+static volatile t_nn_dump _nn_dump = {0};
+void nn_task_dump_output(float *head_out, float *tail_out, uint32_t *bytes_out)
+{
+  if (head_out)  memcpy(head_out, (const void*)_nn_dump.head, sizeof(_nn_dump.head));
+  if (tail_out)  memcpy(tail_out, (const void*)_nn_dump.tail, sizeof(_nn_dump.tail));
+  if (bytes_out) *bytes_out = _nn_dump.bytes;
+}
+
 /* SoW test-injection (firmware-side simulate). Sets a synthetic box count
  * + a synthetic person-class box, runs the same on-edge side-effects the
  * inference loop would: snapshot trigger + notification + trace log.
@@ -518,6 +532,28 @@ static void _nn_frame_process(void)
 
   /* Release FLASH */
   flash_acquire(false);
+
+  /* Debug: capture head/tail of output[0] for shell inspection. The model
+   * output is float32 (NB_CLASSES + 4 bbox per box, * num_boxes). */
+  if (_nn_out[0] != NULL && _nn_out_len[0] > 0U)
+  {
+    /* Output buffer is in PSRAM written by NPU — flush cache for read */
+    SCB_InvalidateDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
+    uint32_t n = _nn_out_len[0];
+    _nn_dump.bytes = n;
+    memcpy((void*)_nn_dump.head, _nn_out[0], sizeof(_nn_dump.head));
+    if (n >= sizeof(_nn_dump.tail))
+    {
+      memcpy((void*)_nn_dump.tail, _nn_out[0] + n - sizeof(_nn_dump.tail), sizeof(_nn_dump.tail));
+    }
+    /* Also log the output buffer address for diagnostic */
+    LINFO(TRACE_NN, "NN out[0]@%p len=%lu", _nn_out[0], (unsigned long)_nn_out_len[0]);
+  }
+  else
+  {
+    LINFO(TRACE_NN, "NN out[0]=%p len=%lu nb=%lu", _nn_out[0],
+          (unsigned long)_nn_out_len[0], (unsigned long)_nn_out_nb);
+  }
 
   /* Run PP */
   pp_output.pOutBuff = NULL;
