@@ -1,250 +1,177 @@
-# Edge AI Sensing Kit — Quick Start
+# EdgeAI — SIANA N6Cam People-Counter Firmware
 
-e2ip / SIANA N6Cam — STM32N657 Edge AI Sensing Kit.
+Custom firmware for the SIANA N6Cam (STM32N657, IMX335 5MP camera + Neural-Art NPU) per the Scopus PoC SoW. Streams H.264 over USB-C UVC, runs on-device person/vehicle detection, captures JPEGs to SD, and (when wired) tunnels alerts + photos to a WP76 modem over UART.
 
-The default out-of-the-box demo is a **live UVC H.264 video stream** from the 5MP IMX335 camera, exposed over USB-C. Plug it in and view the stream.
+| Property | Value |
+|---|---|
+| USB VID:PID | `0483:5740` (UVC 1.50 + CDC-ACM) |
+| Resolution | 800×600 H.264 30 fps |
+| Camera serial console | `/dev/ttyACM1` @ 115200 8N1 |
+| STLink VCP (trace) | `/dev/ttyACM0` @ 115200 8N1 |
 
-**Device specs (as seen on host):**
-
-| Property        | Value                                       |
-| --------------- | ------------------------------------------- |
-| USB VID:PID     | `0483:5740` (STMicroelectronics / N6Cam)    |
-| USB class       | UVC 1.50 video + CDC-ACM serial             |
-| Resolution      | 800×600                                     |
-| Pixel format    | H.264 (Main profile, yuv420p)               |
-| Frame rate      | 30 fps                                      |
-| Bitrate         | ~3 Mbps                                     |
-| Serial console  | `/dev/ttyACM0` @ CDC-ACM                    |
-
-## Requirements
-
-- Linux host (tested on Ubuntu 24.04, kernel 6.17)
-- User in `video`, `dialout`, and `plugdev` groups
-- USB-C **data** cable (not charge-only)
-- Packages: `v4l-utils`, `ffmpeg`, `mpv`
+## 1. Connect and view the live stream
 
 ```bash
 sudo apt-get install -y v4l-utils ffmpeg mpv
-```
+# Plug the kit's USB-C into the laptop. Wait 3s.
 
-## 1. Connect the kit
-
-Plug the kit into the host via the USB-C port on the back of the device. Wait ~3 seconds for enumeration.
-
-Verify enumeration:
-
-```bash
-lsusb | grep 0483:5740
-#  Bus 003 Device XXX: ID 0483:5740 STMicroelectronics Virtual COM Port
-
-v4l2-ctl --list-devices
-#  N6Cam (usb-...):
-#    /dev/videoN
-#    /dev/videoN+1
-#    /dev/mediaN
-```
-
-Use the stable by-id path so re-enumeration doesn't break scripts:
-
-```bash
 VIDEODEV=/dev/v4l/by-id/usb-STMicroelectronics_N6Cam_*-video-index0
-ls -l $VIDEODEV
+ffmpeg -hide_banner -loglevel warning -f v4l2 -input_format h264 \
+       -video_size 800x600 -framerate 30 -i $VIDEODEV \
+       -c copy -f h264 - | \
+mpv --profile=low-latency --demuxer-lavf-format=h264 -
 ```
 
-## 2. Run the default demo (live view)
+Press `q` to quit. For a still frame instead of live: `… -frames:v 1 -update 1 -y frame.jpg`.
 
-Pipe ffmpeg (which reads the V4L2 H.264 stream cleanly) into mpv:
+## 2. Talk to the firmware
+
+The kit exposes a CDC-ACM shell on `/dev/ttyACM1`. Use any serial terminal at 115200 8N1, or send one-shot commands:
 
 ```bash
-ffmpeg -hide_banner -loglevel warning \
-  -f v4l2 -input_format h264 -video_size 800x600 -framerate 30 \
-  -i $VIDEODEV \
-  -c copy -f h264 - | \
-mpv --title="N6Cam Live" --profile=low-latency --demuxer-lavf-format=h264 -
+N6CAM_TTY=$(readlink -f /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02)
+stty -F $N6CAM_TTY 115200 raw -echo
+(timeout 3 cat $N6CAM_TTY) & sleep 0.5
+printf "help\n" > $N6CAM_TTY
+wait
 ```
 
-Press `q` in the mpv window to quit.
+### Shell commands
 
-## 3. Capture to file (optional)
+| Command | What it does |
+|---|---|
+| `help` | List all commands. |
+| `fw` / `hw` / `uid` / `uptime` | Built-ins: firmware version, hardware rev, MCU UID, uptime ms. |
+| `version` | Application version string. |
+| `reboot` | Soft reboot. |
+| `echo on\|off\|query` | Terminal echo + prompt (off = scripted/silent). Persists in flash. |
+| `rtc` | Print current RTC time. |
+| `rtc set DDMMYYYYHHMMSS` | Set RTC. Example: `rtc set 22052026140000` = 2026-05-22 14:00:00. |
+| `camera flip [H\|V\|off]` | Image flip. |
+| `camera aec [value\|off]` | Auto-exposure compensation, range `-2.0..2.0`. |
+| `camera awb [value\|auto]` | White-balance profile, `0..5`. |
+| `camera gain [value]` | Analog gain `0..72000` mdB. |
+| `camera exposure [value]` | Shutter `0..33000` µs. |
+| `camera brightness [value]` | Brightness `0..100`. |
+| `irled on\|off\|query` | IR LED state. (PoC: drives LED_USER3 until real GPIO wired.) |
+| `motion sense <0..100> <timeout_s>` / `motion query` | Motion sensitivity + no-motion timeout. Persists. |
+| `img size H W` | Photo dimensions, persists. |
+| `img quality <1..100>` | JPEG quality, persists. |
+| `img color YCBCR\|RGB\|CMYK` | Color space, persists. |
+| `img chroma 0\|1` | Chroma subsampling — 0=4:4:4, 1=4:2:2. Persists. |
+| `img query` | Print current photo settings. |
+| `detect start\|stop` | Run/halt on-device people detection. Persists across reboots. |
+| `detect profile <det_msk> <act_msk>` | det_msk bit0=people bit1=vehicles; act_msk bit0=save SD bit1=cellular report. Persists. |
+| `detect profile query` | Print current detection profile. |
+| `notify enable <mask>` / `disable` | Notification bitmask: `0x1`=NetReg `0x2`=MotStart `0x4`=MotStop `0x8`=Periodic `0x10`=People `0x20`=Vehicle. |
+| `notify period <s>` | Periodic-notification interval. |
+| `notify trigger <code>` | Emit one notification now with `rsn=code`. |
+| `notify query` | Current notify state + message count. |
+| `photo savesd` / `photo upload` | Capture JPEG → SD card (`savesd`) or modem (`upload`, needs WP76). Filename `serial_DDMMYYYY_HHMMSS.rdy`. |
+| `recovery` | Reboot into FSBL recovery halt (limited use on this kit — debug auth locks SWD in op mode regardless). |
+| `update` | Receive new App firmware over CDC and reflash xSPI. Used by `n6cam-update.py` — you won't run this by hand. |
+
+Successful commands respond `<cmd> [<sub>] ok`. Notifications appear on the same port as `+SDVRNTF: {"ser":...,"num":...,"rsn":...,...}` (SoW §6 JSON).
+
+## 3. Build the firmware
+
+Toolchain:
 
 ```bash
-# 5-second H.264 clip
-ffmpeg -f v4l2 -input_format h264 -video_size 800x600 -framerate 30 \
-  -i $VIDEODEV -t 5 -c copy capture.h264
-
-# Extract a JPEG still
-ffmpeg -i capture.h264 -frames:v 1 frame.jpg
+# STM32CubeIDE 1.18+ (bundles the right ARM GCC 13.3); 1.19 tested
+# STM32CubeProgrammer 2.18+ (signing + SWD flash tool); 2.21 tested
+# Both installable as native x86_64 from st.com.
+# Default paths used below:
+CUBEIDE=/opt/st/stm32cubeide_1.19.0
+CUBEPROG=$HOME/STMicroelectronics/STM32Cube/STM32CubeProgrammer
 ```
 
-## 4. Firmware serial console (optional)
+The entire SIANA BSP is vendored at `vendor/n6cam.core.bsp/` with our additions — no separate fetch step.
 
 ```bash
-sudo usermod -a -G dialout $USER   # once, then re-login
-screen /dev/ttyACM0 115200         # or: minicom, picocom
+# 1. Build (~30s first time, ~2s incremental). Outputs Application.bin + .elf.
+WS=/tmp/cubeide_ws_n6cam
+mkdir -p $WS
+$CUBEIDE/stm32cubeide --launcher.suppressErrors -nosplash \
+  -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
+  -data $WS \
+  -import vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application \
+  -build "Application/Release"
+
+# 2. Sign (STM32N6 rejects unsigned firmware). Outputs Application_signed.bin.
+export PATH="$CUBEPROG/bin:$PATH"
+STM32_SigningTool_CLI \
+  -bin vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application.bin \
+  -nk -of 0x80000000 -t fsbl -hv 2.3 -align \
+  -o   vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin
 ```
 
-## Vendor viewer (reference only)
+To build the FSBL too, use `-import vendor/.../STM32CubeIDE/FSBL -build "FSBL/Release"` and sign its output the same way. **You rarely need to** — once the recovery-capable FSBL is in flash, only the Application changes during normal iteration.
 
-The vendor-supplied `SIANA-N6Cam-Viewer` auto-detects the kit and is the documented GUI. The **Linux v0.9 binary fails on Ubuntu 24.04 with Wayland + Mesa** (GLFW/GLX FBConfig error — `Glfw Error 65542: No GLXFBConfigs returned`). The viewer's own Windows build works; the CLI invocation docs live in `SIANA.N6Cam_Using the N6Cam Viewer_250306-1430.pdf`. Until the vendor ships a fixed Linux build, use the `ffmpeg | mpv` pipeline above — it streams the same UVC feed.
+## 4. Flash the firmware
 
-## Troubleshooting
-
-- **Nothing appears in `lsusb` after plug-in** → cable is charge-only, or the unit is defective. Swap to a known-data USB-C cable; if still nothing, the unit is DOA (we confirmed this failure mode on one of our two units).
-- **Brief `error -71` / re-enumeration on plug-in** → seen on the working unit; self-recovers after one power-cycle retry. Harmless.
-- **`Device or resource busy`** → another process is already holding the V4L2 device. V4L2 is single-reader; close the first viewer first.
-- **`non-existing PPS 0 referenced` at start** → H.264 decoder warming up before the first I-frame. Ignore; video starts within ~1s.
-- **No `/dev/video*` node for N6Cam** → check `dmesg | tail -20` right after plug-in. Expected lines include `Product: N6Cam` and `Found UVC 1.50 device N6Cam (0483:5740)`.
-
-## Firmware serial CLI
-
-The kit firmware exposes a command shell on `/dev/ttyACM0` (115200 8N1). Useful commands:
-
-```text
-help                  — list all commands
-fw                    — firmware version
-hw                    — hardware revision
-uid                   — MCU unique ID
-uptime                — MCU uptime (ms)
-reboot                — soft reboot
-
-camera help           — list camera sub-commands
-camera flip   [H|V|off]
-camera aec    [value|off]   — auto-exposure compensation, -2.0..2.0
-camera awb    [value|auto]  — white-balance profile, 0..5
-camera gain   [value]       — analog gain, 0..72000 mdB
-camera exposure [value]     — shutter, 0..33000 µs
-```
-
-Note: the firmware does **not** expose focus / sharpness / zoom controls. The IMX335 sensor has no lens actuator; focus is set mechanically by rotating the M12 lens barrel (the vendor thread-locks it at the factory — see SIANA wiki "Lens Info" page).
-
-## Self-update over USB-C (no STLink, no boot-switch toggle)
-
-The Application carries a CDC-triggered firmware self-updater. Once the kit is running our firmware, daily iteration goes through the kit's own USB-C link — no SWD, no boot-switch toggle.
+### Daily path: USB-C self-update (no SWD, no boot switch)
 
 ```bash
-# Build + sign a new Application (see "Building the firmware from source" below)
-# Then push it:
 ./n6cam-update.py vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin
 ```
 
-The script reads the file, computes a zlib CRC32, opens the kit's CDC port (default `/dev/ttyACM1`; find reliably with `readlink -f /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02`), sends the shell `update` command, then streams `UPDT` magic + size + CRC32 + payload. The kit verifies the CRC, erases SLOT1_APP (1 MB at `0x70400000`), writes the new image, and resets — total ~5–10s. Watch device-side trace with `cat /dev/ttyACM1 &` during the update.
+The script opens the kit's CDC port (`/dev/ttyACM1` by default), triggers the `update` shell command, streams the signed binary, and the kit reboots into the new firmware. Total ~10s.
 
-**Limits — switch + SWD is still the path for:**
-- Updating **FSBL** itself (can't replace itself live)
-- **Bricked-Application recovery** (a crash before USB enumerates = no CDC port = no self-update)
+### Recovery / FSBL path: SWD via STLink-V3 (boot switch needed)
 
-See `patches/firmware-recovery-and-self-update.patch` for the firmware-side implementation (Application's `update` and `recovery` CLI commands, FSBL recovery hook).
+Only required when changing the FSBL itself, or when the Application is bricked enough that USB-C won't enumerate.
 
-## Building the firmware from source
+1. Set the kit's boot switch to **development mode**, power-cycle (unplug **all** cables to the kit for ≥2s, replug).
+2. Run:
+   ```bash
+   export PATH="$CUBEPROG/bin:$PATH"
+   EL="$CUBEPROG/bin/ExternalLoader/MX66UW1G45G_STM32N6570-DK.stldr"
+   STM32_Programmer_CLI -c port=SWD mode=HOTPLUG ap=1 -el "$EL" \
+     -w vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/FSBL/Release/FSBL_signed.bin 0x70000000 \
+     -w vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin 0x70400000 \
+     -w vendor/n6cam.core.bsp/Firmware/Model/network_data.hex
+   ```
+3. Set the boot switch back to **operation mode**, fully power-cycle again.
 
-Source: [`bitbucket.org/sianasystems/n6cam.core.bsp`](https://bitbucket.org/sianasystems/n6cam.core.bsp) (public). Two firmware projects: `FSBL` (First-Stage Boot Loader) and `Application` (People Detection demo + UVC streamer + camera shell).
+Why two paths? STM32N6's Debug Authentication locks the SWD access ports while the FSBL is running in op mode, so SWD only works from dev-mode boot. The CDC self-updater is in-application — it writes xSPI flash from inside the running App, bypassing SWD entirely. See `memory/project_n6cam_debug_auth_locked.md` for the full story.
 
-### Prerequisites
+## 5. Troubleshooting
 
-| Tool | Version | Notes |
-| --- | --- | --- |
-| STM32CubeIDE | 1.18+ (tested 1.19) | brings in the **correct** ARM GCC |
-| ARM GCC (bundled) | **13.3.rel1** | bundled with CubeIDE — do NOT use 14.3 (breaks the build per vendor release notes) |
-| STM32CubeProgrammer | 2.18+ (tested 2.21) | provides `STM32_Programmer_CLI` and `STM32_SigningTool_CLI` |
-| STLink-V3 or V3MINIE | — | required to flash (SWD; no USB-DFU procedure is documented) |
+- **`lsusb` shows nothing for the kit after plug-in** — cable is charge-only (no data lines), or you plugged into a power-only port. Try a different USB-C cable / port directly on the laptop, not the dock.
+- **`Device or resource busy` on `/dev/videoN`** — another process holds the V4L2 device. UVC is single-reader; close mpv/ffmpeg first.
+- **`non-existing PPS 0 referenced` from ffmpeg at start** — H.264 decoder warming up before the first I-frame. Harmless; video starts within ~1s.
+- **`/dev/ttyACM1` is permission-denied right after self-update** — race during USB re-enumeration. Wait 5–10s and re-`stty`. Future re-runs are fine.
+- **`STM32_Programmer_CLI` says "Cannot connect to access port"** — chip is in op mode (FSBL is running and debug auth has engaged). Flip the boot switch to dev mode and full power-cycle.
 
-Install STM32CubeIDE and STM32CubeProgrammer from st.com (both have native Linux x86_64 installers). Default install locations used below:
+## Reference
 
-- CubeIDE: `/opt/st/stm32cubeide_1.19.0/`
-- CubeProgrammer: `~/STMicroelectronics/STM32Cube/STM32CubeProgrammer/`
+- **`Scopus_SoW_v3.pdf`** — Scopus PoC system spec (this firmware implements §3.1, 3.4, 3.5, 3.7, 3.8, 4.1–4.5, partial §6).
+- **`Kamacode_N6Cam_Proposal_v4.docx`** — WBS-based cost proposal + milestone plan.
+- **`SIANA.N6Cam_Using the N6Cam Viewer_250306-1430.pdf`** — vendor viewer GUI (Windows build works; Linux build broken on Ubuntu 24.04 Wayland; use `ffmpeg | mpv` instead).
+- **`e2ip EdgeAI_Datasheet.pdf`** — hardware spec, pinout, sensor list.
+- **`vendor/n6cam.core.bsp/Documentation/SIANA.N6Cam.*_Schematics-RevB4-PVT.pdf`** — full kit schematics (camera, compute, IO).
+- **`memory/`** — long-form engineering notes on debug-auth lock, flash procedure, and the self-update internals.
 
-### Source layout
-
-The SIANA N6Cam BSP is vendored into `vendor/n6cam.core.bsp/` (snapshot of [`bitbucket.org/sianasystems/n6cam.core.bsp`](https://bitbucket.org/sianasystems/n6cam.core.bsp) with our additions: FSBL recovery hook, Application `recovery` + `update` CDC commands, UART recovery listener). Just clone this repo and build — no separate vendor fetch needed.
-
-The pre-built Neural-Art model blobs (`Firmware/Model/network_data.hex`, ~8.3 MB) are checked in, so you do **not** need the `stedgeai` CLI unless you want to retrain / regenerate the model.
-
-### Build (headless — no GUI needed)
-
-```bash
-# Fresh Eclipse workspace
-WS=/tmp/cubeide_ws_n6cam
-rm -rf "$WS" && mkdir -p "$WS"
-
-REPO=$PWD   # assumes you're in vendor/n6cam.core.bsp
-
-# FSBL (~8 s)
-/opt/st/stm32cubeide_1.19.0/stm32cubeide \
-  --launcher.suppressErrors -nosplash \
-  -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
-  -data "$WS" \
-  -import "$REPO/Firmware/STM32CubeIDE/FSBL" \
-  -build "FSBL/Release"
-
-# Application (~20 s)
-/opt/st/stm32cubeide_1.19.0/stm32cubeide \
-  --launcher.suppressErrors -nosplash \
-  -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
-  -data "$WS" \
-  -import "$REPO/Firmware/STM32CubeIDE/Application" \
-  -build "Application/Release"
-```
-
-Expected outputs:
+## Source layout
 
 ```
-Firmware/STM32CubeIDE/FSBL/Release/FSBL.bin           ~107 KB
-Firmware/STM32CubeIDE/Application/Release/Application.bin   ~673 KB
+n6cam-update.py            # host-side self-update script (stdlib only)
+captures/                  # sample JPEGs from the running kit (gitignored)
+vendor/n6cam.core.bsp/     # SIANA BSP snapshot with our additions
+  Firmware/
+    FSBL/Core/Src/main.c                  # recovery-magic hook
+    Application/Core/Src/Tasks/shell_task.c   # all our shell commands
+    Application/Core/Src/Tasks/nn_task.c      # detect gate + suspend/resume
+    Application/Core/Src/Tasks/snapshot_task.c# JPEG → SD via FileX (vendor)
+    Application/Core/Src/fx_app.c             # FileX SD mount + write (vendor)
+    Application/Core/Inc/registry.h           # V3 persistent settings
+    Model/network_data.hex                    # Neural-Art model weights (PeopleNet)
 ```
-
-Both projects also produce `.elf`, `.map`, and `.list` files for debugging.
-
-### Sign (mandatory — STM32N6 rejects unsigned firmware)
-
-```bash
-export PATH="$HOME/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin:$PATH"
-
-# FSBL
-STM32_SigningTool_CLI \
-  -bin Firmware/STM32CubeIDE/FSBL/Release/FSBL.bin \
-  -nk -of 0x80000000 -t fsbl -hv 2.3 -align \
-  -o   Firmware/STM32CubeIDE/FSBL/Release/FSBL_signed.bin
-
-# Application
-STM32_SigningTool_CLI \
-  -bin Firmware/STM32CubeIDE/Application/Release/Application.bin \
-  -nk -of 0x80000000 -t fsbl -hv 2.3 -align \
-  -o   Firmware/STM32CubeIDE/Application/Release/Application_signed.bin
-```
-
-Note: the `-align` flag is required for STM32CubeProgrammer **2.21+**. Omit it for older versions.
-
-### Flash (optional — requires STLink-V3 and SWD wiring)
-
-```bash
-export PATH="$HOME/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin:$PATH"
-EL="$HOME/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/ExternalLoader/MX66UW1G45G_STM32N6570-DK.stldr"
-
-# 1. Set the kit's boot switch to "development mode", power on, connect STLink to SWD.
-# 2. Flash FSBL, Application, and model weights to the external xSPI2 flash:
-
-STM32_Programmer_CLI -c port=SWD mode=HOTPLUG ap=1 -el "$EL" \
-  -w Firmware/STM32CubeIDE/FSBL/Release/FSBL_signed.bin 0x70000000 \
-  -w Firmware/STM32CubeIDE/Application/Release/Application_signed.bin 0x70400000 \
-  -w Firmware/Model/network_data.hex
-
-# 3. Set boot switch back to "operation mode", power-cycle the device.
-```
-
-See the vendor wiki's [Workstation Setup](https://siana-systems.atlassian.net/wiki/spaces/N6Cam/pages/4223434754/Workstation+Setup) and [Using the BSP (Core)](https://siana-systems.atlassian.net/wiki/spaces/N6Cam/pages/4223139865/Using+the+BSP+Core) pages for the canonical procedure.
-
-### Build alternative: GUI
-
-If you prefer the GUI, open STM32CubeIDE, then `File → Import → General → Existing Projects into Workspace`, point at `Firmware/STM32CubeIDE/`, import the `FSBL` and `Application` projects, and build each in the `Release` configuration.
-
-## Reference docs (in repo)
-
-- `e2ip EdgeAI_Datasheet.pdf` — hardware spec, pinout, sensor list
-- `SIANA.N6Cam_Using the N6Cam Viewer_250306-1430.pdf` — vendor viewer usage
 
 ## Vendor links
 
 - Product: https://www.siana-systems.com/n6cam · https://e2ip.com/edge-ai-sensing-kit/
-- Source: https://bitbucket.org/sianasystems/n6cam.core.bsp
+- Source upstream: https://bitbucket.org/sianasystems/n6cam.core.bsp
 - Wiki: https://siana-systems.atlassian.net/wiki/spaces/N6Cam
-- Support: `n6cam.support@siana-systems.com` · `sylvain@siana-systems.com`
+- Vendor support: `n6cam.support@siana-systems.com`
