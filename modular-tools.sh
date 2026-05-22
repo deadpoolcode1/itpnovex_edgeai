@@ -487,15 +487,34 @@ EOF
 # ── Help ───────────────────────────────────────────────────────
 cmd_update() {
     # Self-update via CDC — no SWD, no boot switch. Wraps n6cam-update.py.
-    require_signed_artifacts
-    local APP_SIGNED="${BSP_DIR}/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin"
-    [ -f "${APP_SIGNED}" ] || error "Signed Application not built. Run: ./modular-tools.sh build"
-    step "Pushing ${APP_SIGNED##*/} via CDC self-updater"
+    # Usage:
+    #   update             — push signed Application_signed.bin (default)
+    #   update app         — same
+    #   update model [path]— push NN weights (default: vendor/.../Model/network_data.hex)
+    local TARGET="app"
+    local IMAGE=""
+    if [ "${1:-}" = "app" ] || [ "${1:-}" = "model" ]; then
+        TARGET="$1"; shift
+        IMAGE="${1:-}"
+    fi
     local TTY
     TTY=$(readlink -f /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02 2>/dev/null)
     [ -n "${TTY}" ] || error "N6Cam CDC port not found"
-    python3 "${PROJECT_ROOT}/n6cam-update.py" "${APP_SIGNED}" "${TTY}"
-    info "Wait ~15s for the kit to flash + reboot before sending more commands."
+
+    if [ "${TARGET}" = "model" ]; then
+        # Default to the vendor's network_data.hex if no path given.
+        [ -n "${IMAGE}" ] || IMAGE="${BSP_DIR}/Firmware/Model/network_data.hex"
+        [ -f "${IMAGE}" ] || error "Model file not found: ${IMAGE}"
+        step "Pushing model ${IMAGE##*/} via CDC self-updater (target=model)"
+        python3 "${PROJECT_ROOT}/n6cam-update.py" --target model "${IMAGE}" "${TTY}"
+        info "Wait ~90s for the kit to erase ~MB + write + reboot."
+    else
+        local APP_SIGNED="${BSP_DIR}/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin"
+        [ -f "${APP_SIGNED}" ] || error "Signed Application not built. Run: ./modular-tools.sh build"
+        step "Pushing ${APP_SIGNED##*/} via CDC self-updater (target=app)"
+        python3 "${PROJECT_ROOT}/n6cam-update.py" --target app "${APP_SIGNED}" "${TTY}"
+        info "Wait ~15s for the kit to flash + reboot before sending more commands."
+    fi
 }
 
 cmd_test() {
@@ -574,8 +593,10 @@ ${YELLOW}Demo — live video & capture:${NC}
   demo-fw-version       One-shot query of fw/hw/uid/uptime over serial.
 
 ${YELLOW}Daily firmware iteration:${NC}
-  update                Push the signed Application via the kit's CDC
+  update [app]          Push the signed Application via the kit's CDC
                         self-updater (no SWD, no boot switch).
+  update model [PATH]   Push the NN weights (default: vendor/.../Model/
+                        network_data.hex) via CDC. Same path — no SWD.
 
 ${YELLOW}Tests:${NC}
   test                  Run the full N6Cam test suite (UART shell, SD,
