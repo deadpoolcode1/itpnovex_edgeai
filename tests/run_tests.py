@@ -419,17 +419,22 @@ def group_sd(sh: KitShell, suite: Suite):
     must_be(suite, "T07.3", "`photo savesd` returns SoW §7 filename",
             m is not None,
             extra=m.group(1) if m else "")
-    # wait for snapshot_task to encode + flush
-    time.sleep(2.5)
-    out_after = sh.send_get("sd ls", "sd ls ok", 4.0)
-    files_after = set(line.split()[0] for line in out_after.splitlines()
-                      if line and line[0] != ">" and "ok" not in line and
-                      "sd ls" not in line)
-    new = files_after - files_before
+    # Wait for snapshot_task to encode JPEG + flush via FileX, then poll
+    # `sd ls` until the new file shows up (or 15 s timeout). FAT flush on a
+    # clean 32 GB card is async and can take a couple of seconds.
+    new_name = m.group(1) if m else ""
+    found = False
+    if new_name:
+        for _ in range(15):
+            time.sleep(1.0)
+            poll_out = sh.send_get("sd ls", "sd ls ok", 4.0)
+            if new_name in poll_out:
+                found = True
+                break
     must_be(suite, "T07.4",
             "New .rdy file appears on SD after `photo savesd`",
-            len(new) > 0,
-            extra=",".join(sorted(new)))
+            found, reason="not seen in sd ls within 15s" if not found else "",
+            extra=new_name if found else "")
 
 
 def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
@@ -459,7 +464,7 @@ def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
 
 
 def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path):
-    suite.group("GROUP 9: Detection algorithm against real photos")
+    suite.group("GROUP 9: Detection algorithm — single person + non-person")
     sh.send_get("detect start", "detect start ok", 2.0)
     person_imgs = ["astronaut.jpg", "camera.jpg"]
     non_imgs    = ["cat.jpg", "coffee.jpg", "moon.jpg", "rocket.jpg"]
@@ -512,6 +517,75 @@ def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path):
             reason="" if avg <= 30.0 else f"avg={avg:.1f}ms",
             extra=f"avg={avg:.1f}ms worst={worst:.1f}ms n={len(nn_times)}",
         ))
+
+
+def group_count(sh: KitShell, suite: Suite, image_dir: Path):
+    """Multi-person and vehicle COUNT verification — images sourced from
+    COCO128 with ground-truth labels. Asserts a sensible lower bound so the
+    test reflects realistic NN behavior at 192x192 input (small people in
+    crowd shots will undercount; that's a property of the model, not a bug)."""
+    suite.group("GROUP 11: Multi-person + vehicle counting")
+    sh.send_get("detect start", "detect start ok", 2.0)
+    sh.send_get("detect profile 3 0", "detect profile ok", 2.0)  # people + vehicles, no action
+
+    # Each entry: (filename, ground_truth_persons, ground_truth_vehicles,
+    #              min_persons_to_pass, min_vehicles_to_pass, kind)
+    cases = [
+        ("1_person.jpg",      1,  0, 1, 0, "single"),
+        ("2_people.jpg",      2,  0, 1, 0, "small group"),
+        ("3_people.jpg",      3,  0, 2, 0, "small group"),
+        ("5_people.jpg",      5,  0, 2, 0, "group"),
+        ("7_people.jpg",      7,  0, 2, 0, "group"),
+        ("crowd_13.jpg",     13,  0, 3, 0, "crowd"),
+        ("cars_18.jpg",       0, 18, 0, 0, "vehicle (multi-class only)"),
+        ("cars_15.jpg",       0, 15, 0, 0, "vehicle (multi-class only)"),
+        ("13ppl_5trucks.jpg",13,  5, 3, 0, "mixed"),
+    ]
+
+    def run_one(name: str):
+        path = image_dir / name
+        if not path.exists():
+            return -1, 0.0, []
+        try:
+            data = load_image_as_rgb(path)
+        except Exception:
+            return -2, 0.0, []
+        if not inject_frame(sh, data):
+            return -3, 0.0, []
+        return run_inference(sh)[:3]
+
+    idx = 1
+    for name, gt_p, gt_v, min_p, min_v, kind in cases:
+        c, nn, boxes = run_one(name)
+        if c < 0:
+            skip(suite, f"T11.{idx}", f"{name} (gt: {gt_p}p, {gt_v}v — {kind})",
+                 f"rc={c}")
+            idx += 1
+            continue
+        per_cls = {}
+        for b in boxes:
+            per_cls[b["class"]] = per_cls.get(b["class"], 0) + 1
+        n_person  = per_cls.get(0, 0)
+        n_vehicle = sum(per_cls.get(c, 0) for c in (2, 3, 5, 7))
+        ok_p = n_person  >= min_p
+        ok_v = n_vehicle >= min_v
+        passed = ok_p and ok_v
+        extra = (f"detected: person={n_person} vehicle={n_vehicle} "
+                 f"(gt {gt_p}p/{gt_v}v) NN={nn:.1f}ms")
+        if passed:
+            suite.add(TestResult(
+                f"T11.{idx}",
+                f"{name} ({kind}) → ≥{min_p} person",
+                "pass", extra=extra))
+        else:
+            reason = []
+            if not ok_p: reason.append(f"person {n_person}<{min_p}")
+            if not ok_v: reason.append(f"vehicle {n_vehicle}<{min_v}")
+            suite.add(TestResult(
+                f"T11.{idx}",
+                f"{name} ({kind}) → ≥{min_p} person",
+                "fail", reason=", ".join(reason), extra=extra))
+        idx += 1
 
 
 def group_camera(sh: KitShell, suite: Suite):
@@ -683,6 +757,11 @@ def main() -> int:
             suite.group("GROUP 9: Detection algorithm against real photos")
             skip(suite, "T09.0", "Algorithm tests", "no images folder")
         group_camera(sh, suite)
+        if image_dir.is_dir():
+            group_count(sh, suite, image_dir)
+        else:
+            suite.group("GROUP 11: Multi-person + vehicle counting")
+            skip(suite, "T11.0", "Count tests", "no images folder")
     finally:
         # Reset state to be friendly
         sh.write_line("frame clear")

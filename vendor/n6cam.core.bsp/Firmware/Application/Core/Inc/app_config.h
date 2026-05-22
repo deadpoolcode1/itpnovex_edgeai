@@ -76,7 +76,7 @@ extern "C" {
  * However, it is essential to balance the threshold value to ensure that you do not miss too many true positives.
  *
  * This value is set following the evaluation curves obtained from Ultralytics YOLOv8 model training. */
-#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.7f)
+#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.3f)
 
 /** Intersection over Union (IoU) threshold for Non-Maximum Suppression (NMS).
  * A high IoU threshold means that more overlapping will be allowed between boxes, while a lower threshold will allow less boxes to be retained.
