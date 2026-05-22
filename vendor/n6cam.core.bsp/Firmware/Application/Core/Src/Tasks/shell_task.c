@@ -44,6 +44,7 @@
 #include "n6cam_core.h"   /* LED_USER3, bsp_led_set_state */
 #include "nn_task.h"
 #include "snapshot_task.h"
+#include "fx_app.h"
 
 /* Camera -------------------------------------*/
 #include "camera_task.h"
@@ -204,6 +205,8 @@ static int32_t  _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 static int32_t  _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Photo capture (SoW §3.1, §4.2, §7) */
 static int32_t  _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* SD card management (W10) */
+static int32_t  _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
@@ -280,6 +283,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
+  {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -405,6 +409,7 @@ void _shell_task_init(void)
     {
       lwshell_echo_set(reg->shell_echo_enable != 0U);
       nn_task_detect_set(reg->detect_enable != 0U);
+      nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
       registry_release();
     }
@@ -621,6 +626,55 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
   _notify_num = (_notify_num + 1U) & 0xFFFFU;
 }
 
+/* SoW §3.2 / W10 SD card management.
+ *   sd query        - print mount + presence
+ *   sd ls           - list files in root dir (truncates to ~1.5KB output)
+ *   sd format CONFIRM - reformat as FAT32 (DESTRUCTIVE). 'CONFIRM' token
+ *                     required so a typo doesn't wipe the card.
+ */
+static int32_t _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
+
+  if (strcmp(sub, "query") == 0)
+  {
+    CMD_PRINTF(stream, "sd: %s%s",
+               fx_app_is_open() ? "mounted" : "not mounted",
+               lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "ls") == 0)
+  {
+    static char ls_buf[1536];
+    int32_t status = fx_app_list_root(ls_buf, sizeof(ls_buf));
+    if (status != FX_SUCCESS)
+    {
+      CMD_PRINTF(stream, "sd ls: failed (%ld)%s", (long)status, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "%s", ls_buf);
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if ((strcmp(sub, "format") == 0) && (argc >= 3U) &&
+      (strcmp((char*)argv[2], "CONFIRM") == 0))
+  {
+    CMD_PRINTF(stream, "sd format: erasing...%s", lwshell_eol());
+    int32_t status = fx_app_format();
+    if (status != FX_SUCCESS)
+    {
+      CMD_PRINTF(stream, "sd format: failed (%ld)%s", (long)status, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "sd format: done%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  return LWSHELL_ERROR_SYNTAX_CMD;
+}
+
 /* SoW §3.1 / §4.2 / §7: photo savesd | upload.
  *
  * Generates the SoW §7 filename: serial_DDMMYYYY_HHMMSS.rdy
@@ -806,6 +860,7 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
         registry_release();
         registry_request_save();
       }
+      nn_task_det_set((uint8_t)dm);
       nn_task_action_set((uint8_t)am);
       CMD_PRINTF(stream, "detect profile: det_msk=0x%02lx action_msk=0x%02lx%s",
                  (unsigned long)dm, (unsigned long)am, lwshell_eol());

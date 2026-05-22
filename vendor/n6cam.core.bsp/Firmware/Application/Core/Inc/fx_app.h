@@ -71,6 +71,26 @@ int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size);
  */
 int32_t fx_app_write_file_exact(const char *filename, uint8_t *data, size_t size);
 
+/**
+ * @brief List filenames in the root directory. Concatenates names with newlines
+ *        into the caller's buffer. Returns FX_SUCCESS or an FX_ error code.
+ *        Truncates if buffer is too small (terminates with '\0').
+ */
+int32_t fx_app_list_root(char *out, size_t out_size);
+
+/**
+ * @brief Status check for callers that want to know if the media is mounted.
+ */
+bool    fx_app_is_open(void);
+
+/**
+ * @brief Re-format the SD card as FAT32 and re-mount. DESTROYS ALL DATA.
+ *        Caller must pre-confirm with the user — the shell does this by
+ *        requiring an explicit 'CONFIRM' token. Returns FX_SUCCESS or
+ *        an FX_ error code.
+ */
+int32_t fx_app_format(void);
+
 /* -------------------------------------------------------------------------- */
 #ifdef __cplusplus
 }

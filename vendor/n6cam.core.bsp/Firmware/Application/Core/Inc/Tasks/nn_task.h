@@ -132,6 +132,16 @@ bool nn_task_detect_get(void);
  */
 void nn_task_action_set(uint8_t mask);
 
+/**
+ * @brief Set the SoW §4.2 'det_msk' (proposal W5/W6 class filter).
+ *        bit0 = people, bit1 = vehicles. Detections whose class index
+ *        falls outside the mask are dropped after post-processing.
+ *        With the current people-only model nb_classes=1 so all
+ *        detections are people; bit1 has no effect until a multi-class
+ *        model is in place.
+ */
+void nn_task_det_set(uint8_t mask);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

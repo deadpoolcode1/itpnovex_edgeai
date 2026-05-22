@@ -197,6 +197,7 @@ uint32_t nn_task_resume_thread(void)
  * the SoW says detection must be explicitly started. */
 static volatile bool    _nn_detect_enabled = false;
 static volatile uint8_t _nn_action_mask    = 0U;
+static volatile uint8_t _nn_det_mask       = 0x01U; /* default people */
 /* Edge detection: previous frame's box count. Lets us fire snapshot/notify
  * only on 0->N transitions, not every frame at 22 Hz. */
 static uint32_t          _nn_prev_boxes    = 0U;
@@ -204,6 +205,22 @@ static uint32_t          _nn_prev_boxes    = 0U;
 void nn_task_detect_set(bool enable)   { _nn_detect_enabled = enable; }
 bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
+void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
+
+/* COCO-class -> SoW class mapping (proposal W5/W6).
+ *   bit0 = person; bit1 = car|motorcycle|bus|truck.
+ *   Bicycle (class 1) is intentionally ignored — the SoW only lists
+ *   people + vehicles. Other COCO classes also drop. */
+static bool _class_passes_mask(int32_t class_index, uint8_t det_msk)
+{
+  /* People class */
+  if (class_index == 0)      return (det_msk & 0x01U) != 0U;
+  /* Vehicle classes (COCO): car=2, motorcycle=3, bus=5, truck=7 */
+  if (class_index == 2 || class_index == 3 ||
+      class_index == 5 || class_index == 7)
+                              return (det_msk & 0x02U) != 0U;
+  return false;
+}
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
@@ -243,6 +260,25 @@ static void _nn_task_run(uint32_t args)
       stat_time_start(STAT_TIME_NN_TOTAL);
       _nn_frame_process();
       stat_time_stop(STAT_TIME_NN_TOTAL);
+
+      /* SoW §4.2 W5/W6: filter detections by class against det_msk.
+       * Holds the box-buffer mutex briefly so consumers see a consistent
+       * (filtered) view. */
+      rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
+      size_t kept = 0U;
+      for (size_t i = 0U; i < _pp_box_count; i++)
+      {
+        if (_class_passes_mask((int32_t)_pp_box_buff[i].class_index, _nn_det_mask))
+        {
+          if (kept != i)
+          {
+            _pp_box_buff[kept] = _pp_box_buff[i];
+          }
+          kept++;
+        }
+      }
+      _pp_box_count = kept;
+      rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
 
       /* SoW W12 / W11: on a 0->N box-count edge, fire side effects
        * per the action_msk profile. Edge-only so we don't spam SD

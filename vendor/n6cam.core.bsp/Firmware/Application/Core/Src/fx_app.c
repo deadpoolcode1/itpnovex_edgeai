@@ -143,6 +143,98 @@ int32_t fx_app_write_file_exact(const char *filename, uint8_t *data, size_t size
   return status;
 }
 
+bool fx_app_is_open(void)
+{
+  return _fx_task.open;
+}
+
+int32_t fx_app_list_root(char *out, size_t out_size)
+{
+  CHAR    entry_name[FX_MAX_LONG_NAME_LEN];
+  UINT    attr;
+  ULONG   size, year, month, day, hour, minute, second;
+  int32_t status;
+  size_t  pos = 0U;
+
+  if (!_fx_task.open) return FX_MEDIA_NOT_OPEN;
+  if (!out || (out_size < 2U)) return FX_INVALID_NAME;
+  out[0] = '\0';
+
+  rtos_mutex_acquire(&_fx_task.mtx, true);
+
+  status = fx_directory_first_full_entry_find(
+    &_fx_task.sdio, entry_name, &attr, &size,
+    &year, &month, &day, &hour, &minute, &second
+  );
+  while (status == FX_SUCCESS)
+  {
+    int written = snprintf(out + pos, out_size - pos,
+                            "%s %lu\n", entry_name, (unsigned long)size);
+    if (written < 0) break;
+    if ((size_t)written >= (out_size - pos))
+    {
+      /* truncated */
+      out[out_size - 1U] = '\0';
+      break;
+    }
+    pos += (size_t)written;
+    status = fx_directory_next_full_entry_find(
+      &_fx_task.sdio, entry_name, &attr, &size,
+      &year, &month, &day, &hour, &minute, &second
+    );
+  }
+
+  rtos_mutex_acquire(&_fx_task.mtx, false);
+  return (status == FX_NO_MORE_ENTRIES) ? FX_SUCCESS : status;
+}
+
+int32_t fx_app_format(void)
+{
+  int32_t status;
+
+  if (!_fx_task.open) return FX_MEDIA_NOT_OPEN;
+
+  rtos_mutex_acquire(&_fx_task.mtx, true);
+
+  /* Close the open media, format, reopen */
+  status = fx_media_close(&_fx_task.sdio);
+  _fx_task.open = false;
+  if (status == FX_SUCCESS)
+  {
+    /* fx_media_format with a generic FAT32-friendly geometry. The driver's
+     * underlying SDIO layer knows the real disk size; FileX uses these
+     * parameters mostly for cluster-size + reserved sector layout. */
+    status = fx_media_format(
+      &_fx_task.sdio, fx_stm32_sd_driver, NULL,
+      _fx_task.media, _fx_task.size,
+      "N6CAM",   /* volume name (11 chars max in FAT) */
+      1,         /* FATs */
+      32,        /* dir entries */
+      0,         /* hidden sectors */
+      0,         /* total sectors (0 = let driver report) */
+      512,       /* bytes per sector */
+      8,         /* sectors per cluster */
+      1,         /* heads */
+      1          /* sectors per track */
+    );
+  }
+  if (status == FX_SUCCESS)
+  {
+    status = fx_media_open(
+      &_fx_task.sdio, FX_SD_VOLUME_NAME,
+      fx_stm32_sd_driver, NULL,
+      _fx_task.media, _fx_task.size
+    );
+    if (status == FX_SUCCESS)
+    {
+      _fx_task.open = true;
+    }
+  }
+
+  rtos_mutex_acquire(&_fx_task.mtx, false);
+  return status;
+}
+
 int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size)
 {
   int32_t   status;
