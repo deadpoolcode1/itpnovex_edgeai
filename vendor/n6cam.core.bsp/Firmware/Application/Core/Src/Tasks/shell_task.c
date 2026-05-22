@@ -301,7 +301,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
-  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | run | clear | query] - inject test frame into NN" },
+  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -677,6 +677,35 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     nn_task_set_test_frame(NULL);
     _frame_loaded = false;
     CMD_PRINTF(stream, "frame: cleared (NN back to live camera)%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* SD-based load: read a pre-prepared 192x192 RGB888 .raw file from SD.
+   * Workflow: drop a folder of .raw files on the SD card via PC, then
+   * iterate quickly through them with 'frame load file.raw' + 'frame run'. */
+  if ((strcmp(sub, "load") == 0) && (argc >= 3U))
+  {
+    const char *fname = (const char*)argv[2];
+    size_t got = 0U;
+    int32_t status = fx_app_read_file(fname, _frame_test_buf, FRAME_EXPECTED_SIZE, &got);
+    if (status != FX_SUCCESS)
+    {
+      CMD_PRINTF(stream, "frame load: read failed (%ld)%s", (long)status, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    if (got != FRAME_EXPECTED_SIZE)
+    {
+      CMD_PRINTF(stream,
+        "frame load: bad size %lu, expected %u (must be 192x192 RGB888)%s",
+        (unsigned long)got, (unsigned)FRAME_EXPECTED_SIZE, lwshell_eol());
+      _frame_loaded = false;
+      return LWSHELL_OK;
+    }
+    SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
+    _frame_loaded = true;
+    CMD_PRINTF(stream, "frame load: ok (%s, %lu bytes)%s",
+               fname, (unsigned long)got, lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }

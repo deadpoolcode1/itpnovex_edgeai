@@ -235,6 +235,36 @@ int32_t fx_app_format(void)
   return status;
 }
 
+int32_t fx_app_read_file(const char *filename, uint8_t *buf,
+                         size_t max_size, size_t *out_size)
+{
+  int32_t  status;
+  ULONG    bytes_read = 0;
+
+  if (out_size) *out_size = 0;
+  if (!_fx_task.open) return FX_MEDIA_NOT_OPEN;
+  if (!filename || !buf || (max_size == 0)) return FX_INVALID_NAME;
+
+  rtos_mutex_acquire(&_fx_task.mtx, true);
+
+  status = fx_file_open(&_fx_task.sdio, &_fx_task.file,
+                        (char*)filename, FX_OPEN_FOR_READ);
+  if (status == FX_SUCCESS)
+  {
+    status = fx_file_read(&_fx_task.file, buf, (ULONG)max_size, &bytes_read);
+    (void)fx_file_close(&_fx_task.file);
+    if ((status == FX_SUCCESS) || (status == FX_END_OF_FILE))
+    {
+      if (out_size) *out_size = (size_t)bytes_read;
+      /* End-of-file on first read = empty file, still success */
+      status = FX_SUCCESS;
+    }
+  }
+
+  rtos_mutex_acquire(&_fx_task.mtx, false);
+  return status;
+}
+
 int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size)
 {
   int32_t   status;

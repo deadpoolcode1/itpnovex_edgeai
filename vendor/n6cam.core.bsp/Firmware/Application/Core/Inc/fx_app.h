@@ -91,6 +91,14 @@ bool    fx_app_is_open(void);
  */
 int32_t fx_app_format(void);
 
+/**
+ * @brief Read up to max_size bytes from filename into buf. *out_size
+ *        receives the actual byte count. Returns FX_SUCCESS or an FX_
+ *        error code (FX_NOT_FOUND, FX_INVALID_NAME, etc.).
+ */
+int32_t fx_app_read_file(const char *filename, uint8_t *buf,
+                         size_t max_size, size_t *out_size);
+
 /* -------------------------------------------------------------------------- */
 #ifdef __cplusplus
 }
