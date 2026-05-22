@@ -41,6 +41,7 @@
 #include "n6cam_uart.h"
 #include "n6cam_xspi.h"
 #include "n6cam_watchdog.h"
+#include "n6cam_core.h"   /* LED_USER3, bsp_led_set_state */
 #include "nn_task.h"
 
 /* Camera -------------------------------------*/
@@ -191,6 +192,14 @@ static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* Sensors (SoW §3.5, §4.5) */
+static int32_t  _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+
+/* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
+ * user can see the command landing during bring-up; the actual IR LED GPIO
+ * isn't yet wired into the BSP enum and is W15 in the proposal. */
+static bool _irled_state = false;
 
 /* SoW §4.1 success-ack helper: "<cmd> [<sub>] ok". Use at the end of any
  * new command that completes successfully. */
@@ -245,6 +254,8 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _rtc_cmd                , .name = "rtc"       , .help = "[set DDMMYYYYHHMMSS] - get or set RTC" },
   {.run = _version_cmd            , .name = "version"   , .help = "Print application version" },
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
+  {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
+  {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -530,6 +541,83 @@ static int32_t _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   CMD_PRINTF(stream, "Application: %s%s", FW_VERSION, lwshell_eol());
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
+}
+
+/* SoW §4.5 irled on|off|query.
+ * PoC: drives LED_USER3 as a proxy until the IR LED GPIO is identified (W15). */
+static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  bool set = false;
+  bool new_state = false;
+
+  if (argc >= 2U)
+  {
+    if (strcmp((char*)argv[1], "on") == 0)       { set = true; new_state = true; }
+    else if (strcmp((char*)argv[1], "off") == 0) { set = true; new_state = false; }
+    else if (strcmp((char*)argv[1], "query") != 0)
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+  }
+
+  if (set)
+  {
+    _irled_state = new_state;
+    /* Visible proxy on LED_USER3 until real IR LED is wired */
+    bsp_led_set_state(LED_USER3, new_state);
+  }
+
+  CMD_PRINTF(stream, "irled: %u%s", _irled_state ? 1U : 0U, lwshell_eol());
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
+}
+
+/* SoW §4.5 motion sense <sensitivity 0-100> <no_motion_timeout_s> | motion query.
+ * PoC: parameters persist in registry; sensor wiring (W16) is a future task. */
+static int32_t _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  uint8_t  sens = 0U;
+  uint32_t timeout_s = 0U;
+
+  if ((argc >= 4U) && (strcmp((char*)argv[1], "sense") == 0))
+  {
+    int s = atoi((char*)argv[2]);
+    long t = atol((char*)argv[3]);
+    if ((s < 0) || (s > 100) || (t < 0))
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+    sens = (uint8_t)s;
+    timeout_s = (uint32_t)t;
+
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      reg->motion_sensitivity         = sens;
+      reg->motion_no_motion_timeout_s = timeout_s;
+      registry_release();
+      registry_request_save();
+    }
+    CMD_PRINTF(stream, "motion: sensitivity=%u timeout=%lu%s",
+               (unsigned)sens, (unsigned long)timeout_s, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  else if ((argc >= 2U) && (strcmp((char*)argv[1], "query") == 0))
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      sens      = reg->motion_sensitivity;
+      timeout_s = reg->motion_no_motion_timeout_s;
+      registry_release();
+    }
+    CMD_PRINTF(stream, "motion: sensitivity=%u timeout=%lu%s",
+               (unsigned)sens, (unsigned long)timeout_s, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /**
