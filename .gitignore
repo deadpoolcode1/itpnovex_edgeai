@@ -70,3 +70,7 @@ node_modules/
 
 # Keep the datasheet PDFs in the repo root
 !*.pdf
+
+# Ultralytics auto-downloaded weights — never commit
+yolov8n.pt
+yolov8n_saved_model/
