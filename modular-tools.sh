@@ -485,6 +485,62 @@ EOF
 }
 
 # ── Help ───────────────────────────────────────────────────────
+cmd_update() {
+    # Self-update via CDC — no SWD, no boot switch. Wraps n6cam-update.py.
+    require_signed_artifacts
+    local APP_SIGNED="${BSP_DIR}/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin"
+    [ -f "${APP_SIGNED}" ] || error "Signed Application not built. Run: ./modular-tools.sh build"
+    step "Pushing ${APP_SIGNED##*/} via CDC self-updater"
+    local TTY
+    TTY=$(readlink -f /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02 2>/dev/null)
+    [ -n "${TTY}" ] || error "N6Cam CDC port not found"
+    python3 "${PROJECT_ROOT}/n6cam-update.py" "${APP_SIGNED}" "${TTY}"
+    info "Wait ~15s for the kit to flash + reboot before sending more commands."
+}
+
+cmd_test() {
+    # Comprehensive UART/SD/NN test suite + HTML report.
+    local TTY IMAGES OUT
+    TTY=""
+    IMAGES="${PROJECT_ROOT}/tests/images"
+    OUT=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tty)    TTY="$2"; shift 2 ;;
+            --images) IMAGES="$2"; shift 2 ;;
+            --out)    OUT="$2"; shift 2 ;;
+            *) error "Unknown test option: $1" ;;
+        esac
+    done
+
+    step "Running N6Cam test suite"
+    mkdir -p "${PROJECT_ROOT}/results"
+    local ARGS=()
+    [ -n "${TTY}" ] && ARGS+=(--tty "${TTY}")
+    [ -n "${IMAGES}" ] && ARGS+=(--images "${IMAGES}")
+    [ -n "${OUT}" ] && ARGS+=(--out "${OUT}")
+
+    set +e
+    python3 "${PROJECT_ROOT}/tests/run_tests.py" "${ARGS[@]}"
+    local rc=$?
+    set -e
+
+    # Generate PDF alongside HTML if a converter is available
+    local LATEST_HTML
+    LATEST_HTML=$(ls -1t "${PROJECT_ROOT}/results"/test-report-*.html 2>/dev/null | head -1)
+    if [ -n "${LATEST_HTML}" ]; then
+        local PDF="${LATEST_HTML%.html}.pdf"
+        if command -v wkhtmltopdf &>/dev/null; then
+            wkhtmltopdf --quiet "${LATEST_HTML}" "${PDF}" 2>/dev/null && info "PDF: ${PDF}"
+        elif command -v google-chrome &>/dev/null || command -v chromium-browser &>/dev/null; then
+            local CHROME=$(command -v google-chrome || command -v chromium-browser)
+            "${CHROME}" --headless --disable-gpu --print-to-pdf="${PDF}" \
+                "file://${LATEST_HTML}" >/dev/null 2>&1 && info "PDF: ${PDF}"
+        fi
+    fi
+    exit ${rc}
+}
+
 cmd_help() {
     cat <<EOF
 ${CYAN}Kamacode Ltd. | Edge AI Sensing Kit - Modular Tools${NC}
@@ -516,6 +572,17 @@ ${YELLOW}Demo — live video & capture:${NC}
                         If no file passed, captures a fresh frame first.
   demo-cli              Open firmware serial console (picocom @ 115200).
   demo-fw-version       One-shot query of fw/hw/uid/uptime over serial.
+
+${YELLOW}Daily firmware iteration:${NC}
+  update                Push the signed Application via the kit's CDC
+                        self-updater (no SWD, no boot switch).
+
+${YELLOW}Tests:${NC}
+  test                  Run the full N6Cam test suite (UART shell, SD,
+                        notifications, frame injection, NN algorithm,
+                        performance). Emits an HTML + PDF report under
+                        results/ similar to the V20_SDVR format.
+                        Options: --tty PATH --images DIR --out FILE
 
 ${YELLOW}Diagnostics:${NC}
   doctor                Check USB enumeration, v4l2 nodes, serial console,
@@ -569,6 +636,8 @@ case "${1:-help}" in
     demo-sharpness)     shift; cmd_demo_sharpness "$@" ;;
     demo-cli)           shift; cmd_demo_cli "$@" ;;
     demo-fw-version)    shift; cmd_demo_fw_version "$@" ;;
+    update)             shift; cmd_update "$@" ;;
+    test)               shift; cmd_test "$@" ;;
     doctor)             shift; cmd_doctor "$@" ;;
     info)               shift; cmd_info "$@" ;;
     help|--help|-h|"")  cmd_help ;;
