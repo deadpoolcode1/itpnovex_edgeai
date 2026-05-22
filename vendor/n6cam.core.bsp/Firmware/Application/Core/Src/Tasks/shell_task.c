@@ -41,6 +41,7 @@
 #include "n6cam_uart.h"
 #include "n6cam_xspi.h"
 #include "n6cam_watchdog.h"
+#include "nn_task.h"
 
 /* Camera -------------------------------------*/
 #include "camera_task.h"
@@ -186,6 +187,7 @@ static void     _recovery_trigger(void);
 
 /* System -------------------------------------*/
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
@@ -240,7 +242,8 @@ static __ALIGN_BEGIN uint8_t _uart_recov_buf[UART_RECOV_BUF_SIZE] __ALIGN_END;
 
 /* Common -------------------------------------*/
 static const t_lwshell_cmd  _shell_cmd[] = {
-  {.run = _rtc_cmd                , .name = "rtc"       , .help = "Print RTC time"  },
+  {.run = _rtc_cmd                , .name = "rtc"       , .help = "[set DDMMYYYYHHMMSS] - get or set RTC" },
+  {.run = _version_cmd            , .name = "version"   , .help = "Print application version" },
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
@@ -453,15 +456,58 @@ static int32_t _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
  * @param argc    Number of arguments
  * @return Error code
  */
+/* Helper: parse N decimal digits from string starting at `s`. Returns false on
+ * non-digit. Caller pre-checks length. */
+static bool _parse_n_digits(const char *s, size_t n, uint32_t *out)
+{
+  uint32_t v = 0U;
+  for (size_t i = 0; i < n; i++)
+  {
+    if ((s[i] < '0') || (s[i] > '9')) return false;
+    v = (v * 10U) + (uint32_t)(s[i] - '0');
+  }
+  *out = v;
+  return true;
+}
+
 static int32_t _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 {
   t_datetime dt;
   int32_t    status;
 
-  UNUSED(argv);
-  UNUSED(argc);
+  /* SoW §4.2: rtc set DDMMYYYYHHMMSS — 14 decimal digits */
+  if ((argc >= 3U) && (strcmp((char*)argv[1], "set") == 0))
+  {
+    const char *s = (const char*)argv[2];
+    if (strlen(s) != 14U) return LWSHELL_ERROR_SYNTAX_CMD;
+    uint32_t dd, mm, yyyy, hh, mi, ss;
+    if (!_parse_n_digits(s + 0,  2, &dd) ||
+        !_parse_n_digits(s + 2,  2, &mm) ||
+        !_parse_n_digits(s + 4,  4, &yyyy) ||
+        !_parse_n_digits(s + 8,  2, &hh) ||
+        !_parse_n_digits(s + 10, 2, &mi) ||
+        !_parse_n_digits(s + 12, 2, &ss))
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+    if ((yyyy < 2000U) || (yyyy > 2099U)) return LWSHELL_ERROR_SYNTAX_CMD;
+    dt.year    = (uint8_t)(yyyy - 2000U);
+    dt.month   = (uint8_t)mm;
+    dt.day     = (uint8_t)dd;
+    dt.hours   = (uint8_t)hh;
+    dt.minutes = (uint8_t)mi;
+    dt.seconds = (uint8_t)ss;
+    status = bsp_rtc_set_time(&dt);
+    if (status != BSP_OK)
+    {
+      CMD_PRINTF(stream, "rtc set: failed (%ld)%s", (long)status, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
 
-  /* Get RTC time */
+  /* Get RTC time (legacy / default) */
   status = bsp_rtc_get_time(&dt);
   if (status == BSP_OK)
   {
@@ -476,6 +522,13 @@ static int32_t _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   {
     CMD_PRINTF(stream, "RTC: Not available (%d)%s", status, lwshell_eol());
   }
+  return LWSHELL_OK;
+}
+
+static int32_t _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  CMD_PRINTF(stream, "Application: %s%s", FW_VERSION, lwshell_eol());
+  _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
 }
 
@@ -564,6 +617,16 @@ static int32_t _stream_read_exact(const t_stream *stream, uint8_t *buf, size_t s
 static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
 {
   int32_t status;
+
+  /* Suspend the NN task FIRST: it's the only consumer that does memory-mapped
+   * reads into xSPI NOR (model weights at 0x70600000). If we disable MMP while
+   * it's mid-inference, the next weight load faults and we never get to the
+   * erase/write. Camera, JPEG, display tasks read from PSRAM (xSPI1), not
+   * xSPI2 NOR, so they're not affected. */
+  CMD_PRINTF(stream, "Suspending NN task...%s", lwshell_eol());
+  (void)nn_task_suspend_thread();
+  /* Give any in-flight inference a moment to wind down before we yank the bus */
+  HAL_Delay(50);
 
   CMD_PRINTF(stream, "Disabling xSPI memory-mapped mode...%s", lwshell_eol());
   status = BSP_XSPI_NOR_DisableMemoryMappedMode(0);

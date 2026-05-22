@@ -181,6 +181,16 @@ uint32_t nn_get_detections(t_nn_box* box_buff)
   return _pp_box_count;
 }
 
+uint32_t nn_task_suspend_thread(void)
+{
+  return tx_thread_suspend(&_nn_task.thread);
+}
+
+uint32_t nn_task_resume_thread(void)
+{
+  return tx_thread_resume(&_nn_task.thread);
+}
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

@@ -103,6 +103,20 @@ int32_t nn_task_start(void);
  */
 uint32_t nn_get_detections(t_nn_box* box_buff);
 
+/**
+ * @brief Suspend the NN task. While suspended it stops consuming camera
+ *        frames and stops reading model weights from xSPI NOR — required
+ *        before disabling xSPI memory-mapped mode (e.g., self-updater).
+ *        Returns ThreadX status.
+ */
+uint32_t nn_task_suspend_thread(void);
+
+/**
+ * @brief Resume a previously suspended NN task. Not strictly required by
+ *        the self-updater (we reset right after), but kept for symmetry.
+ */
+uint32_t nn_task_resume_thread(void);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
