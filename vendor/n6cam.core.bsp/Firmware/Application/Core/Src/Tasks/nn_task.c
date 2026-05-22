@@ -191,6 +191,13 @@ uint32_t nn_task_resume_thread(void)
   return tx_thread_resume(&_nn_task.thread);
 }
 
+/* Runtime detection gate (SoW §3.1 detect start/stop). Default is OFF —
+ * the SoW says detection must be explicitly started. */
+static volatile bool _nn_detect_enabled = false;
+
+void nn_task_detect_set(bool enable) { _nn_detect_enabled = enable; }
+bool nn_task_detect_get(void)        { return _nn_detect_enabled; }
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
@@ -214,6 +221,13 @@ static void _nn_task_run(uint32_t args)
   {
     /* Wait for a new frame */
     camera_wait_event(CAMERA_EVT_FRAME_ANCILLARY, true);
+
+    /* SoW §3.1: skip inference when detection is stopped. We still drain the
+     * event above to keep the camera pipeline flowing. */
+    if (!_nn_detect_enabled)
+    {
+      continue;
+    }
 
     /* Process frame */
     _nn_frame = camera_get_buffer(camera.ancillary.id);

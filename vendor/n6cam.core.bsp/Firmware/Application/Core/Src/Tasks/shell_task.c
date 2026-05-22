@@ -197,6 +197,8 @@ static int32_t  _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* JPEG / photo settings (SoW §3.4, §4.4) */
 static int32_t  _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* Object detection (SoW §3.1, §4.2) */
+static int32_t  _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
  * user can see the command landing during bring-up; the actual IR LED GPIO
@@ -259,6 +261,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -377,12 +380,13 @@ void _shell_task_init(void)
     Error_Handler();
   }
 
-  /* Apply persisted shell settings (SoW §4.1) */
+  /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) */
   {
     t_registry_data *reg = registry_acquire();
     if (reg)
     {
       lwshell_echo_set(reg->shell_echo_enable != 0U);
+      nn_task_detect_set(reg->detect_enable != 0U);
       registry_release();
     }
   }
@@ -573,6 +577,78 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   CMD_PRINTF(stream, "irled: %u%s", _irled_state ? 1U : 0U, lwshell_eol());
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
+}
+
+/* SoW §3.1 / §4.2: detect start | stop | profile <det_msk> <action_msk> |
+ *                 profile query.
+ *
+ *   det_msk    bit0 = people, bit1 = vehicles
+ *   action_msk bit0 = save SD, bit1 = report cellular
+ *
+ * 'start'/'stop' gates the NN task's inference (camera + UVC keep running).
+ * The bitmasks are stored in registry; downstream tasks (photo capture,
+ * notification subsystem) read them. */
+static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
+
+  if (strcmp(sub, "start") == 0)
+  {
+    nn_task_detect_set(true);
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->detect_enable = 1U; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "detect: started%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "stop") == 0)
+  {
+    nn_task_detect_set(false);
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->detect_enable = 0U; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "detect: stopped%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "profile") == 0)
+  {
+    /* profile query */
+    if ((argc >= 3U) && (strcmp((char*)argv[2], "query") == 0))
+    {
+      uint8_t dm = 0U, am = 0U;
+      t_registry_data *reg = registry_acquire();
+      if (reg) { dm = reg->detect_det_mask; am = reg->detect_action_mask; registry_release(); }
+      CMD_PRINTF(stream, "detect profile: det_msk=0x%02x action_msk=0x%02x%s",
+                 (unsigned)dm, (unsigned)am, lwshell_eol());
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
+    /* profile <det_msk> <action_msk> */
+    if (argc >= 4U)
+    {
+      long dm = strtol((char*)argv[2], NULL, 0);
+      long am = strtol((char*)argv[3], NULL, 0);
+      if ((dm < 0) || (dm > 0xFF) || (am < 0) || (am > 0xFF))
+      {
+        return LWSHELL_ERROR_SYNTAX_CMD;
+      }
+      t_registry_data *reg = registry_acquire();
+      if (reg)
+      {
+        reg->detect_det_mask    = (uint8_t)dm;
+        reg->detect_action_mask = (uint8_t)am;
+        registry_release();
+        registry_request_save();
+      }
+      CMD_PRINTF(stream, "detect profile: det_msk=0x%02lx action_msk=0x%02lx%s",
+                 (unsigned long)dm, (unsigned long)am, lwshell_eol());
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
+    return LWSHELL_ERROR_SYNTAX_CMD;
+  }
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /* SoW §3.4 / §4.4: photo settings.

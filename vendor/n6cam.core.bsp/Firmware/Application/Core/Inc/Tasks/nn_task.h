@@ -117,6 +117,14 @@ uint32_t nn_task_suspend_thread(void);
  */
 uint32_t nn_task_resume_thread(void);
 
+/**
+ * @brief Enable/disable runtime detection (SoW §3.1 detect start/stop).
+ *        When disabled, the NN task still drains camera frames but skips
+ *        the inference + post-processing path. Cheap CPU gating.
+ */
+void nn_task_detect_set(bool enable);
+bool nn_task_detect_get(void);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
