@@ -195,6 +195,8 @@ static int32_t  _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Sensors (SoW §3.5, §4.5) */
 static int32_t  _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* JPEG / photo settings (SoW §3.4, §4.4) */
+static int32_t  _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
  * user can see the command landing during bring-up; the actual IR LED GPIO
@@ -256,6 +258,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
+  {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -570,6 +573,102 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   CMD_PRINTF(stream, "irled: %u%s", _irled_state ? 1U : 0U, lwshell_eol());
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
+}
+
+/* SoW §3.4 / §4.4: photo settings.
+ *   img size <H> <W>      - image dimensions in pixels
+ *   img quality <1..100>  - JPEG quality
+ *   img color YCBCR|RGB|CMYK - color space (0/1/2)
+ *   img chroma 0|1        - 0 = 4:4:4, 1 = 4:2:2
+ *   img query             - dump all current settings
+ *
+ * Values persist in registry. Vendor's jpeg_task currently uses compile-time
+ * constants for buffer sizing; once the encoder is refactored to consume the
+ * registry values, this shell command drives end-to-end behavior. */
+static int32_t _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+
+  const char *sub = (const char*)argv[1];
+
+  /* QUERY ----------------------------------------------------------------*/
+  if (strcmp(sub, "query") == 0)
+  {
+    uint16_t w = 0U, h = 0U;
+    uint8_t  q = 0U, color = 0U, chroma = 0U;
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      w      = reg->img_width;
+      h      = reg->img_height;
+      q      = reg->img_quality;
+      color  = reg->img_color;
+      chroma = reg->img_chroma;
+      registry_release();
+    }
+    const char *color_s = (color == 0U) ? "YCBCR" : (color == 1U) ? "RGB" : (color == 2U) ? "CMYK" : "?";
+    CMD_PRINTF(stream, "img: %ux%u quality=%u color=%s chroma=%u%s",
+               (unsigned)w, (unsigned)h, (unsigned)q, color_s, (unsigned)chroma, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* SIZE H W -------------------------------------------------------------*/
+  if ((strcmp(sub, "size") == 0) && (argc >= 4U))
+  {
+    long h = atol((char*)argv[2]);
+    long w = atol((char*)argv[3]);
+    if ((h <= 0) || (w <= 0) || (h > 0xFFFF) || (w > 0xFFFF))
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->img_height = (uint16_t)h; reg->img_width = (uint16_t)w; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "img size: %lux%lu%s", (unsigned long)w, (unsigned long)h, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* QUALITY 1..100 -------------------------------------------------------*/
+  if ((strcmp(sub, "quality") == 0) && (argc >= 3U))
+  {
+    long q = atol((char*)argv[2]);
+    if ((q < 1) || (q > 100)) return LWSHELL_ERROR_SYNTAX_CMD;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->img_quality = (uint8_t)q; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "img quality: %ld%s", q, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* COLOR YCBCR|RGB|CMYK -------------------------------------------------*/
+  if ((strcmp(sub, "color") == 0) && (argc >= 3U))
+  {
+    uint8_t color;
+    if      (strcmp((char*)argv[2], "YCBCR") == 0) color = 0U;
+    else if (strcmp((char*)argv[2], "RGB")   == 0) color = 1U;
+    else if (strcmp((char*)argv[2], "CMYK")  == 0) color = 2U;
+    else return LWSHELL_ERROR_SYNTAX_CMD;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->img_color = color; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "img color: %s%s", (char*)argv[2], lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* CHROMA 0|1 -----------------------------------------------------------*/
+  if ((strcmp(sub, "chroma") == 0) && (argc >= 3U))
+  {
+    long c = atol((char*)argv[2]);
+    if ((c != 0) && (c != 1)) return LWSHELL_ERROR_SYNTAX_CMD;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->img_chroma = (uint8_t)c; registry_release(); registry_request_save(); }
+    CMD_PRINTF(stream, "img chroma: %ld (%s)%s", c, c == 0 ? "4:4:4" : "4:2:2", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /* SoW §4.5 motion sense <sensitivity 0-100> <no_motion_timeout_s> | motion query.
