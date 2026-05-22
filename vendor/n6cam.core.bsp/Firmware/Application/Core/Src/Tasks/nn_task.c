@@ -207,6 +207,53 @@ bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
 
+/* SoW test-injection (firmware-side simulate). Sets a synthetic box count
+ * + a synthetic person-class box, runs the same on-edge side-effects the
+ * inference loop would: snapshot trigger + notification + trace log.
+ * Skips the actual NN inference — useful when the camera is out of focus
+ * or the lens is dirty, so we want to verify the post-detect chain in
+ * isolation. Holds the box-buffer mutex like the real path. */
+void nn_task_simulate_detection(uint32_t boxes)
+{
+  rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
+  _pp_box_count = (size_t)boxes;
+  if (boxes > 0U)
+  {
+    /* Populate one fake person-class box so consumers (nn_get_detections)
+     * see something coherent. Only fields the downstream cares about. */
+    memset(&_pp_box_buff[0], 0, sizeof(_pp_box_buff[0]));
+    _pp_box_buff[0].class_index = 0;   /* COCO person */
+    _pp_box_buff[0].conf        = 1.0f;
+  }
+  rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
+
+  /* Drive the same edge logic the inference loop uses. We replay the
+   * snapshot + notification side effects inline because we don't want
+   * to wait for the next camera frame to wake the loop. */
+  if ((boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U))
+  {
+    if (_nn_action_mask & 0x01U)
+    {
+      t_datetime dt = { 0 };
+      (void)bsp_rtc_get_time(&dt);
+      uint32_t ser = HAL_GetUIDw0();
+      char fname[48];
+      snprintf(fname, sizeof(fname),
+               "%lu_%02u%02u20%02u_%02u%02u%02u.rdy",
+               (unsigned long)ser,
+               (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
+               (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
+      snapshot_set_filename(fname);
+      if (!snapshot_trigger())
+      {
+        snapshot_set_filename(NULL);
+      }
+    }
+    LINFO(TRACE_NN, "[simulate] %lu object(s)", (unsigned long)boxes);
+  }
+  _nn_prev_boxes = boxes;
+}
+
 /* COCO-class -> SoW class mapping (proposal W5/W6).
  *   bit0 = person; bit1 = car|motorcycle|bus|truck.
  *   Bicycle (class 1) is intentionally ignored — the SoW only lists

@@ -280,7 +280,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query | simulate [N]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
@@ -827,6 +827,24 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     t_registry_data *reg = registry_acquire();
     if (reg) { reg->detect_enable = 0U; registry_release(); registry_request_save(); }
     CMD_PRINTF(stream, "detect: stopped%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strcmp(sub, "simulate") == 0)
+  {
+    /* default to 1 box if no count given */
+    uint32_t boxes = 1U;
+    if (argc >= 3U)
+    {
+      long n = atol((char*)argv[2]);
+      if (n < 0) return LWSHELL_ERROR_SYNTAX_CMD;
+      boxes = (uint32_t)n;
+    }
+    nn_task_simulate_detection(boxes);
+    CMD_PRINTF(stream, "detect simulate: %lu object(s)%s",
+               (unsigned long)boxes, lwshell_eol());
+    /* Also fire the +SDVRNTF the inference loop would have. rsn=0x10 = people. */
+    _notify_emit(0x10U, boxes, false);
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }

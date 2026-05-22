@@ -142,6 +142,19 @@ void nn_task_action_set(uint8_t mask);
  */
 void nn_task_det_set(uint8_t mask);
 
+/**
+ * @brief Inject a synthetic detection edge. Used to test the
+ *        detect -> snapshot -> SD -> notify chain when the camera
+ *        optics are subpar (out of focus, dirty lens, etc.) so real
+ *        NN detection isn't reliable. Fires exactly like a real
+ *        detection: edge-trigger, snapshot if action_msk bit0 set,
+ *        +OBJDET trace, +SDVRNTF notification.
+ *
+ * @param boxes Number of synthetic boxes to claim were detected.
+ *              Pass >= 1 to trigger; 0 to clear the edge.
+ */
+void nn_task_simulate_detection(uint32_t boxes);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
