@@ -106,6 +106,43 @@ void fx_app_init(void)
   }
 }
 
+int32_t fx_app_write_file_exact(const char *filename, uint8_t *data, size_t size)
+{
+  int32_t status;
+
+  if (!_fx_task.open) return FX_MEDIA_NOT_OPEN;
+  if (!filename || !data || (size == 0)) return FX_INVALID_NAME;
+
+  rtos_mutex_acquire(&_fx_task.mtx, true);
+
+  /* Fail if file already exists — we don't overwrite (per fx_app conventions) */
+  status = fx_file_open(&_fx_task.sdio, &_fx_task.file, (char*)filename, FX_OPEN_FOR_READ);
+  if (status == FX_SUCCESS)
+  {
+    (void)fx_file_close(&_fx_task.file);
+    rtos_mutex_acquire(&_fx_task.mtx, false);
+    return FX_ALREADY_CREATED;
+  }
+
+  status = fx_file_create(&_fx_task.sdio, (char*)filename);
+  if (status == FX_SUCCESS)
+  {
+    status = fx_file_open(&_fx_task.sdio, &_fx_task.file, (char*)filename, FX_OPEN_FOR_WRITE);
+    if (status == FX_SUCCESS)
+    {
+      status = fx_file_write(&_fx_task.file, (void*)data, size);
+      (void)fx_file_close(&_fx_task.file);
+    }
+  }
+  if (status == FX_SUCCESS)
+  {
+    status = fx_media_flush(&_fx_task.sdio);
+  }
+
+  rtos_mutex_acquire(&_fx_task.mtx, false);
+  return status;
+}
+
 int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size)
 {
   int32_t   status;

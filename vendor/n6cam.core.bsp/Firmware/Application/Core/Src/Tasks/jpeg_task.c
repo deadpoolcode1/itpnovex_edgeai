@@ -32,6 +32,8 @@
 #include "camera_task.h"
 #include "jpeg_task.h"
 #include "jpeg_utils.h"
+#include "registry.h"
+#include "slib32_registry.h"
 
 /*-------------------------------------------------------------------------*//**
 * @addtogroup SIANA
@@ -328,6 +330,31 @@ void _jpeg_encode_start(JPEG_HandleTypeDef *hjpeg)
   jpeg_config.ChromaSubsampling = JPEG_CHROMA_SAMPLING;
   jpeg_config.ColorSpace        = JPEG_COLOR_SPACE;
   jpeg_config.ImageQuality      = JPEG_IMAGE_QUALITY;
+
+  /* SoW §3.4 W8: pick up runtime overrides from the registry. ImageWidth /
+   * Height stay compile-time because the input chunk size + ring buffers
+   * depend on them; quality / colorspace / chroma are safe to vary per
+   * encode and just change the output bitstream. */
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      if ((reg->img_quality >= 1U) && (reg->img_quality <= 100U))
+      {
+        jpeg_config.ImageQuality = reg->img_quality;
+      }
+      switch (reg->img_color)
+      {
+        case 0U: jpeg_config.ColorSpace = JPEG_YCBCR_COLORSPACE; break;
+        case 1U: jpeg_config.ColorSpace = JPEG_YCBCR_COLORSPACE; break; /* RGB->YCBCR conversion */
+        case 2U: jpeg_config.ColorSpace = JPEG_CMYK_COLORSPACE;  break;
+        default: break;
+      }
+      jpeg_config.ChromaSubsampling =
+        (reg->img_chroma == 1U) ? JPEG_422_SUBSAMPLING : JPEG_444_SUBSAMPLING;
+      registry_release();
+    }
+  }
 
   /* Check if Image Sizes meets the requirements */
   if (

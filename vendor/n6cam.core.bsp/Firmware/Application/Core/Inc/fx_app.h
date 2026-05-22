@@ -63,6 +63,14 @@ void fx_app_init(void);
  */
 int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size);
 
+/**
+ * @brief Writes data to a file with the exact filename given (no auto-suffix).
+ *        Used when the caller already has a uniqueness scheme (e.g. SoW §7
+ *        timestamped photo filenames). Fails with FX_ALREADY_CREATED if the
+ *        file already exists.
+ */
+int32_t fx_app_write_file_exact(const char *filename, uint8_t *data, size_t size);
+
 /* -------------------------------------------------------------------------- */
 #ifdef __cplusplus
 }

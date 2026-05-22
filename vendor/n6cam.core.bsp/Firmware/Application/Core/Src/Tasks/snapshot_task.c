@@ -122,6 +122,10 @@ static t_snapshot_task _snapshot_task = {
   .state = AVAILABLE,
 };
 
+/* SoW §7 filename override. Empty = use vendor default 'Snapshot{idx}.jpeg'. */
+#define SNAP_FILENAME_MAX  63U
+static char _snap_filename[SNAP_FILENAME_MAX + 1U] = "";
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_Data -->
 *//*-----------------------------------------------------------------------*//**
@@ -175,6 +179,22 @@ bool snapshot_trigger(void)
   return false;
 }
 
+void snapshot_set_filename(const char *filename)
+{
+  if (filename == NULL)
+  {
+    _snap_filename[0] = '\0';
+    return;
+  }
+  /* Copy at most SNAP_FILENAME_MAX bytes, always NUL-terminate */
+  size_t i;
+  for (i = 0; (i < SNAP_FILENAME_MAX) && (filename[i] != '\0'); i++)
+  {
+    _snap_filename[i] = filename[i];
+  }
+  _snap_filename[i] = '\0';
+}
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
@@ -211,7 +231,15 @@ static void _snapshot_task_run(uint32_t args)
     rtos_wait_any_event(&_snapshot_task.evt, SNAPSHOT_EVT_START, true);
 
     jpeg_buff = jpeg_encode(&jpeg_size);
-    status = fx_app_write_file("Snapshot", "jpeg", jpeg_buff, jpeg_size);
+    if (_snap_filename[0] != '\0')
+    {
+      status = fx_app_write_file_exact(_snap_filename, jpeg_buff, jpeg_size);
+      _snap_filename[0] = '\0';  /* one-shot override */
+    }
+    else
+    {
+      status = fx_app_write_file("Snapshot", "jpeg", jpeg_buff, jpeg_size);
+    }
     if (status != FX_SUCCESS)
     {
       LERROR(TRACE_SNAPSHOT, "Store snapshot failed (%d)", status);

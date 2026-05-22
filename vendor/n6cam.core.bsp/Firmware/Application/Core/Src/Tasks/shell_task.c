@@ -43,6 +43,7 @@
 #include "n6cam_watchdog.h"
 #include "n6cam_core.h"   /* LED_USER3, bsp_led_set_state */
 #include "nn_task.h"
+#include "snapshot_task.h"
 
 /* Camera -------------------------------------*/
 #include "camera_task.h"
@@ -404,6 +405,7 @@ void _shell_task_init(void)
     {
       lwshell_echo_set(reg->shell_echo_enable != 0U);
       nn_task_detect_set(reg->detect_enable != 0U);
+      nn_task_action_set(reg->detect_action_mask);
       registry_release();
     }
   }
@@ -649,8 +651,25 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
            (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
            (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
 
-  /* TODO: actually trigger jpeg_encode() and route to SD or modem. */
-  CMD_PRINTF(stream, "photo %s: %s%s", sub, fname, lwshell_eol());
+  if (savesd)
+  {
+    /* Override the snapshot filename and request a capture. display_task will
+     * call snapshot_create on the next frame, the snapshot task encodes the
+     * JPEG and writes it to SD via fx_app_write_file_exact. */
+    snapshot_set_filename(fname);
+    if (!snapshot_trigger())
+    {
+      CMD_PRINTF(stream, "photo savesd: trigger failed (no SD card / busy)%s", lwshell_eol());
+      snapshot_set_filename(NULL);
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "photo savesd: capturing -> %s%s", fname, lwshell_eol());
+  }
+  else
+  {
+    /* upload: needs HDLC tunnel to WP76. Stub for now — emit notification only. */
+    CMD_PRINTF(stream, "photo upload: %s (modem not wired)%s", fname, lwshell_eol());
+  }
 
   /* Emit a notification carrying the action + filename. rsn=0x40 = photo-event
    * bit (extension to SoW §4.2's bit table). rsd encodes savesd vs upload. */
@@ -787,6 +806,7 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
         registry_release();
         registry_request_save();
       }
+      nn_task_action_set((uint8_t)am);
       CMD_PRINTF(stream, "detect profile: det_msk=0x%02lx action_msk=0x%02lx%s",
                  (unsigned long)dm, (unsigned long)am, lwshell_eol());
       _cmd_ack(stream, argv, argc);

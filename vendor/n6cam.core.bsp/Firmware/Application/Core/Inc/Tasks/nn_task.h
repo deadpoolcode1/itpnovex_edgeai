@@ -125,6 +125,13 @@ uint32_t nn_task_resume_thread(void);
 void nn_task_detect_set(bool enable);
 bool nn_task_detect_get(void);
 
+/**
+ * @brief Set the SoW §4.2 'action_msk' for on-detection side effects.
+ *        bit0 = save to SD (W12), bit1 = report cellular (W11/W13).
+ *        Checked on each new-object edge. 0 = no side effects.
+ */
+void nn_task_action_set(uint8_t mask);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

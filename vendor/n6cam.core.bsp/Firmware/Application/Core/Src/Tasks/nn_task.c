@@ -40,6 +40,8 @@
 #include "n6cam_npu.h"
 #include "stai.h"
 #include "stai_network.h"
+#include "snapshot_task.h"
+#include "n6cam_rtc.h"
 
 /*-------------------------------------------------------------------------*//**
 * @addtogroup SIANA
@@ -193,10 +195,15 @@ uint32_t nn_task_resume_thread(void)
 
 /* Runtime detection gate (SoW §3.1 detect start/stop). Default is OFF —
  * the SoW says detection must be explicitly started. */
-static volatile bool _nn_detect_enabled = false;
+static volatile bool    _nn_detect_enabled = false;
+static volatile uint8_t _nn_action_mask    = 0U;
+/* Edge detection: previous frame's box count. Lets us fire snapshot/notify
+ * only on 0->N transitions, not every frame at 22 Hz. */
+static uint32_t          _nn_prev_boxes    = 0U;
 
-void nn_task_detect_set(bool enable) { _nn_detect_enabled = enable; }
-bool nn_task_detect_get(void)        { return _nn_detect_enabled; }
+void nn_task_detect_set(bool enable)   { _nn_detect_enabled = enable; }
+bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
+void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
@@ -236,6 +243,37 @@ static void _nn_task_run(uint32_t args)
       stat_time_start(STAT_TIME_NN_TOTAL);
       _nn_frame_process();
       stat_time_stop(STAT_TIME_NN_TOTAL);
+
+      /* SoW W12 / W11: on a 0->N box-count edge, fire side effects
+       * per the action_msk profile. Edge-only so we don't spam SD
+       * with one JPEG per frame at 22 Hz. */
+      uint32_t cur_boxes = (uint32_t)_pp_box_count;
+      if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U))
+      {
+        /* bit0 = save to SD: build SoW §7 filename + trigger snapshot */
+        if (_nn_action_mask & 0x01U)
+        {
+          t_datetime dt = { 0 };
+          (void)bsp_rtc_get_time(&dt);
+          uint32_t ser = HAL_GetUIDw0();
+          char fname[48];
+          snprintf(fname, sizeof(fname),
+                   "%lu_%02u%02u20%02u_%02u%02u%02u.rdy",
+                   (unsigned long)ser,
+                   (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
+                   (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
+          snapshot_set_filename(fname);
+          if (!snapshot_trigger())
+          {
+            /* SD busy/missing — drop this one; don't block inference */
+            snapshot_set_filename(NULL);
+          }
+        }
+        /* bit1 = report cellular: handled when modem channel is wired
+         * (W11/W13). For now we still log the detection via trace. */
+        LINFO(TRACE_NN, "detected %lu object(s)", (unsigned long)cur_boxes);
+      }
+      _nn_prev_boxes = cur_boxes;
     }
   }
 }

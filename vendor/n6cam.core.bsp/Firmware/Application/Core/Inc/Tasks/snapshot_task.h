@@ -100,6 +100,15 @@ void snapshot_create(t_draw *draw);
  */
 bool snapshot_trigger(void);
 
+/**
+ * @brief Override the next snapshot's filename (SoW §7 timestamped names).
+ *        Pass NULL to revert to the default 'Snapshot{idx}.jpeg'. The
+ *        override is consumed by the next snapshot then cleared.
+ *
+ * @note  Caller owns the storage; snapshot_task copies it.
+ */
+void snapshot_set_filename(const char *filename);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**
