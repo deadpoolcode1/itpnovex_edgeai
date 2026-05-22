@@ -13,7 +13,7 @@ captures/
 *.png
 # (PDFs in repo root are reference docs and ARE tracked — see !*.pdf below)
 
-# Build outputs
+# Build outputs (catch-all)
 build/
 out/
 *.elf
@@ -24,9 +24,22 @@ out/
 *.obj
 *.d
 *.a
+*.list
+*.su
+*.cyclo
 
-# Downloaded vendor source / SDKs (large, fetched by build script)
-vendor/
+# CubeIDE per-project Release/Debug directories under the vendor BSP
+vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/*/Release/
+vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/*/Debug/
+
+# But keep the vendor binary blobs the build needs (can't regenerate without retraining model / vendor WiFi firmware)
+!vendor/n6cam.core.bsp/Firmware/Model/network_data.hex
+!vendor/n6cam.core.bsp/Firmware/Middlewares/Third_Party/WHD/binaries/*.bin
+
+# Bulky vendor reference docs (duplicates of online HTML reference manual)
+*.chm
+
+# Other vendor / SDK downloads (still ignored — only the N6Cam BSP is vendored in)
 sdk/
 third_party/
 .deps/

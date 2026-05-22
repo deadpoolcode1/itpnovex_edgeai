@@ -117,6 +117,24 @@ camera exposure [value]     — shutter, 0..33000 µs
 
 Note: the firmware does **not** expose focus / sharpness / zoom controls. The IMX335 sensor has no lens actuator; focus is set mechanically by rotating the M12 lens barrel (the vendor thread-locks it at the factory — see SIANA wiki "Lens Info" page).
 
+## Self-update over USB-C (no STLink, no boot-switch toggle)
+
+The Application carries a CDC-triggered firmware self-updater. Once the kit is running our firmware, daily iteration goes through the kit's own USB-C link — no SWD, no boot-switch toggle.
+
+```bash
+# Build + sign a new Application (see "Building the firmware from source" below)
+# Then push it:
+./n6cam-update.py vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin
+```
+
+The script reads the file, computes a zlib CRC32, opens the kit's CDC port (default `/dev/ttyACM1`; find reliably with `readlink -f /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02`), sends the shell `update` command, then streams `UPDT` magic + size + CRC32 + payload. The kit verifies the CRC, erases SLOT1_APP (1 MB at `0x70400000`), writes the new image, and resets — total ~5–10s. Watch device-side trace with `cat /dev/ttyACM1 &` during the update.
+
+**Limits — switch + SWD is still the path for:**
+- Updating **FSBL** itself (can't replace itself live)
+- **Bricked-Application recovery** (a crash before USB enumerates = no CDC port = no self-update)
+
+See `patches/firmware-recovery-and-self-update.patch` for the firmware-side implementation (Application's `update` and `recovery` CLI commands, FSBL recovery hook).
+
 ## Building the firmware from source
 
 Source: [`bitbucket.org/sianasystems/n6cam.core.bsp`](https://bitbucket.org/sianasystems/n6cam.core.bsp) (public). Two firmware projects: `FSBL` (First-Stage Boot Loader) and `Application` (People Detection demo + UVC streamer + camera shell).
@@ -135,15 +153,11 @@ Install STM32CubeIDE and STM32CubeProgrammer from st.com (both have native Linux
 - CubeIDE: `/opt/st/stm32cubeide_1.19.0/`
 - CubeProgrammer: `~/STMicroelectronics/STM32Cube/STM32CubeProgrammer/`
 
-### Clone the source
+### Source layout
 
-```bash
-mkdir -p vendor && cd vendor
-git clone --depth 1 https://bitbucket.org/sianasystems/n6cam.core.bsp.git
-cd n6cam.core.bsp
-```
+The SIANA N6Cam BSP is vendored into `vendor/n6cam.core.bsp/` (snapshot of [`bitbucket.org/sianasystems/n6cam.core.bsp`](https://bitbucket.org/sianasystems/n6cam.core.bsp) with our additions: FSBL recovery hook, Application `recovery` + `update` CDC commands, UART recovery listener). Just clone this repo and build — no separate vendor fetch needed.
 
-The repo ships pre-built Neural-Art model blobs (`Firmware/Model/network_data.hex`, ~8.3 MB), so you do **not** need the `stedgeai` CLI unless you want to retrain / regenerate the model.
+The pre-built Neural-Art model blobs (`Firmware/Model/network_data.hex`, ~8.3 MB) are checked in, so you do **not** need the `stedgeai` CLI unless you want to retrain / regenerate the model.
 
 ### Build (headless — no GUI needed)
 

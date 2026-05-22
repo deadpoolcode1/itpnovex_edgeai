@@ -1,0 +1,162 @@
+SIANA-N6Cam_Murata v0.27               2026/04/20
+=================================================
+- Updated:
+  - ISP to v2.0.0
+  - Updated camera drivers
+  - Fixed Maneki driver name (VDX941 to VD1943)
+
+SIANA-N6Cam_Murata v0.26               2026/03/27
+=================================================
+- Updated:
+  - ST EdgeAI to v4.0
+  - Vision Model PP to v0.14.2
+  - AI PP Wrapper to v1.0.10
+  - Fixed signature inconsistency on telnet stream
+
+SIANA-N6Cam_Murata v0.25               2026/03/26
+=================================================
+- Updated:
+  - HAL to v1.3.0
+  - Updated SLIB32 definitions
+- Known bug:
+  - Compilation issues with toolchain +v14.3.rel1
+
+SIANA-N6Cam_Murata v0.24               2025/12/11
+=================================================
+- Featuring:
+  - Support for ST cameras (VDx941)
+  - Telnet for shell access
+- Updated:
+  - EdgeAI to v2.2.0
+  - Updated BSP/SLIB32 definitions
+  - Included IO definitions for STM32N6-DK
+  - Improved button debounce logic
+
+SIANA-N6Cam_Murata v0.23               2025/10/28
+=================================================
+- Featuring:
+  - Support for VL53L7 TOF sensor
+- Updated:
+  - HAL to v1.2.0
+  - ISP to v1.2.0
+  - Fixed TCP stream application
+  - Updated clock settings
+  - Updated BSP/SLIB32 definitions
+  - Updated project startup/system files
+  - Updated memory layout (check linker)
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_Murata v0.22               2025/06/26
+=================================================
+- Featuring:
+  - SAI libraries for detection transform and drawing
+- Updated:
+  - Fixed NPU/MCU cache initialization
+  - Refactored BSP core to simplify the GPIO definitions and usage
+  - Updated BSP IO definitions
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_Murata v0.21               2025/06/05
+=================================================
+- Updated:
+  - Single file binary release
+
+SIANA-N6Cam_Murata v0.20               2025/06/04
+=================================================
+- Updated:
+  - Device name on display to: "Edge AI Sensing Kit, E2IP Technologies"
+
+SIANA-N6Cam_Murata v0.19               2025/06/03
+=================================================
+- Featuring:
+  - Integrated watchdog
+- Updated:
+  - Fixed SDCard hot-swap
+  - Fixed artifact on snapshot: JPEG tearing
+  - Refactored tasks initialization and organization
+
+SIANA-N6Cam_Murata v0.18               2025/05/27
+=================================================
+- Featuring:
+  - Documentation for flashing/testing N6Cam
+  - Support for ST cameras (VD55G1, VD66GY)
+  - Command shell:
+    - Camera flip configuration (h / v / off)
+    - Wifi mode selection command (sta / off)
+- Updated:
+  - Fixed NPU cache management functions
+  - Included extra logic for Wifi:
+    - Added toggle in common.h to enable/disable service
+    - Improved reconnection (empty IP and connection polling)
+    - Updated init to check Wifi presence even when mode is OFF
+  - Refactored draw implementation:
+    - Functions enabled for using in multiple tasks
+    - Print now allows to set the background width
+    - Added color/alpha definitions
+  - Refactored traces to improve readability
+  - Refactored camera task for on-boot camera selection (IMX335, VD55G1, VD66GY)
+  - User button (short press): Change AWB profile for ISP cameras (IMX335, VD66GY) and brightness for other devices (VD55G1)
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_Murata v0.17               2025/04/09
+=================================================
+- Updated:
+  - Removed POC support
+  - Reorganized project structure
+  - Changed Standalone to Application
+  - Refactored release scripts
+
+SIANA-N6Cam_Murata v0.16               2025/04/08
+=================================================
+- Featuring:
+  - User button:
+    - Short press: Change AWB profile
+    - Long press (+1sec): Take a snapshot
+- Updated:
+  - HAL to v1.1.0
+  - ISP to v1.1.0
+  - SRAM/FLASH layout
+  - Refactored camera task and control commands
+
+SIANA-N6Cam_Murata v0.15               2025/04/01
+=================================================
+- Featuring:
+  - RTC support
+  - Command shell:
+    - System commands (rtc)
+    - Wifi control commands (mdns, sntp, static)
+  - Wifi support (static IPs, mDNS client, SNTP client)
+- Updated:
+  - Refactored SLIB32 registry
+
+SIANA-N6Cam_Murata v0.14               2025/03/18
+=================================================
+- Based on SIANA-N6Cam_BSP v1.0
+- Featuring:
+  - Registry
+  - Command shell:
+    - System commands (fw version, mcu uid, reboot)
+    - Camera control commands (aec, awb, gain, exposure)
+    - Wifi control commands (join, ifconfig)
+  - Wifi support (RTSP server)
+- Updated:
+  - ISP updated to v1.0.1
+  - People Detection model is now using ST Yolo V8n 192x192
+  - Refactored/improved tests, BSP, and SLIB32
+
+SIANA-N6Cam_BSP v1.0                   2025/01/14
+=================================================
+- Initial release
+- Featuring:
+  - Factory/Built-in tests
+  - People detection
+  - Camera snapshot
+  - UVC streaming
+- Using:
+  - HAL v1.0.0
+  - ISP v1.0.0
+  - EdgeAI v2.0.0
+  - lib_vision_models_pp v0.7.2

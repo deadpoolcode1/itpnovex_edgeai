@@ -1,0 +1,111 @@
+SIANA-N6Cam_BSP v1.8                   2026/04/20
+=================================================
+- Updated:
+  - ISP to v2.0.0
+  - Updated camera drivers
+  - Fixed Maneki driver name (VDX941 to VD1943)
+
+SIANA-N6Cam_BSP v1.7                   2026/03/27
+=================================================
+- Updated:
+  - ST EdgeAI to v4.0
+  - Vision Model PP to v0.14.2
+  - AI PP Wrapper to v1.0.10
+  - Fixed signature inconsistency on telnet stream
+
+SIANA-N6Cam_BSP v1.6                   2026/03/26
+=================================================
+- Updated:
+  - HAL to v1.3.0
+  - Updated SLIB32 definitions
+- Known bug:
+  - Compilation issues with toolchain +v14.3.rel1
+
+SIANA-N6Cam_BSP v1.5                   2025/12/11
+=================================================
+- Featuring:
+  - Support for ST cameras (VDx941)
+- Updated:
+  - EdgeAI to v2.2.0
+  - Updated BSP/SLIB32 definitions
+  - Included IO definitions for STM32N6-DK
+  - Improved button debounce logic
+
+SIANA-N6Cam_BSP v1.4                   2025/10/28
+=================================================
+- Featuring:
+  - Support for VL53L7 TOF sensor
+- Updated:
+  - HAL to v1.2.0
+  - ISP to v1.2.0
+  - Updated clock settings
+  - Updated BSP/SLIB32 definitions
+  - Updated project startup/system files
+  - Updated memory layout (check linker)
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_BSP v1.3                   2025/06/26
+=================================================
+- Featuring:
+  - SAI libraries for detection transform and drawing
+- Updated:
+  - Fixed NPU/MCU cache initialization
+  - Refactored BSP core to simplify the GPIO definitions and usage
+  - Updated BSP IO definitions
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_BSP v1.2                   2025/06/05
+=================================================
+- Featuring:
+  - Integrated watchdog
+  - Support for ST cameras (VD55G1, VD66GY)
+  - Command shell:
+    - Camera flip configuration (h / v / off)
+- Updated:
+  - Single file binary release
+  - Device name on display to: "Edge AI Sensing Kit, E2IP Technologies"
+  - User button (short press): Change AWB profile for ISP cameras (IMX335, VD66GY) and brightness for other devices (VD55G1)
+  - Fixed SDCard hot-swap
+  - Fixed artifact on snapshot: JPEG tearing
+  - Fixed NPU cache management functions
+  - Refactored camera task for on-boot camera selection (IMX335, VD55G1, VD66GY)
+  - Refactored draw implementation:
+    - Functions enabled for using in multiple tasks
+    - Print now allows to set the background width
+    - Added color/alpha definitions
+  - Refactored tasks initialization and organization
+  - Refactored traces to improve readability
+- Known bug:
+  - VD66GY color artifact on flip (h/v)
+
+SIANA-N6Cam_BSP v1.1                   2025/04/15
+=================================================
+- Featuring:
+  - User button:
+    - Short press: Change AWB profile
+    - Long press (+1sec): Take a snapshot
+- Updated:
+  - HAL to v1.1.0
+  - ISP to v1.1.0
+  - SRAM/FLASH layout
+  - Removed POC support
+  - Refactored release scripts
+  - Refactored/improved tests, BSP, and SLIB32
+  - Reorganized project structure
+  - People Detection model is now using ST Yolo V8n 192x192
+
+SIANA-N6Cam_BSP v1.0                   2025/01/14
+=================================================
+- Initial release
+- Featuring:
+  - Factory/Built-in tests
+  - People detection
+  - Camera snapshot
+  - UVC streaming
+- Using:
+  - HAL v1.0.0
+  - ISP v1.0.0
+  - EdgeAI v2.0.0
+  - lib_vision_models_pp v0.7.2

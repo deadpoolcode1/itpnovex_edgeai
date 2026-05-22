@@ -1,0 +1,70 @@
+/**
+ ******************************************************************************
+ * @file    fx_app.h
+ * @author  SIANA Systems
+ * @date    2024
+ * @brief   FileX application definition
+ ******************************************************************************
+ * @attention
+ *
+ * <h2><center>© COPYRIGHT 2024 SIANA Systems</center></h2>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ ******************************************************************************
+ */
+#ifndef __FX_APP_H__
+#define __FX_APP_H__
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "fx_api.h"
+#include "tx_app.h"
+
+/*-->> Public Definitions <<--------------------------------------------------*/
+
+/*-->> Public Macros <<-------------------------------------------------------*/
+
+/*-->> Public Types <<--------------------------------------------------------*/
+
+/*-->> Public Data <<---------------------------------------------------------*/
+
+/*-->> Public API <<----------------------------------------------------------*/
+
+/**
+ * @brief FileX application initialization
+ */
+void fx_app_init(void);
+
+/**
+ * @brief Writes data to a new file - if file already exists, adds suffix
+ * @param path Path to new file
+ * @param ext  File extension (e.g. ".txt")
+ * @param data Data to write
+ * @param size Size of the data
+ * @retval Error code
+ */
+int32_t fx_app_write_file(char *path, char *ext, uint8_t *data, size_t size);
+
+/* -------------------------------------------------------------------------- */
+#ifdef __cplusplus
+}
+#endif
+#endif /* __FX_APP_H__ */
