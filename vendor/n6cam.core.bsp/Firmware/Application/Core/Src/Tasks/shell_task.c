@@ -201,6 +201,8 @@ static int32_t  _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Notifications (SoW §3.1, §4.2, §6) */
 static int32_t  _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* Photo capture (SoW §3.1, §4.2, §7) */
+static int32_t  _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
@@ -276,6 +278,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
   {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
+  {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -614,6 +617,47 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
     stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
   }
   _notify_num = (_notify_num + 1U) & 0xFFFFU;
+}
+
+/* SoW §3.1 / §4.2 / §7: photo savesd | upload.
+ *
+ * Generates the SoW §7 filename: serial_DDMMYYYY_HHMMSS.rdy
+ * Emits a '+SDVRNTF: ... rsn=0x40' notification with the filename as
+ * mod-string so the host (and later the modem) can correlate.
+ *
+ * Actual JPEG capture + SD/UART transport is proposal W7/W12/W13. The
+ * call sites here will trigger jpeg_encode() and route the bytes to
+ * SD (via fx_app) for savesd, or HDLC->SDVR+SENDBIN for upload, once
+ * those tasks are wired. */
+static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
+
+  bool savesd = (strcmp(sub, "savesd") == 0);
+  bool upload = (strcmp(sub, "upload") == 0);
+  if (!savesd && !upload) return LWSHELL_ERROR_SYNTAX_CMD;
+
+  /* Build the filename per SoW §7: serial_DDMMYYYY_HHMMSS.rdy */
+  t_datetime dt = { 0 };
+  (void)bsp_rtc_get_time(&dt);
+  uint32_t ser = HAL_GetUIDw0();
+  char fname[48];
+  snprintf(fname, sizeof(fname),
+           "%lu_%02u%02u20%02u_%02u%02u%02u.rdy",
+           (unsigned long)ser,
+           (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
+           (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
+
+  /* TODO: actually trigger jpeg_encode() and route to SD or modem. */
+  CMD_PRINTF(stream, "photo %s: %s%s", sub, fname, lwshell_eol());
+
+  /* Emit a notification carrying the action + filename. rsn=0x40 = photo-event
+   * bit (extension to SoW §4.2's bit table). rsd encodes savesd vs upload. */
+  _notify_emit(0x40U, savesd ? 1U : 2U, false);
+
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
 }
 
 /* SoW §3.1 / §4.2: notify enable <mask> | disable | trigger <code> |
