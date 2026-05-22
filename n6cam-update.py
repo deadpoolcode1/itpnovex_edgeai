@@ -116,26 +116,29 @@ def main() -> int:
         print(f"stty failed on {args.tty}")
         return 1
 
-    with open(args.tty, "r+b", buffering=0) as port:
+    # Use raw os.open with O_NONBLOCK so we don't block on modem control
+    # lines that the CDC ACM stack doesn't drive. Then os.write loops over
+    # the buffer manually with a small sleep on EAGAIN.
+    fd = os.open(args.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+    def write_all(buf: bytes):
+        n = 0
+        while n < len(buf):
+            try:
+                n += os.write(fd, buf[n:])
+            except BlockingIOError:
+                time.sleep(0.001)
+
+    try:
         # Trigger the shell 'update [app|model]' command.
-        cmd = f"\nupdate {args.target}\n".encode()
-        port.write(cmd)
-        port.flush()
-        # Give the App a moment to print its prompt and switch to binary RX.
+        write_all(f"\nupdate {args.target}\n".encode())
         time.sleep(0.5)
+        write_all(b"UPDT" + struct.pack("<II", size, crc))
 
-        hdr = b"UPDT" + struct.pack("<II", size, crc)
-        port.write(hdr)
-        port.flush()
-
-        # Chunk the payload — 4 KB at a time keeps the device buffer ahead of
-        # CDC USB transfers without blocking on flow control.
         CHUNK = 4096
         t0 = time.time()
         for i in range(0, size, CHUNK):
-            port.write(data[i:i + CHUNK])
-            port.flush()
-            # Progress for large payloads (models)
+            write_all(data[i:i + CHUNK])
             if size > 1024 * 1024 and (i // CHUNK) % 256 == 0:
                 elapsed = time.time() - t0
                 pct = 100.0 * i / size
@@ -146,6 +149,8 @@ def main() -> int:
         print(f"Sent {size} bytes in {dt:.1f}s ({size/dt/1024:.0f} KB/s). "
               f"Device will erase+write+reboot — model can take ~90s, "
               f"app ~5s.")
+    finally:
+        os.close(fd)
 
     return 0
 
