@@ -207,6 +207,15 @@ bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
 
+/* Test-frame override: when non-NULL, the NN loop reads inference input
+ * from this buffer instead of the camera's ancillary buffer. Useful for
+ * bench-testing the algorithm against a known scene without depending on
+ * camera focus. Caller is responsible for cache coherence. */
+static uint8_t * volatile _nn_test_frame_override = NULL;
+
+void nn_task_set_test_frame(uint8_t *frame) { _nn_test_frame_override = frame; }
+uint32_t nn_task_get_box_count(void)        { return (uint32_t)_pp_box_count; }
+
 /* SoW test-injection (firmware-side simulate). Sets a synthetic box count
  * + a synthetic person-class box, runs the same on-edge side-effects the
  * inference loop would: snapshot trigger + notification + trace log.
@@ -300,8 +309,14 @@ static void _nn_task_run(uint32_t args)
       continue;
     }
 
-    /* Process frame */
-    _nn_frame = camera_get_buffer(camera.ancillary.id);
+    /* Process frame. If a test-frame override is in place, use it instead of
+     * the live camera buffer — exercises the NN pipeline against a known
+     * scene (W6 algorithm validation when camera optics are subpar). */
+    {
+      uint8_t *override = _nn_test_frame_override;
+      _nn_frame = (override != NULL) ? override
+                                     : camera_get_buffer(camera.ancillary.id);
+    }
     if (_nn_frame != NULL)
     {
       stat_time_start(STAT_TIME_NN_TOTAL);

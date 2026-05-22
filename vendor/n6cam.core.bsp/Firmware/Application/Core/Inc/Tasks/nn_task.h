@@ -155,6 +155,26 @@ void nn_task_det_set(uint8_t mask);
  */
 void nn_task_simulate_detection(uint32_t boxes);
 
+/**
+ * @brief Inject a real test image into the NN pipeline.
+ *        The NN task uses `frame` as the input instead of the camera's
+ *        ancillary buffer until the override is cleared (NULL). Buffer
+ *        layout must match CAMERA_ANCILLARY_BUFFER_SIZE (192*192*3 RGB).
+ *        Lets the user prove the detection algorithm works on a known
+ *        scene while the camera optics are being tuned.
+ *
+ *        Cache-flush of the supplied buffer is the caller's responsibility.
+ *
+ * @param frame Buffer pointer, or NULL to revert to live camera.
+ */
+void nn_task_set_test_frame(uint8_t *frame);
+
+/**
+ * @brief Return the most recent post-processed detection count (for
+ *        querying after a 'frame run').
+ */
+uint32_t nn_task_get_box_count(void);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

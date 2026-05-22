@@ -45,6 +45,7 @@
 #include "nn_task.h"
 #include "snapshot_task.h"
 #include "fx_app.h"
+#include "camera_task.h"   /* CAMERA_ANCILLARY_BUFFER_SIZE */
 
 /* Camera -------------------------------------*/
 #include "camera_task.h"
@@ -207,6 +208,19 @@ static int32_t  _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 static int32_t  _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* SD card management (W10) */
 static int32_t  _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* NN test-frame injection (for algorithm validation when camera optics are subpar) */
+static int32_t  _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+
+/* Test-frame protocol: 'FRMI' magic + size_le(4) + crc32_le(4) + payload */
+#define FRAME_MAGIC                 "FRMI"
+#define FRAME_HDR_SIZE              12U
+#define FRAME_EXPECTED_SIZE         (192U * 192U * 3U)   /* = CAMERA_ANCILLARY_BUFFER_SIZE */
+#define FRAME_RX_TIMEOUT_MS         15000U
+
+/* Test-frame buffer for NN injection. Same layout as the camera ancillary
+ * buffer so the NN doesn't notice the swap. */
+static __ALIGN_BEGIN uint8_t _frame_test_buf[FRAME_EXPECTED_SIZE] __ALIGN_END IN_PSRAM;
+static bool _frame_loaded = false;
 
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
@@ -227,6 +241,9 @@ static bool _irled_state = false;
 /* SoW §4.1 success-ack helper: "<cmd> [<sub>] ok". Use at the end of any
  * new command that completes successfully. */
 static void _cmd_ack(const t_stream *stream, uint8_t **argv, size_t argc);
+/* Forward-decls of helpers used by frame injection (defined later in this TU). */
+static int32_t  _stream_read_exact(const t_stream *stream, uint8_t *buf, size_t size, uint32_t timeout_ms);
+static uint32_t _crc32(const uint8_t *data, size_t len);
 
 /* Recovery magic value: must match FSBL/Core/Src/main.c */
 #define FSBL_RECOVERY_MAGIC      0xDEADBEEFU
@@ -284,6 +301,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
+  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | run | clear | query] - inject test frame into NN" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -624,6 +642,132 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
     stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
   }
   _notify_num = (_notify_num + 1U) & 0xFFFFU;
+}
+
+/* Test-frame injection — for validating the NN algorithm against a known
+ * scene without depending on whatever the camera lens currently sees.
+ *
+ *   frame upload  -> receive FRAME_HDR (FRMI+size+crc) + 192*192*3 RGB bytes
+ *   frame run     -> route NN input to the test buffer; wait for the next
+ *                    inference; print detection count + top classes
+ *   frame clear   -> revert NN to live camera input
+ *   frame query   -> show whether a test frame is loaded
+ *
+ * Frame format: 192 x 192, RGB888 (R,G,B,R,G,B,...), row-major, top-left
+ * origin. Same layout the camera ancillary pipeline produces, so the NN
+ * sees an indistinguishable input.
+ */
+static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
+
+  if (strcmp(sub, "query") == 0)
+  {
+    CMD_PRINTF(stream, "frame: %s (NN %s)%s",
+               _frame_loaded ? "loaded" : "empty",
+               nn_task_detect_get() ? "running" : "stopped",
+               lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if (strcmp(sub, "clear") == 0)
+  {
+    nn_task_set_test_frame(NULL);
+    _frame_loaded = false;
+    CMD_PRINTF(stream, "frame: cleared (NN back to live camera)%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if (strcmp(sub, "upload") == 0)
+  {
+    uint8_t hdr[FRAME_HDR_SIZE];
+    CMD_PRINTF(stream,
+      "Ready. Send: 'FRMI' + size_le(4) + crc32_le(4) + %u bytes RGB%s",
+      (unsigned)FRAME_EXPECTED_SIZE, lwshell_eol());
+
+    int32_t n = _stream_read_exact(stream, hdr, FRAME_HDR_SIZE, FRAME_RX_TIMEOUT_MS);
+    if (n != (int32_t)FRAME_HDR_SIZE)
+    {
+      CMD_PRINTF(stream, "ERROR: header timeout (%ld bytes)%s", (long)n, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    if (memcmp(hdr, FRAME_MAGIC, 4) != 0)
+    {
+      CMD_PRINTF(stream, "ERROR: bad magic%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+    uint32_t size = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+    uint32_t expect_crc = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+    if (size != FRAME_EXPECTED_SIZE)
+    {
+      CMD_PRINTF(stream, "ERROR: size=%lu, expected %u%s",
+                 (unsigned long)size, (unsigned)FRAME_EXPECTED_SIZE, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    n = _stream_read_exact(stream, _frame_test_buf, size, FRAME_RX_TIMEOUT_MS);
+    if (n != (int32_t)size)
+    {
+      CMD_PRINTF(stream, "ERROR: payload short (%ld/%lu)%s", (long)n, (unsigned long)size, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    uint32_t got_crc = _crc32(_frame_test_buf, size);
+    if (got_crc != expect_crc)
+    {
+      CMD_PRINTF(stream, "ERROR: CRC mismatch (got 0x%08lx, expected 0x%08lx)%s",
+                 (unsigned long)got_crc, (unsigned long)expect_crc, lwshell_eol());
+      return LWSHELL_OK;
+    }
+
+    /* Cache flush so the NPU sees the bytes we just wrote (NN runs from RAM). */
+    SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
+    _frame_loaded = true;
+    CMD_PRINTF(stream, "frame upload: ok (%lu bytes, CRC 0x%08lx)%s",
+               (unsigned long)size, (unsigned long)got_crc, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if (strcmp(sub, "run") == 0)
+  {
+    if (!_frame_loaded)
+    {
+      CMD_PRINTF(stream, "frame run: no frame loaded (use 'frame upload' first)%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+    if (!nn_task_detect_get())
+    {
+      CMD_PRINTF(stream, "frame run: NN is stopped — run 'detect start' first%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+
+    /* Route NN input to our test buffer and give it a few camera ticks to
+     * process. At ~22 Hz camera FPS, 250 ms ~= 5 NN cycles, more than
+     * enough to capture a few inference runs. */
+    nn_task_set_test_frame(_frame_test_buf);
+    HAL_Delay(250);
+
+    uint32_t boxes = nn_task_get_box_count();
+    t_nn_box  buf[NN_BOXES_MAX_NUM];
+    uint32_t  got = nn_get_detections(buf);
+    CMD_PRINTF(stream, "frame run: %lu detection(s)%s", (unsigned long)boxes, lwshell_eol());
+    for (uint32_t i = 0; (i < got) && (i < 10U); i++)
+    {
+      CMD_PRINTF(stream, "  [%lu] class=%ld conf=%.2f bbox=(%.2f,%.2f,%.2f,%.2f)%s",
+                 (unsigned long)i,
+                 (long)buf[i].class_index,
+                 buf[i].conf,
+                 buf[i].x_center, buf[i].y_center,
+                 buf[i].width,    buf[i].height,
+                 lwshell_eol());
+    }
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /* SoW §3.2 / W10 SD card management.
