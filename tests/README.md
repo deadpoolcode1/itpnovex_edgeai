@@ -54,36 +54,57 @@ Output:
 
 To extend with your own images, drop them in `tests/images/` and adjust the `person_imgs` / `non_imgs` lists in `tests/run_tests.py group_algorithm()`.
 
-## Multi-class (vehicle) detection
+## Multi-class (vehicle) detection — current status
 
 The default model `vendor/n6cam.core.bsp/Firmware/Model/yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` is **person-only** — `detect profile 2 X` (vehicles bit) will always return 0 detections regardless of input.
 
-To extend to vehicles (proposal W6):
+The **firmware-side wiring is multi-class capable** (class filter, regression suite, registry persistence). What's blocking production multi-class is the **model accuracy** after the quantization step required for the ATON NPU. This section documents what we tried and where the gap is.
 
-1. Install `stedgeai` from ST (free, requires ST account). The downloaded `stedgeai-lin.zip` extracts to a Qt installer; run it with:
-   ```bash
-   /tmp/stedgeai-linux-onlineinstaller --root ~/STMicroelectronics/stedgeai \
-     --accept-licenses --confirm-command --default-answer install stedgeai0300
-   ```
-2. Source a multi-class quantized YOLOv8n model:
-   - **ST's stm32-hotspot/ultralytics repo only ships person-only variants** (`coco-person-st.tflite`). Their listed `map_52.36` ONNX still has 1-class output (we checked).
-   - Path forward: take Ultralytics `yolov8n.pt` (default COCO 80-class), export to ONNX (`yolo export model=yolov8n.pt format=onnx`), quantize with stedgeai's `--quantize` flag against a calibration dataset.
-3. Run the generate step (see `vendor/n6cam.core.bsp/Firmware/Model/generate.sh`):
-   ```bash
-   export PATH=$HOME/STMicroelectronics/stedgeai/3.0/Utilities/linux:$PATH
-   stedgeai generate --model your_multi_class_model.tflite --target stm32n6 \
-            --st-neural-art default@user_neuralart.json
-   ```
-4. Reflash `network_data.hex` to xSPI offset `0x70600000` (the SLOT1_WEIGHTS region). Either:
-   - Switch to dev mode + SWD: `STM32_Programmer_CLI -c port=SWD mode=HOTPLUG ap=1 -el "$EL" -w network_data.hex` ; or
-   - Extend `n6cam-update.py` to also accept a weights payload (~30 min of work).
-5. Update `vendor/n6cam.core.bsp/Firmware/Application/Core/Inc/app_config.h`:
-   - `AI_OD_YOLOV8_PP_NB_CLASSES` from `1` to the new class count
-6. Rebuild + push the Application via `./modular-tools.sh update`.
+### Pipeline status
 
-The firmware-side wiring is already done:
-- `nn_task_det_set(mask)` filters boxes by class: person (COCO 0) when bit0, vehicles (COCO 2/3/5/7) when bit1.
-- `detect profile <det_msk> <action_msk>` persists the mask via registry.
+All the toolchain pieces are working end-to-end:
+
+| Step | Tool | Working? |
+|---|---|---|
+| Float ONNX export from Ultralytics | `yolo export model=yolov8n.pt format=onnx imgsz=192` | ✅ |
+| INT8 quantization with calibration | `tools/quantize_yolov8n.py --samples 128` | ✅ |
+| Compile to ATON code + weights | `stedgeai generate --model … --target stm32n6 --st-neural-art …` | ✅ |
+| Push App + model to kit over UART | `./modular-tools.sh update [app\|model]` | ✅ |
+| Detection accuracy on real photos | (model dependent) | ❌ |
+
+### What we tried (this session)
+
+Starting from Ultralytics' `yolov8n.pt` (full 80-class COCO), exported to ONNX at 192×192, then four quantization variants through `tools/quantize_yolov8n.py`:
+
+| Variant | Calibration | Method | Quantized ops | Model size | NN time | Detection on astronaut |
+|---|---|---|---|---|---|---|
+| v0 (vendor's PeopleNet, 1 class) | (ST internal) | (ST internal) | — | 3.0 MB | **17 ms** | ✅ conf 0.9+ |
+| v1 (PTQ, small) | 16 imgs | MinMax | Conv/MatMul/Mul/Add | 3.5 MB | **42 ms** | ⚠️ conf 0.09 (faint hit) |
+| v2 (PTQ, more ops) | 128 imgs (COCO128) | Entropy | + MaxPool/Resize/Concat/Split/Sigmoid | 3.4 MB | 486 ms | ❌ 0 detections |
+| v3 (PTQ, narrow ops) | 128 imgs | MinMax | Conv/MatMul only | 3.4 MB | 491 ms | ❌ 0 detections |
+| v4 (PTQ, broad ops) | 128 imgs | MinMax | Conv/MatMul/Mul/Add | 3.5 MB | wedged | ❌ NN init issue |
+
+**Key takeaways:**
+- The `op_types_to_quantize` set matters enormously for inference time. Too few quantised ops → most layers fall back to Cortex-M55 float → 500 ms. The right set keeps ~95% of compute on the ATON NPU.
+- Adding more calibration data (16 → 128 from COCO128) didn't recover detection accuracy on this PTQ pipeline. The Q/DQ insertion + scale calibration doesn't line up with what `app_postprocess_od_yolov8.c` expects after the trained YOLOv8n weights are quantised.
+- This is consistent with public reports of YOLOv8 PTQ losing 5–10% mAP on small backbones — for a single class, that's tolerable; spread over 80 classes, conf scores drop into the noise.
+
+### How to make multi-class work for production
+
+Three paths, in increasing effort:
+
+1. **Ask ST for a multi-class N6 variant** — `stm32-hotspot/ultralytics` ships only `coco-person-st.tflite` today, but ST internally has multi-class deployments (the Cube AI Developer Cloud examples reference them). One support email could be the shortest path. See `EMAIL_TO_SYLVAIN.md` for a draft.
+
+2. **QAT on a GPU** — fine-tune `yolov8n.pt` with quantisation-aware training, then export to INT8 ONNX, then `stedgeai`. Preserves 70–80% of the float mAP. Tooling: `ultralytics` + `pytorch-quantization`. Runs in ~10 min on a modern GPU. We have a Jetson Orin available at the office for this.
+
+3. **ST Cube AI Developer Cloud** — upload float ONNX to https://stedgeai-dc.st.com, the server runs QAT on its end, downloads a working quantised model. Needs an ST account login.
+
+### What's already in the firmware for multi-class
+
+- `AI_OD_YOLOV8_PP_NB_CLASSES` in `app_config.h` controls the class count — bump from 1 to 80 (or however many the new model has) and rebuild.
+- `SAI_CLASSES[]` table — add display names + colours for the new classes (person + car + motorcycle + bus + truck are pre-staged in a commit comment).
+- `nn_task_det_set(mask)` filters by class bitmask: bit 0 = person (COCO 0), bit 1 = vehicles (COCO 2/3/5/7).
+- `detect profile <det_msk> <act_msk>` persists the mask via registry.
 - `run_tests.py group_algorithm` already understands `car=N`, `truck=N`, etc. — when a vehicle photo returns those classes, the regression table prints them automatically.
 
-So the moment the new model is in flash, vehicles light up; no additional code changes.
+The moment a working `network_data.hex` is in flash and `NB_CLASSES` matches, vehicles light up — no additional code changes.

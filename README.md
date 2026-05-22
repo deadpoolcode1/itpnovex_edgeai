@@ -1,6 +1,8 @@
 # EdgeAI — SIANA N6Cam People-Counter Firmware
 
-Custom firmware for the SIANA N6Cam (STM32N657, IMX335 5MP camera + Neural-Art NPU) per the Scopus PoC SoW. Streams H.264 over USB-C UVC, runs on-device person/vehicle detection, captures JPEGs to SD, and (when wired) tunnels alerts + photos to a WP76 modem over UART.
+Custom firmware for the SIANA N6Cam (STM32N657, IMX335 5MP camera + Neural-Art NPU) per the Scopus PoC SoW. Streams H.264 over USB-C UVC, runs on-device **person detection** (NN at ~17 ms / frame on the ATON NPU), captures JPEGs to SD, and (when wired) tunnels alerts + photos to a WP76 modem over UART.
+
+**Detection status:** the firmware-side wiring supports both people and vehicle classes (bitmask filter, COCO classes 0/2/3/5/7). The model currently in flash is the vendor's `yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` (person-only). Multi-class deployment is mechanism-complete — `update model` over UART works end-to-end — but blocked on a production-grade multi-class quantized model for STM32N6 (see [§6 Detection model](#6-detection-model)).
 
 | Property | Value |
 |---|---|
@@ -69,7 +71,9 @@ wait
 | `notify query` | Current notify state + message count. |
 | `photo savesd` / `photo upload` | Capture JPEG → SD card (`savesd`) or modem (`upload`, needs WP76). Filename `serial_DDMMYYYY_HHMMSS.rdy`. |
 | `recovery` | Reboot into FSBL recovery halt (limited use on this kit — debug auth locks SWD in op mode regardless). |
-| `update` | Receive new App firmware over CDC and reflash xSPI. Used by `n6cam-update.py` — you won't run this by hand. |
+| `update [app\|model]` | Receive new App firmware (default) or NN model weights over CDC and reflash xSPI. Used by `n6cam-update.py` — you won't run this by hand. |
+| `frame upload\|load\|run\|clear\|query` | Test-frame injection — push a 192×192 RGB image into the NN input from the host, run inference, read back detections. Used by the regression suite to validate the algorithm without depending on the lens. |
+| `sd query\|ls\|format CONFIRM` | SD card status, root listing, destructive reformat (FAT32). |
 
 Successful commands respond `<cmd> [<sub>] ok`. Notifications appear on the same port as `+SDVRNTF: {"ser":...,"num":...,"rsn":...,...}` (SoW §6 JSON).
 
@@ -113,10 +117,18 @@ To build the FSBL too, use `-import vendor/.../STM32CubeIDE/FSBL -build "FSBL/Re
 ### Daily path: USB-C self-update (no SWD, no boot switch)
 
 ```bash
+# App update (default):
+./modular-tools.sh update
+# or directly:
 ./n6cam-update.py vendor/n6cam.core.bsp/Firmware/STM32CubeIDE/Application/Release/Application_signed.bin
+
+# Model update (NN weights, e.g. after re-running stedgeai on a new model):
+./modular-tools.sh update model
+# or with explicit path:
+./n6cam-update.py --target model vendor/n6cam.core.bsp/Firmware/Model/network_data.hex
 ```
 
-The script opens the kit's CDC port (`/dev/ttyACM1` by default), triggers the `update` shell command, streams the signed binary, and the kit reboots into the new firmware. Total ~10s.
+The scripts open the kit's CDC port, trigger the `update [app|model]` shell command, stream the signed payload (auto-converting Intel HEX → binary on the host if needed), and the kit reboots. App = ~5 s, model = ~30–60 s (large erase). Both targets work without SWD or the boot switch.
 
 ### Recovery / FSBL path: SWD via STLink-V3 (boot switch needed)
 
@@ -136,7 +148,25 @@ Only required when changing the FSBL itself, or when the Application is bricked 
 
 Why two paths? STM32N6's Debug Authentication locks the SWD access ports while the FSBL is running in op mode, so SWD only works from dev-mode boot. The CDC self-updater is in-application — it writes xSPI flash from inside the running App, bypassing SWD entirely. See `memory/project_n6cam_debug_auth_locked.md` for the full story.
 
-## 5. Troubleshooting
+## 5. Test suite + HTML report
+
+A comprehensive regression suite drives the kit's CDC shell and exercises every SoW command, the SD photo pipeline, frame injection, the NN algorithm, and inference performance. See [`tests/README.md`](tests/README.md) for the full breakdown.
+
+```bash
+./modular-tools.sh test
+```
+
+Latest baseline: **46 / 47 PASS in 15 s, NN inference 17 ms / frame** on the 1-class person model. Output goes to `results/test-report-<timestamp>.html` (and `.pdf` if `wkhtmltopdf` or headless Chrome is on PATH) in the same format as the V20_SDVR reports.
+
+## 6. Detection model
+
+The model in flash today is the vendor's pre-quantized `yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` (person-only, 192×192 input, INT8 on the ATON NPU). Inference: ~17 ms / frame.
+
+The firmware-side wiring is multi-class capable — `detect profile <det_msk> <act_msk>` filters by class bitmask (bit 0 = people, bit 1 = vehicles → COCO 2/3/5/7), and the regression suite already understands `car=N` / `truck=N` / etc. The moment a multi-class quantized model lands in `vendor/.../Model/network_data.hex`, vehicles light up automatically with no firmware code changes — just bump `AI_OD_YOLOV8_PP_NB_CLASSES` from 1 to N and re-run `./modular-tools.sh build && ./modular-tools.sh update` + `./modular-tools.sh update model`.
+
+The full pipeline for producing a custom model is committed under `tools/quantize_yolov8n.py` (ONNX Runtime static quantization with COCO128 calibration). What's blocking production multi-class today is **model accuracy after PTQ** — Ultralytics' post-training quantization on `yolov8n.pt` collapses confidence scores when fed through `stedgeai → ATON → vendor's app_postprocess_od_yolov8`. Production-grade accuracy requires either QAT (quantization-aware training on a GPU) or a vendor-blessed multi-class N6 model from ST. See `tests/README.md` for the experimental results and what each variant produced.
+
+## 7. Troubleshooting
 
 - **`lsusb` shows nothing for the kit after plug-in** — cable is charge-only (no data lines), or you plugged into a power-only port. Try a different USB-C cable / port directly on the laptop, not the dock.
 - **`Device or resource busy` on `/dev/videoN`** — another process holds the V4L2 device. UVC is single-reader; close mpv/ffmpeg first.
@@ -156,17 +186,29 @@ Why two paths? STM32N6's Debug Authentication locks the SWD access ports while t
 ## Source layout
 
 ```
-n6cam-update.py            # host-side self-update script (stdlib only)
+modular-tools.sh           # one-liner workflows: setup / build / flash / update [app|model] / test / demo-* / doctor
+n6cam-update.py            # host-side self-update script (CDC, supports --target app|model)
+n6cam-inject-frame.py      # host-side test-frame inject (any image → 192x192 RGB → NN)
+n6cam-regress.py           # standalone batch detection-regression script (older; superseded by tests/run_tests.py)
+n6cam-prep-tests.py        # convert folder of images → .raw files for SD-based testing
+tests/
+  run_tests.py             # main test runner (CDC shell + image inject + HTML report)
+  README.md                # what each test group covers, image sourcing, multi-class workflow
+  images/                  # 15 deterministic test photos (skimage / NASA PD)
+tools/
+  quantize_yolov8n.py      # ONNX → ORT static INT8 quantization for stedgeai
+results/                   # test-report-<timestamp>.html + .pdf (V20_SDVR format)
 captures/                  # sample JPEGs from the running kit (gitignored)
 vendor/n6cam.core.bsp/     # SIANA BSP snapshot with our additions
   Firmware/
-    FSBL/Core/Src/main.c                  # recovery-magic hook
-    Application/Core/Src/Tasks/shell_task.c   # all our shell commands
-    Application/Core/Src/Tasks/nn_task.c      # detect gate + suspend/resume
-    Application/Core/Src/Tasks/snapshot_task.c# JPEG → SD via FileX (vendor)
-    Application/Core/Src/fx_app.c             # FileX SD mount + write (vendor)
-    Application/Core/Inc/registry.h           # V3 persistent settings
-    Model/network_data.hex                    # Neural-Art model weights (PeopleNet)
+    FSBL/Core/Src/main.c                       # recovery-magic hook
+    Application/Core/Src/Tasks/shell_task.c    # all our shell commands + self-updater
+    Application/Core/Src/Tasks/nn_task.c       # detect gate + class filter + suspend/resume
+    Application/Core/Src/Tasks/snapshot_task.c # JPEG → SD via FileX (vendor)
+    Application/Core/Src/fx_app.c              # FileX SD mount/read/write (vendor + our helpers)
+    Application/Core/Inc/registry.h            # V3 persistent settings
+    Model/network_data.hex                     # Neural-Art model weights (currently PeopleNet)
+    Model/_backup_person_only/                 # vendor's 1-class model artifacts (recovery baseline)
 ```
 
 ## Vendor links
