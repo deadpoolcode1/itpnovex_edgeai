@@ -188,6 +188,11 @@ static void     _recovery_trigger(void);
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+
+/* SoW §4.1 success-ack helper: "<cmd> [<sub>] ok". Use at the end of any
+ * new command that completes successfully. */
+static void _cmd_ack(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* Recovery magic value: must match FSBL/Core/Src/main.c */
 #define FSBL_RECOVERY_MAGIC      0xDEADBEEFU
@@ -236,6 +241,7 @@ static __ALIGN_BEGIN uint8_t _uart_recov_buf[UART_RECOV_BUF_SIZE] __ALIGN_END;
 /* Common -------------------------------------*/
 static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _rtc_cmd                , .name = "rtc"       , .help = "Print RTC time"  },
+  {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "Receive new App firmware over CDC and reflash xSPI" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -354,6 +360,16 @@ void _shell_task_init(void)
     Error_Handler();
   }
 
+  /* Apply persisted shell settings (SoW §4.1) */
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      lwshell_echo_set(reg->shell_echo_enable != 0U);
+      registry_release();
+    }
+  }
+
   /*-->> READY <<--*/
   LINFO(TRACE_SHELL, "Task started");
   task_raise_event(TX_EVT_SHELL_READY);
@@ -380,6 +396,53 @@ static void _shell_task_run(uint32_t args)
       lwshell_stream_change(_shell.stream);
     }
   }
+}
+
+/* SoW §4.1 success-ack helper */
+static void _cmd_ack(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc >= 2U)
+  {
+    CMD_PRINTF(stream, "%s %s ok%s", (char*)argv[0], (char*)argv[1], lwshell_eol());
+  }
+  else
+  {
+    CMD_PRINTF(stream, "%s ok%s", (char*)argv[0], lwshell_eol());
+  }
+}
+
+/* Echo command (SoW §4.1): toggle terminal-style echo + prompt printing.
+ * Persists in registry. */
+static int32_t _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  bool set       = false;
+  bool new_state = false;
+
+  if (argc >= 2U)
+  {
+    if (strcmp((char*)argv[1], "on") == 0)       { set = true;  new_state = true;  }
+    else if (strcmp((char*)argv[1], "off") == 0) { set = true;  new_state = false; }
+    else if (strcmp((char*)argv[1], "query") != 0)
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+  }
+
+  if (set)
+  {
+    lwshell_echo_set(new_state);
+    t_registry_data *reg = registry_acquire();
+    if (reg)
+    {
+      reg->shell_echo_enable = new_state ? 1U : 0U;
+      registry_release();
+      registry_request_save();
+    }
+  }
+
+  CMD_PRINTF(stream, "echo: %s%s", lwshell_echo_get() ? "on" : "off", lwshell_eol());
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
 }
 
 /* System -------------------------------------*/
@@ -517,7 +580,10 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
              (unsigned long)FWUPD_XSPI_OFFSET, lwshell_eol());
   for (uint32_t b = 0; b < 16U; b++)
   {
-    bsp_watchdog_refresh();
+    /* Don't call bsp_watchdog_refresh here — it ignores the WWDG window and
+     * spurious refreshes during the upper-counter region trigger reset. The
+     * vendor watchdog_task (lower priority but preempts during HAL polling)
+     * keeps the dog fed on its own cadence. */
     status = BSP_XSPI_NOR_Erase_Block(0, FWUPD_XSPI_OFFSET + (b * 0x10000U), BSP_XSPI_NOR_ERASE_64K);
     if (status != BSP_OK)
     {
@@ -528,7 +594,6 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream, size_t size)
 
   /* Write the new image. BSP_XSPI_NOR_Write handles page-boundary splitting. */
   CMD_PRINTF(stream, "Writing %lu bytes...%s", (unsigned long)size, lwshell_eol());
-  bsp_watchdog_refresh();
   status = BSP_XSPI_NOR_Write(0, _fwupd_buf, FWUPD_XSPI_OFFSET, (uint32_t)size);
   if (status != BSP_OK)
   {

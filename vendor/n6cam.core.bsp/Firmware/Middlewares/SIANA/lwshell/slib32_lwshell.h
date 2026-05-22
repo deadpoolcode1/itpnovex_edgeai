@@ -172,6 +172,17 @@ const char *lwshell_fmt(void);
  */
 const char *lwshell_eol(void);
 
+/**
+ * @brief Enable or disable input echo + prompt printing (SoW §4.1).
+ *        When disabled, the shell is suitable for scripted/automated callers.
+ */
+void lwshell_echo_set(bool enable);
+
+/**
+ * @brief Query current echo state.
+ */
+bool lwshell_echo_get(void);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

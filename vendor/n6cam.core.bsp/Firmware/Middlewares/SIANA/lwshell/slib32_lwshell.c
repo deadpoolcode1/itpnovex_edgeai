@@ -136,6 +136,7 @@
 typedef struct
 {
   bool                init;                               /*!< Initialization flag */
+  bool                echo;                               /*!< Echo input chars + prompt (SoW §4.1) */
   /* Commands */
   const t_lwshell_cmd *builtin;                           /*!< Array of built-in commands */
   size_t              builtin_size;                       /*!< Number of built-in commands */
@@ -208,6 +209,7 @@ int32_t lwshell_init(const t_stream *stream, uint8_t* in, size_t in_size, uint8_
   /* Reset shell */
   memset(&_shell, 0U, sizeof(t_shell));
   _shell.init         = true;
+  _shell.echo         = true;  /* default: echo on (matches legacy behavior) */
   _shell.stream       = stream;
   _shell.in           = in;
   _shell.in_size      = in_size;
@@ -357,10 +359,16 @@ int32_t lwshell_update(uint32_t timeout)
     {
       case LWSHELL_CHAR_CR:
       case LWSHELL_CHAR_LF:
-        LWSHELL_PRINTF(SLIB32_LWSHELL_EOL);
+        if (_shell.echo)
+        {
+          LWSHELL_PRINTF(SLIB32_LWSHELL_EOL);
+        }
         _lwshell_line_parse();
         _lwshell_cmd_run();
-        LWSHELL_PRINTF("%s ", SLIB32_LWSHELL_PROMPT);
+        if (_shell.echo)
+        {
+          LWSHELL_PRINTF("%s ", SLIB32_LWSHELL_PROMPT);
+        }
         _lwshell_input_reset();
         break;
 
@@ -369,7 +377,10 @@ int32_t lwshell_update(uint32_t timeout)
         if (_shell.cursor > _shell.line)
         {
           *--_shell.cursor = LWSHELL_CHAR_NULL;
-          LWSHELL_PRINTF(LWSHELL_DELETE);
+          if (_shell.echo)
+          {
+            LWSHELL_PRINTF(LWSHELL_DELETE);
+          }
         }
         break;
 
@@ -380,7 +391,10 @@ int32_t lwshell_update(uint32_t timeout)
           (byte < LWSHELL_CHAR_DEL)
         )
         {
-          LWSHELL_PRINTF("%c", byte);
+          if (_shell.echo)
+          {
+            LWSHELL_PRINTF("%c", byte);
+          }
           *_shell.cursor++ = byte;
           *_shell.cursor = LWSHELL_CHAR_NULL;
         }
@@ -398,6 +412,16 @@ const char *lwshell_fmt(void)
 const char* lwshell_eol(void)
 {
   return SLIB32_LWSHELL_EOL;
+}
+
+void lwshell_echo_set(bool enable)
+{
+  _shell.echo = enable;
+}
+
+bool lwshell_echo_get(void)
+{
+  return _shell.echo;
 }
 
 /*-------------------------------------------------------------------------*//**

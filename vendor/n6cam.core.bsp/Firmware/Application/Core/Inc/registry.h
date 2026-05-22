@@ -53,7 +53,7 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        2U
+#define REGISTRY_VERSION        3U
 
 /* Wifi */
 #define WIFI_SSID_LEN           31U
@@ -120,6 +120,32 @@ typedef struct
   /* Wifi */
   uint8_t   wifi_mode;
 
+  /* V3 — Scopus SoW settings ----------*/
+  /* Shell (§4.1) */
+  uint8_t   shell_echo_enable;
+
+  /* Object detection (§3.1, §4.2) */
+  uint8_t   detect_enable;        /* 0=stopped, 1=running */
+  uint8_t   detect_det_mask;      /* bit0=people, bit1=vehicles */
+  uint8_t   detect_action_mask;   /* bit0=save SD, bit1=report cellular */
+
+  /* Notifications (§3.1, §4.2, §6) */
+  uint32_t  notify_enable_mask;   /* bit mask: 1=NetReg 2=MotStart 4=MotStop 8=Periodic 0x10=People 0x20=Vehicle */
+  uint32_t  notify_period_s;
+  uint32_t  notify_dest_ip;       /* set on modem via SDVR+NTFHOST */
+  uint16_t  notify_dest_port;
+
+  /* Photo / JPEG (§3.4, §4.4) */
+  uint16_t  img_width;
+  uint16_t  img_height;
+  uint8_t   img_quality;          /* 1..100 */
+  uint8_t   img_color;            /* 0=YCBCR, 1=RGB, 2=CMYK */
+  uint8_t   img_chroma;           /* 0=4:4:4, 1=4:2:2 */
+
+  /* Motion sensor (§3.5, §4.5) */
+  uint8_t   motion_sensitivity;   /* 0..100 */
+  uint32_t  motion_no_motion_timeout_s;
+
 } t_registry_data;
 
 /*-------------------------------------------------------------------------*//**
@@ -145,6 +171,23 @@ const t_registry_data registry_defaults =
   .camera_gain          = 0U,
   .camera_exposure      = 0U,
   .camera_brightness    = 55U,
+
+  /* Scopus SoW defaults */
+  .shell_echo_enable           = 1U,
+  .detect_enable               = 0U,
+  .detect_det_mask             = 1U,     /* people only by default */
+  .detect_action_mask          = 0U,
+  .notify_enable_mask          = 0U,
+  .notify_period_s             = 0U,
+  .notify_dest_ip              = 0U,
+  .notify_dest_port            = 0U,
+  .img_width                   = 800U,
+  .img_height                  = 600U,
+  .img_quality                 = 90U,
+  .img_color                   = 0U,     /* YCBCR */
+  .img_chroma                  = 0U,     /* 4:4:4 */
+  .motion_sensitivity          = 50U,
+  .motion_no_motion_timeout_s  = 30U,
 
   /* Wifi */
   .wifi_mode            = 0U,
