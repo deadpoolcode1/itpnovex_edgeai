@@ -555,6 +555,21 @@ static void _nn_frame_process(void)
     SCB_InvalidateDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
     float32_t *out = (float32_t*)_nn_out[0];
     const uint32_t NB  = AI_OD_YOLOV8_PP_TOTAL_BOXES;
+    /* channels 0..3 are bbox logits (cx, cy, w, h) — stedgeai 4.0
+     * strips the head's final activation on this output for the
+     * multi-class build, so what reaches the post-proc is raw
+     * pre-activation values. Map back into a usable [0,1] range with
+     * sigmoid so the post-proc sees normalized center+size and the
+     * test-report's bbox rectangles end up on top of the actual
+     * detected object instead of off-canvas. */
+    for (uint32_t c = 0U; c < 4U; c++)
+    {
+      for (uint32_t a = 0U; a < NB; a++)
+      {
+        float32_t x = out[c * NB + a];
+        out[c * NB + a] = 1.0f / (1.0f + expf(-x));
+      }
+    }
     /* channels 4..3+NB_CLASSES are class logits */
     for (uint32_t c = 4U; c < 4U + AI_OD_YOLOV8_PP_NB_CLASSES; c++)
     {

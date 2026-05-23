@@ -296,16 +296,23 @@ def save_image_pair(image_path: Path, boxes: List[dict], dest_dir: Path,
     for b in boxes:
         cx, cy = b.get("cx", 0.0), b.get("cy", 0.0)
         w,  h  = b.get("w",  0.0), b.get("h",  0.0)
-        # The firmware emits normalized [0,1] cx,cy,w,h. Clamp so a
-        # nonsensical bbox (which happens with the relu30 model's
-        # low-conf garbage detections — negative coords or coords > 1)
-        # doesn't disappear off-canvas; clamping keeps the user-visible
-        # signal that "the model fired here, with low confidence".
-        x1 = max(0.0, min(1.0, cx - w / 2.0)) * FRAME_W
-        y1 = max(0.0, min(1.0, cy - h / 2.0)) * FRAME_H
-        x2 = max(0.0, min(1.0, cx + w / 2.0)) * FRAME_W
-        y2 = max(0.0, min(1.0, cy + h / 2.0)) * FRAME_H
+        # The firmware emits normalized [0,1] cx,cy,w,h. Compute the
+        # corners straight from those, then clip *the corners* to the
+        # canvas — clipping after the math (instead of clamping each
+        # input value) keeps a box that's partially off-screen visible
+        # on the in-frame side. For totally-degenerate output (e.g.
+        # negative w/h) we still drop the box so we don't draw garbage.
+        x1 = (cx - w / 2.0) * FRAME_W
+        y1 = (cy - h / 2.0) * FRAME_H
+        x2 = (cx + w / 2.0) * FRAME_W
+        y2 = (cy + h / 2.0) * FRAME_H
         if x2 <= x1 or y2 <= y1:
+            continue
+        x1 = max(0.0, min(float(FRAME_W - 1), x1))
+        y1 = max(0.0, min(float(FRAME_H - 1), y1))
+        x2 = max(0.0, min(float(FRAME_W - 1), x2))
+        y2 = max(0.0, min(float(FRAME_H - 1), y2))
+        if x2 - x1 < 1.0 or y2 - y1 < 1.0:
             continue
         name, color = _REPORT_CLASS_PALETTE.get(
             b.get("class", -1), (f"c{b.get('class','?')}", "#a3a3a3"))
