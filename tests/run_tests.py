@@ -263,12 +263,17 @@ _REPORT_CLASS_PALETTE = {
 
 def save_image_pair(image_path: Path, boxes: List[dict], dest_dir: Path,
                     stem: str) -> Tuple[str, str]:
-    """For an inference test, write the 192x192 input the kit saw and a
-    copy with the kit-reported detection rectangles drawn over it.
+    """For an inference test, return the 192x192 input the kit saw and a
+    copy with the kit-reported detection rectangles drawn over it, both
+    as base64 data URIs ready to drop into an <img src=…>.
 
-    Returns (orig_rel, annotated_rel) — relative paths suitable for the
-    HTML report's <img src=…>. Returns ('','') if Pillow isn't available
-    or the source image can't be read.
+    Returns (orig_data_uri, annotated_data_uri). The HTML report ends
+    up self-contained (no external files), so it renders correctly when
+    emailed / extracted from git / opened on another machine. Also
+    writes the same PNGs to `dest_dir` for the PDF-rendering pass — the
+    headless-chrome route uses file:// paths and works either way.
+
+    Returns ('','') if Pillow isn't available or the source can't be read.
     """
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -334,8 +339,13 @@ def save_image_pair(image_path: Path, boxes: List[dict], dest_dir: Path,
 
     annotated_path = dest_dir / f"{stem}_det.png"
     annotated.save(annotated_path, "PNG", optimize=True)
-    # Return paths relative to the HTML report's directory.
-    return (orig_path.name, annotated_path.name)
+
+    # Encode as data URIs for self-contained HTML rendering.
+    import base64
+    def _data_uri(p: Path) -> str:
+        return ("data:image/png;base64,"
+                + base64.b64encode(p.read_bytes()).decode("ascii"))
+    return (_data_uri(orig_path), _data_uri(annotated_path))
 
 
 # Path to STM32CubeProgrammer CLI — used to pulse NRST on the kit
@@ -951,9 +961,6 @@ def write_report(out_path: Path, suite: Suite, runtime_s: int, tty: str):
 
     # the simpler grouping logic above is buggy; rebuild cleanly:
     rows = []
-    # Path the report will live at — used to make the embedded
-    # <img src=…> point at the per-run artifacts directory.
-    art_subdir = f"{out_path.stem}_artifacts"
     group_marker = dict(suite.groups)
     for i, r in enumerate(suite.results):
         if i in group_marker:
@@ -964,16 +971,20 @@ def write_report(out_path: Path, suite: Suite, runtime_s: int, tty: str):
         if r.reason:
             rcell += f" — {r.reason}"
         extra = f"<br><span class='extra'>{r.extra}</span>" if r.extra else ""
-        # If this test produced an annotated detection image, render the
-        # source frame + the kit-annotated copy side by side under the
-        # description cell.
+        # If this test produced an annotated detection image, render
+        # the source frame + the kit-annotated copy side by side under
+        # the description cell. The src= values are full base64 data
+        # URIs ("data:image/png;base64,…") so the HTML is fully
+        # self-contained — no external artifacts dir needed for the
+        # images to show up when the HTML is moved/emailed/extracted
+        # from git.
         imgs = ""
         if r.image_orig and r.image_annotated:
             imgs = (
                 f"<div class='detgrid'>"
-                f"<figure><img src='{art_subdir}/{r.image_orig}' alt='input'>"
+                f"<figure><img src='{r.image_orig}' alt='input'>"
                 f"<figcaption>input (192×192)</figcaption></figure>"
-                f"<figure><img src='{art_subdir}/{r.image_annotated}' alt='detections'>"
+                f"<figure><img src='{r.image_annotated}' alt='detections'>"
                 f"<figcaption>kit detections</figcaption></figure>"
                 f"</div>"
             )
@@ -1003,6 +1014,40 @@ def write_report(out_path: Path, suite: Suite, runtime_s: int, tty: str):
 </body></html>
 """
     out_path.write_text(body, encoding="utf-8")
+    # Also drop a PDF next to the HTML using headless Chrome. The HTML
+    # is fully self-contained (data-URI images), so Chrome only needs
+    # the file:// URL and produces a single-file PDF with the
+    # detection thumbnails rendered inline. Best effort: if Chrome
+    # isn't on PATH we just skip — the HTML is still the canonical
+    # report.
+    _maybe_render_pdf(out_path)
+
+
+def _maybe_render_pdf(html_path: Path):
+    """Render the HTML report to a same-stem PDF using headless Chrome.
+    The HTML is self-contained (base64-inlined images) so no
+    --allow-file-access-from-files flag dance is needed; Chrome reads
+    the local file://, renders, and dumps a PDF beside it."""
+    import shutil, subprocess
+    chrome = (shutil.which("google-chrome")
+              or shutil.which("google-chrome-stable")
+              or shutil.which("chromium")
+              or shutil.which("chromium-browser"))
+    if chrome is None:
+        print(f"  (no chrome on PATH — skipping PDF render)")
+        return
+    pdf_path = html_path.with_suffix(".pdf")
+    try:
+        subprocess.run(
+            [chrome, "--headless", "--disable-gpu", "--no-sandbox",
+             f"--print-to-pdf={pdf_path}", "--no-pdf-header-footer",
+             f"file://{html_path.resolve()}"],
+            capture_output=True, timeout=60, check=False,
+        )
+        if pdf_path.exists():
+            print(f"  PDF: {pdf_path}")
+    except Exception as e:
+        print(f"  PDF render failed: {e}")
 
 
 # ── Main ───────────────────────────────────────────────────────────
