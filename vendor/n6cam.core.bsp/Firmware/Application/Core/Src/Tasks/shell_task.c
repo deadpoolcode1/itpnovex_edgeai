@@ -200,6 +200,7 @@ static void     _recovery_trigger(void);
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _safeboot_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _echo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Sensors (SoW §3.5, §4.5) */
@@ -313,6 +314,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
+  {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
   {.run = _update_cmd             , .name = "update"    , .help = "[app | model] - Receive new firmware/model over CDC and reflash xSPI (default: app)" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
   #if defined(N6CAM_WIFI_MURATA)
@@ -440,30 +442,26 @@ void _shell_task_init(void)
 
   /* ── Safe-boot guard ───────────────────────────────────────────
    *
-   * TAMP->BKP1R is a bootloop counter that survives reset. We bump it on
-   * every boot and clear it ~60 s later (see _shell_safe_boot_clear in
-   * the main loop). Threshold = 3 — three crashes in a row → don't
-   * auto-start NN so the kit stays reachable on CDC for the user to
-   * push a fix via 'update [app|model]'. No more SWD recoveries.
-   *
-   * IMPORTANT: TAMP backup-register access on STM32N6 requires
-   * HAL_PWR_EnableBkUpAccess() + RTC APB clock first — otherwise writes
-   * silently no-op and reads return 0.
-   */
+   * The bootloop counter is bumped + saved in registry_task_init (runs
+   * before NN/camera/display init, so a crash anywhere downstream gets
+   * counted). Here we just READ it and decide whether to enter safe
+   * mode. Threshold = 3 — three consecutive crashes → don't auto-start
+   * NN, leaving CDC reachable so the operator can push a fix via
+   * 'update [app|model]'. The healthy-boot timer in the main loop
+   * clears the counter after ~30 s of uptime. */
   uint8_t boot_n = 0U;
   bool safe_mode = false;
 
-  /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) + bump
-   * bootloop counter under the same registry lock. */
+  /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) + read
+   * bootloop counter under the registry lock. NO write here — the
+   * bump already happened in registry_task_init. */
   {
     t_registry_data *reg = registry_acquire();
     if (reg)
     {
       lwshell_echo_set(reg->shell_echo_enable != 0U);
 
-      /* Bump counter. */
-      boot_n = (uint8_t)(reg->boot_count + 1U);
-      reg->boot_count = boot_n;
+      boot_n = reg->boot_count;
       safe_mode = (boot_n >= BOOT_GUARD_THRESHOLD);
 
       bool persisted_detect = (reg->detect_enable != 0U);
@@ -472,7 +470,8 @@ void _shell_task_init(void)
       {
         LERROR(TRACE_SHELL,
           "*** SAFE BOOT *** %u consecutive crash-reboots detected. "
-          "NN auto-start suppressed; issue 'detect start' explicitly to resume.",
+          "NN auto-start suppressed; issue 'detect start' to resume "
+          "or 'safeboot clear' to exit safe mode.",
           (unsigned)boot_n);
       }
       else
@@ -484,11 +483,6 @@ void _shell_task_init(void)
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
       registry_release();
-      /* SYNCHRONOUS save — registry_request_save() only queues an event
-       * for the registry task, and a NN crash within the next ~tens of
-       * ms means the counter never lands in flash. Calling registry_save()
-       * directly here forces a flush before we proceed to NN init. */
-      (void)registry_save();
     }
   }
 
@@ -1379,6 +1373,69 @@ static int32_t _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc
   CMD_PRINTF(stream, "Entering FSBL recovery in 100ms...%s", lwshell_eol());
   _recovery_trigger();
   return LWSHELL_OK;  /* unreachable */
+}
+
+/* safeboot [status | clear | test]
+ *   status — print current boot_count, threshold, safe-mode flag
+ *   clear  — zero the counter (use after the bad model/app is replaced
+ *            so the next reboot starts at 1 again, not at threshold)
+ *   test   — set counter to threshold so the next boot engages safe
+ *            mode (NN auto-start suppressed). Verification + drill aid. */
+static int32_t _safeboot_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  uint8_t bn = 0U;
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg != NULL)
+    {
+      bn = reg->boot_count;
+      registry_release();
+    }
+  }
+  bool safe = (bn >= BOOT_GUARD_THRESHOLD);
+
+  if (argc < 2U || strncmp((const char*)argv[1], "status", 6) == 0)
+  {
+    CMD_PRINTF(stream, "boot_count = %u/%u, safe_mode = %s%s",
+               (unsigned)bn, (unsigned)BOOT_GUARD_THRESHOLD,
+               safe ? "YES" : "no", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strncmp((const char*)argv[1], "clear", 5) == 0)
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg != NULL)
+    {
+      reg->boot_count = 0U;
+      registry_release();
+      (void)registry_save();
+    }
+    CMD_PRINTF(stream, "Bootloop counter cleared (was %u)%s",
+               (unsigned)bn, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  if (strncmp((const char*)argv[1], "test", 4) == 0)
+  {
+    /* Set counter to threshold MINUS 1 — the next registry_task_init
+     * will bump it to threshold and engage safe mode on that boot. */
+    t_registry_data *reg = registry_acquire();
+    if (reg != NULL)
+    {
+      reg->boot_count = (uint8_t)(BOOT_GUARD_THRESHOLD - 1U);
+      registry_release();
+      (void)registry_save();
+    }
+    CMD_PRINTF(stream,
+               "Counter set to %u — next reboot will engage safe mode. "
+               "Reboot now (e.g. unplug+replug USB) to verify.%s",
+               (unsigned)(BOOT_GUARD_THRESHOLD - 1U), lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  CMD_PRINTF(stream, "usage: safeboot [status | clear | test]%s", lwshell_eol());
+  return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
 /**

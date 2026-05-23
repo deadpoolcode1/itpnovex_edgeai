@@ -188,7 +188,53 @@ Emitted on:
 - the CDC shell as `+SDVRNTF: { … }\r\n`
 - (when M3 wires up) over the modem channel via `SDVR+NTFA=…`
 
-### 3.4 Self-update protocol (M1 / A4)
+### 3.4 Safe-boot / bootloop guard
+
+A bootloop counter lives in the flash-backed registry (`boot_count` field).
+`registry_task_init` bumps the counter and synchronously saves it before
+the NN, camera, or display tasks have a chance to start — so a crash
+anywhere downstream (bad model load, ATON HW init, camera bring-up,
+display init, NN inference) still gets counted on the *next* boot.
+
+Once the counter crosses **3** consecutive boots without a healthy
+clear, `shell_task` enters **safe mode**:
+
+- `nn_task_detect_set(false)` — NN auto-start suppressed (the typical
+  bad-update failure mode is a bad model, so we stop running it).
+- `LERROR(TRACE_SHELL, "*** SAFE BOOT *** …")` prints on the STLink VCP
+  + CDC shell.
+- Operator's CDC shell stays alive; `update app` / `update model` work
+  normally — kit recovers without SWD.
+
+After ~60 s of healthy uptime (`HEALTHY_BOOT_TICKS = 300` × 200 ms in
+the shell main loop), the counter is reset to 0 and the next reboot
+starts over.
+
+**Shell command:**
+
+```
+> safeboot status         # current counter, threshold, safe-mode flag
+boot_count = 1/3, safe_mode = no
+safeboot status ok
+
+> safeboot clear          # zero the counter (post-recovery)
+> safeboot test           # set counter to 2 — next reboot engages safe mode
+                          # (drill / verification aid)
+```
+
+**Field recovery flow** when a bad `update app` or `update model` has
+caused the kit to crash repeatedly:
+
+1. Kit reboots 3× in a row (registry counter goes 0 → 1 → 2 → 3).
+2. Boot #4: counter is already 3 → safe mode engages → NN doesn't
+   auto-start → kit is reachable on CDC.
+3. Operator pushes a known-good `update app` or `update model`.
+4. After the fix is in, `safeboot clear` to zero the counter.
+5. Reboot or wait ~60 s — kit returns to normal operation.
+
+No FSBL changes, no SWD required, no boot-switch toggle.
+
+### 3.5 Self-update protocol (M1 / A4)
 
 See `M1_M2_WORKFLOW.md` for the diagram. Wire format:
 

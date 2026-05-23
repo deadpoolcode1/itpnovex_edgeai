@@ -32,6 +32,7 @@
 #include "flash.h"
 #include "n6cam_crc.h"
 #include "registry_task.h"
+#include "registry.h"
 
 /*-------------------------------------------------------------------------*//**
 * @addtogroup SIANA
@@ -228,6 +229,35 @@ static void _registry_task_init(void)
   {
     LERROR(TRACE_REGISTRY, "Registry failed (%ld)", status);
     Error_Handler();
+  }
+
+  /* Safe-boot: bump boot_count + sync-save BEFORE any other task (NN,
+   * camera, display) gets a chance to crash. shell_task reads this
+   * counter later to decide if safe mode should engage.
+   *
+   * Bumping here in registry_task_init means we catch crashes that
+   * happen anywhere downstream of this point — including NN model
+   * load + ATON HW init, which run before shell_task_init completes
+   * and would otherwise miss the v1.5.1 shell-side bump. */
+  {
+    t_registry_data *reg = registry_acquire();
+    if (reg != NULL)
+    {
+      uint8_t bn = (uint8_t)(reg->boot_count + 1U);
+      reg->boot_count = bn;
+      registry_release();
+      /* Synchronous save — registry_request_save() only queues a save
+       * event for our own task loop (which hasn't started yet), so the
+       * counter would never land in flash if NN crashes next. */
+      if (registry_save() == SLIB32_OK)
+      {
+        LINFO(TRACE_REGISTRY, "Boot count = %u", (unsigned)bn);
+      }
+      else
+      {
+        LERROR(TRACE_REGISTRY, "Boot count save failed (count=%u)", (unsigned)bn);
+      }
+    }
   }
 
   /*-->> READY <<--*/

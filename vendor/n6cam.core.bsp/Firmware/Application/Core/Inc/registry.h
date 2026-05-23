@@ -146,13 +146,13 @@ typedef struct
   uint8_t   motion_sensitivity;   /* 0..100 */
   uint32_t  motion_no_motion_timeout_s;
 
-  /* V4 — safe-boot bootloop counter (flash-backed because TAMP + SRAM
-   * are both wiped on this kit's NVIC_SystemReset path). The shell task
-   * bumps it on boot, clears it after ~60 s of healthy uptime. If we
-   * reach BOOTLOOP_THRESHOLD before that healthy point, the previous
-   * boot(s) crashed before becoming healthy — typically nn_task hitting
-   * a bad model — and the App switches to safe mode (skip auto-detect)
-   * so the user can push a fix over CDC. */
+  /* V4 — safe-boot bootloop counter (flash-backed for persistence
+   * across reset + power-off). registry_task_init bumps it + sync-saves
+   * BEFORE NN/camera/display start, so a crash anywhere downstream
+   * (model load, ATON HW init, display bring-up, NN inference) gets
+   * counted. shell_task reads it and enters safe mode (NN auto-start
+   * suppressed) when it reaches BOOT_GUARD_THRESHOLD. The healthy-boot
+   * timer in shell's main loop clears it after ~30 s of uptime. */
   uint8_t   boot_count;
 
 } t_registry_data;
