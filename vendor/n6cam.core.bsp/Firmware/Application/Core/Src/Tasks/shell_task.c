@@ -42,6 +42,8 @@
 #include "n6cam_xspi.h"
 #include "n6cam_watchdog.h"
 #include "n6cam_core.h"   /* LED_USER3, bsp_led_set_state */
+#include "hdlc.h"
+#include "modem_task.h"
 #include "nn_task.h"
 #include "snapshot_task.h"
 #include "fx_app.h"
@@ -215,6 +217,8 @@ static int32_t  _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* NN test-frame injection (for algorithm validation when camera optics are subpar) */
 static int32_t  _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+/* MangOH modem pass-through (SoW §4.6 — `mdm <command>`) */
+static int32_t  _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 
 /* Test-frame protocol: 'FRMI' magic + size_le(4) + crc32_le(4) + payload */
 #define FRAME_MAGIC                 "FRMI"
@@ -307,6 +311,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
+  {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _update_cmd             , .name = "update"    , .help = "[app | model] - Receive new firmware/model over CDC and reflash xSPI (default: app)" },
   {.run = _camera_cmd             , .name = "camera"    , .help = "Camera control"  },
@@ -1023,8 +1028,22 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   }
   else
   {
-    /* upload: needs HDLC tunnel to WP76. Stub for now — emit notification only. */
-    CMD_PRINTF(stream, "photo upload: %s (modem not wired)%s", fname, lwshell_eol());
+    /* SoW §8.2: capture a JPEG and ship it to the MangOH over USART2 in an
+     * SDVR+SENDBIN binary transport, atomically (snapshot_task wraps both
+     * the prefix line and the JPEG payload under the modem tx mutex so a
+     * concurrent shell `mdm <at>` can't interleave). On the modem side
+     * this hits the same SDVR HTTP-upload pipeline the SD-file uploads
+     * use, just sourced from RAM instead of the FAT. */
+    static uint32_t _upload_ref;
+    _upload_ref++;
+    if (!snapshot_request_upload("photo", _upload_ref, fname))
+    {
+      CMD_PRINTF(stream, "photo upload: trigger failed (busy / no modem)%s",
+                 lwshell_eol());
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "photo upload: capturing -> SDVR+SENDBIN ref=%lu name=%s%s",
+               (unsigned long)_upload_ref, fname, lwshell_eol());
   }
 
   /* Emit a notification carrying the action + filename. rsn=0x40 = photo-event
@@ -2359,6 +2378,140 @@ static uint8_t* _wifi_mode_to_str(uint8_t mode)
   }
 }
 #endif /* N6CAM_WIFI_MURATA */
+
+/*-------------------------------------------------------------------------*//**
+*           MangOH modem pass-through (SoW §4.6)
+*//*--------------------------------------------------------------------------*/
+
+/* Stream pointer for the URC callback to write back to. Set every time the
+ * shell task wakes — the URC arrives in modem_task context, we forward it
+ * to the shell's stream so the operator sees +SDVR* lines as they come. */
+static const t_stream *volatile _mdm_urc_stream = NULL;
+
+static void _mdm_urc_forward(const char *line, size_t len, void *ctx)
+{
+  (void)len; (void)ctx;
+  const t_stream *s = _mdm_urc_stream;
+  if (s == NULL) return;
+  /* The shell task's CMD_PRINTF macro needs the static `_shell.out`
+   * scratch, but the URC fires in modem_task context. Use stream_printf
+   * directly with a tiny stack buffer — keeps the URC path independent
+   * of the command-printer plumbing. */
+  static uint8_t scratch[MODEM_URC_MAX + 8U];
+  stream_printf(s, scratch, sizeof(scratch),
+                "%s%s", line, lwshell_eol());
+}
+
+static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if (argc < 2U)
+  {
+    CMD_PRINTF(stream, "Usage: mdm <at-command>%s"
+                       "       mdm test echo            - HDLC loopback%s"
+                       "       mdm test urc <line>      - synthesise a URC%s",
+               lwshell_eol(), lwshell_eol(), lwshell_eol());
+    return LWSHELL_OK;
+  }
+
+  /* Register the URC forwarder once (per shell, per stream). The callback
+   * pointer is global, but the stream changes when shell is re-entered. */
+  _mdm_urc_stream = stream;
+  modem_set_urc_callback(_mdm_urc_forward, NULL);
+
+  /* Big scratch buffers — keep them out of the shell task's 2 KB stack
+   * (which already carries the lwshell tokeniser + per-command locals).
+   * Single shell consumer is serial, so a static is fine. */
+  static char cmd[MODEM_FRAME_MAX];
+  static char reply[MODEM_FRAME_MAX];
+  static uint8_t test_wire[64];
+  static uint8_t test_out[64];
+
+  /* `mdm test ...` exercises the framing locally so the path can be
+   * validated without a MangOH on the bench. */
+  if (strcmp((char*)argv[1], "test") == 0 && argc >= 3U)
+  {
+    if (strcmp((char*)argv[2], "echo") == 0)
+    {
+      /* Round-trip "AT\r\n" through the HDLC encoder/decoder and report. */
+      const uint8_t  payload[] = { 'A', 'T', '\r', '\n' };
+      size_t         wire_len = 0U;
+      hdlc_encode(payload, sizeof(payload), test_wire, sizeof(test_wire), &wire_len);
+      t_hdlc_decoder d;
+      hdlc_decoder_init(&d, test_out, sizeof(test_out));
+      size_t got = 0U;
+      for (size_t i = 0U; i < wire_len; i++)
+      {
+        size_t finished = 0U;
+        hdlc_decoder_feed(&d, test_wire[i], &finished);
+        if (finished) got = finished;
+      }
+      CMD_PRINTF(stream,
+        "mdm test echo: wire=%u bytes, decoded=%u bytes, match=%s%s",
+        (unsigned)wire_len, (unsigned)got,
+        (got == sizeof(payload) && memcmp(test_out, payload, got) == 0) ? "yes" : "no",
+        lwshell_eol());
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
+    if (strcmp((char*)argv[2], "urc") == 0 && argc >= 4U)
+    {
+      /* Synthesise an asynchronous URC and run it through the dispatcher
+       * exactly as if it arrived over USART2. lwshell already tokenised
+       * on whitespace, so a URC like '+SDVRRDY: 1.0.5' arrives across
+       * argv[3..argc-1]; rejoin with single spaces so we forward the
+       * whole line. The forwarder above will write it back to this
+       * shell's stream. */
+      size_t up = 0U;
+      for (size_t i = 3U; i < argc; i++)
+      {
+        if (i > 3U && up < sizeof(cmd) - 1U) cmd[up++] = ' ';
+        size_t a = strlen((char*)argv[i]);
+        if (up + a >= sizeof(cmd) - 1U) a = sizeof(cmd) - 1U - up;
+        memcpy(&cmd[up], argv[i], a);
+        up += a;
+      }
+      if (up + 2U < sizeof(cmd)) { cmd[up++] = '\r'; cmd[up++] = '\n'; }
+      modem_inject_rx((const uint8_t*)cmd, up);
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "Bad syntax — use 'mdm test echo' or 'mdm test urc <line>'%s",
+               lwshell_eol());
+    return LWSHELL_OK;
+  }
+
+  /* Real pass-through: glue argv[1..] back together with spaces. lwshell
+   * tokenises on whitespace, so a quoted AT command like
+   *   mdm AT+CPIN?
+   *   mdm SDVR+HOST="example.com"
+   * comes in pre-split; we rejoin. */
+  size_t pos = 0U;
+  for (size_t i = 1U; i < argc; i++)
+  {
+    if (i > 1U && pos < sizeof(cmd) - 1U) cmd[pos++] = ' ';
+    size_t a = strlen((char*)argv[i]);
+    if (pos + a >= sizeof(cmd) - 1U) a = sizeof(cmd) - 1U - pos;
+    memcpy(&cmd[pos], argv[i], a);
+    pos += a;
+  }
+  cmd[pos] = '\0';
+
+  int32_t rc = modem_send_at(cmd, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
+  if (rc < 0)
+  {
+    CMD_PRINTF(stream, "mdm: error %ld (no modem? timeout?)%s",
+               (long)rc, lwshell_eol());
+    return LWSHELL_OK;
+  }
+  /* Print the reply. Strip the trailing newline if any — CMD_PRINTF appends
+   * lwshell_eol() so we keep the line terminator consistent. */
+  size_t rlen = (size_t)rc;
+  while (rlen > 0U && (reply[rlen - 1U] == '\n' || reply[rlen - 1U] == '\r'))
+    reply[--rlen] = '\0';
+  CMD_PRINTF(stream, "%s%s", reply, lwshell_eol());
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
+}
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_Functions -->

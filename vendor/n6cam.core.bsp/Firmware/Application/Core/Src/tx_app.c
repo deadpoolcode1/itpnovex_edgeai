@@ -35,6 +35,7 @@
 #include "camera_task.h"
 #include "display_task.h"
 #include "jpeg_task.h"
+#include "modem_task.h"
 #if ENABLE_NN == 1U
   #include "nn_task.h"
 #endif /* ENABLE_NN */
@@ -113,6 +114,7 @@ static t_task_start_fn      _task[] = {
   camera_task_start,
   display_task_start,
   jpeg_task_start,
+  modem_task_start,
 #if ENABLE_NN == 1U
   nn_task_start,
 #endif /* ENABLE_NN */

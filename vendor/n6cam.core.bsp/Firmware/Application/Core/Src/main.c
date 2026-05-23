@@ -57,6 +57,7 @@ const char* TRACE_TOPIC_NAME[TRACE_NUM] = {
   "DISPLAY",
   "FX",
   "JPEG",
+  "MODEM",
   "NN",
   "NX",
   "PP",

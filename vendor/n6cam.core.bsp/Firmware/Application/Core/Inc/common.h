@@ -102,6 +102,7 @@ typedef enum
   TRACE_DISPLAY,
   TRACE_FX,
   TRACE_JPEG,
+  TRACE_MODEM,
   TRACE_NN,
   TRACE_NX,
   TRACE_PP,

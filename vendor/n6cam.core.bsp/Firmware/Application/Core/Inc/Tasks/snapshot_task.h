@@ -120,6 +120,28 @@ bool snapshot_trigger(void);
 bool snapshot_request(const char *filename);
 
 /**
+ * @brief Atomic "claim a snapshot slot, encode JPEG, ship over the modem
+ *        link via SoW §8.2 SDVR+SENDBIN" — same race-free contract as
+ *        snapshot_request, but the worker hands the encoded JPEG to
+ *        modem_send_binary() instead of writing it to SD.
+ *
+ *        Used by the shell `photo upload` command and by nn_task's
+ *        auto-detect path when the registry has the "upload via modem"
+ *        bit set in `detect_action_mask`.
+ *
+ * @param tag      SoW §8.2 TAG metadata field — short identifier such
+ *                 as "photo", "event", "detect". May be NULL → "photo".
+ * @param ref      SoW §8.2 REF metadata — monotonic per-session
+ *                 numerator the caller picks; used by the modem HTTP
+ *                 layer as the upload reference.
+ * @param filename SoW §7 filename to put in the HTTP custom header.
+ *                 May be NULL (modem will fill it in from TIME).
+ * @return true if the slot was claimed, false if busy.
+ */
+bool snapshot_request_upload(const char *tag, uint32_t ref,
+                             const char *filename);
+
+/**
  * @brief Override the next snapshot's filename (SoW §7 timestamped names).
  *        Pass NULL to revert to the default 'Snapshot{idx}.jpeg'. The
  *        override is consumed by the next snapshot then cleared.

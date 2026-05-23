@@ -35,7 +35,9 @@
  */
 #include "fx_app.h"
 #include "jpeg_task.h"
+#include "modem_task.h"
 #include "n6cam_core.h"
+#include "n6cam_rtc.h"
 #include "n6cam_sdio.h"
 #include "snapshot_task.h"
 
@@ -126,6 +128,18 @@ static t_snapshot_task _snapshot_task = {
 #define SNAP_FILENAME_MAX  63U
 static char _snap_filename[SNAP_FILENAME_MAX + 1U] = "";
 
+/* Per-request target: where does the encoded JPEG go? */
+typedef enum
+{
+  SNAP_TARGET_SD = 0,
+  SNAP_TARGET_UART,
+} t_snap_target;
+
+static t_snap_target _snap_target = SNAP_TARGET_SD;
+#define SNAP_TAG_MAX 31U
+static char     _snap_tag[SNAP_TAG_MAX + 1U] = "";
+static uint32_t _snap_ref = 0U;
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_Data -->
 *//*-----------------------------------------------------------------------*//**
@@ -214,9 +228,53 @@ bool snapshot_request(const char *filename)
   {
     _snap_filename[0] = '\0';
   }
+  /* SD target by default (snapshot_request_upload sets UART before
+   * the trigger; we just preserve whatever was set, no override here). */
   /* Flip state to "trigger in flight" so a concurrent trigger from
    * another task observes the slot as taken. The worker will re-set
    * state when it processes the request. */
+  rtos_raise_event(&_snapshot_task.evt, SNAPSHOT_EVT_REQUEST);
+  TX_RESTORE
+  return true;
+}
+
+bool snapshot_request_upload(const char *tag, uint32_t ref,
+                             const char *filename)
+{
+  /* Same critical-section dance as snapshot_request, but also stages
+   * the SoW §8.2 metadata that the worker reads on completion. */
+  TX_INTERRUPT_SAVE_AREA
+  TX_DISABLE
+  if (_snapshot_task.state != AVAILABLE)
+  {
+    TX_RESTORE
+    return false;
+  }
+  /* Stage filename (optional) + tag + ref + target = UART. */
+  if (filename != NULL && filename[0] != '\0')
+  {
+    size_t i;
+    for (i = 0U; (i < SNAP_FILENAME_MAX) && (filename[i] != '\0'); i++)
+      _snap_filename[i] = filename[i];
+    _snap_filename[i] = '\0';
+  }
+  else
+  {
+    _snap_filename[0] = '\0';
+  }
+  if (tag != NULL && tag[0] != '\0')
+  {
+    size_t i;
+    for (i = 0U; (i < SNAP_TAG_MAX) && (tag[i] != '\0'); i++)
+      _snap_tag[i] = tag[i];
+    _snap_tag[i] = '\0';
+  }
+  else
+  {
+    _snap_tag[0] = '\0';
+  }
+  _snap_ref    = ref;
+  _snap_target = SNAP_TARGET_UART;
   rtos_raise_event(&_snapshot_task.evt, SNAPSHOT_EVT_REQUEST);
   TX_RESTORE
   return true;
@@ -274,7 +332,44 @@ static void _snapshot_task_run(uint32_t args)
     rtos_wait_any_event(&_snapshot_task.evt, SNAPSHOT_EVT_START, true);
 
     jpeg_buff = jpeg_encode(&jpeg_size);
-    if (_snap_filename[0] != '\0')
+    if (_snap_target == SNAP_TARGET_UART)
+    {
+      /* SoW §8.2 — Live UART photo upload.
+       *
+       * Prefix line carries the AT-style metadata so the MangOH side can
+       * parse parameters before binary starts:
+       *   SDVR+SENDBIN=<ref>,"<tag>","<DDMMYYYYHHMMSS>",<ref>,<size>
+       *
+       * Then the JPEG bytes ride a separate HDLC-framed binary tail.
+       * modem_send_binary() serialises both under the modem tx mutex so
+       * a concurrent `mdm <at-cmd>` from the shell can't interleave. */
+      char prefix[160];
+      t_datetime dt = { 0 };
+      (void)bsp_rtc_get_time(&dt);
+      const char *tag = (_snap_tag[0] != '\0') ? _snap_tag : "photo";
+      snprintf(prefix, sizeof(prefix),
+               "SDVR+SENDBIN=%lu,\"%s\",\"%02u%02u20%02u%02u%02u%02u\",%lu,%lu",
+               (unsigned long)_snap_ref, tag,
+               (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
+               (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
+               (unsigned long)_snap_ref, (unsigned long)jpeg_size);
+      int32_t mc = modem_send_binary(prefix, jpeg_buff, jpeg_size, 5000U);
+      if (mc != 0)
+      {
+        LERROR(TRACE_SNAPSHOT, "UART upload failed (%ld)", (long)mc);
+      }
+      else
+      {
+        LINFO(TRACE_SNAPSHOT, "UART upload ok ref=%lu size=%u",
+              (unsigned long)_snap_ref, (unsigned)jpeg_size);
+      }
+      /* One-shot — reset target + meta for the next request. */
+      _snap_target   = SNAP_TARGET_SD;
+      _snap_tag[0]   = '\0';
+      _snap_ref      = 0U;
+      status         = (mc == 0) ? FX_SUCCESS : (int32_t)mc;
+    }
+    else if (_snap_filename[0] != '\0')
     {
       status = fx_app_write_file_exact(_snap_filename, jpeg_buff, jpeg_size);
       _snap_filename[0] = '\0';  /* one-shot override */
@@ -283,7 +378,7 @@ static void _snapshot_task_run(uint32_t args)
     {
       status = fx_app_write_file("Snapshot", "jpeg", jpeg_buff, jpeg_size);
     }
-    if (status != FX_SUCCESS)
+    if (status != FX_SUCCESS && _snap_target != SNAP_TARGET_UART)
     {
       LERROR(TRACE_SNAPSHOT, "Store snapshot failed (%d)", status);
     }
