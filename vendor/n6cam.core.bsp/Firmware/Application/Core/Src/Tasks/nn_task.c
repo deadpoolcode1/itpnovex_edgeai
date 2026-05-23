@@ -554,31 +554,28 @@ static void _nn_frame_process(void)
   {
     SCB_InvalidateDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
     float32_t *out = (float32_t*)_nn_out[0];
-    const uint32_t NB  = AI_OD_YOLOV8_PP_TOTAL_BOXES;
-    /* channels 0..3 are bbox logits (cx, cy, w, h) — stedgeai 4.0
-     * strips the head's final activation on this output for the
-     * multi-class build, so what reaches the post-proc is raw
-     * pre-activation values. Map back into a usable [0,1] range with
-     * sigmoid so the post-proc sees normalized center+size and the
-     * test-report's bbox rectangles end up on top of the actual
-     * detected object instead of off-canvas. */
-    for (uint32_t c = 0U; c < 4U; c++)
+    const uint32_t N    = (4U + AI_OD_YOLOV8_PP_NB_CLASSES) * AI_OD_YOLOV8_PP_TOTAL_BOXES;
+    const float32_t BIAS = AI_OD_YOLOV8_DEQUANT_BIAS;
+
+    /* Stedgeai 4.0 emits `float = int8 * scale` at the output
+     * DequantizeLinear epoch instead of `float = (int8 - zero_point)
+     * * scale`. For the multi-class relu30 model that means every
+     * channel of the 84x756 output tensor lands `-zero_point * scale`
+     * (= 1.5495) below where it should. The post-proc then sees
+     * negative bbox cx/cy/w/h and below-threshold class probs.
+     *
+     * Re-apply the missing bias here so the data the post-proc reads
+     * matches what host-side TFLite produces on the same input:
+     * bbox channels become normalized [0,1] cx/cy/w/h (with width or
+     * height occasionally > 1 for huge boxes), class channels become
+     * post-sigmoid probabilities. The 1-class vendor model has its
+     * dequant baked in correctly so the #if guard keeps this off the
+     * default path. */
+    for (uint32_t i = 0U; i < N; i++)
     {
-      for (uint32_t a = 0U; a < NB; a++)
-      {
-        float32_t x = out[c * NB + a];
-        out[c * NB + a] = 1.0f / (1.0f + expf(-x));
-      }
+      out[i] += BIAS;
     }
-    /* channels 4..3+NB_CLASSES are class logits */
-    for (uint32_t c = 4U; c < 4U + AI_OD_YOLOV8_PP_NB_CLASSES; c++)
-    {
-      for (uint32_t a = 0U; a < NB; a++)
-      {
-        float32_t x = out[c * NB + a];
-        out[c * NB + a] = 1.0f / (1.0f + expf(-x));
-      }
-    }
+
     SCB_CleanDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
   }
 #endif

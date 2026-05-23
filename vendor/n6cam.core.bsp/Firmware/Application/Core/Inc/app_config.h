@@ -76,7 +76,7 @@ extern "C" {
  * However, it is essential to balance the threshold value to ensure that you do not miss too many true positives.
  *
  * This value is set following the evaluation curves obtained from Ultralytics YOLOv8 model training. */
-#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.25f)
+#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.4f)
 
 /** Intersection over Union (IoU) threshold for Non-Maximum Suppression (NMS).
  * A high IoU threshold means that more overlapping will be allowed between boxes, while a lower threshold will allow less boxes to be retained.
@@ -93,6 +93,24 @@ extern "C" {
   * Abstracted definition from the post-processing dependent definition.
   */
 #define SAI_CLASS_TOTAL_PREDICTIONS               AI_OD_YOLOV8_PP_TOTAL_BOXES
+
+/** Output dequantize zero-point correction.
+ *
+ * stedgeai 4.0's `DequantizeLinear` epoch at the model's output does
+ * `float = int8 * scale` and drops the `- zero_point` step. For the
+ * relu30 model the int8 output has scale=0.0131 and zero_point=-118,
+ * so every channel comes out shifted low by `-zero_point * scale =
+ * 118 * 0.0131 = 1.5495`. Without this correction the post-proc sees
+ * bbox values around (-1.2, -1.0, -0.9, -0.7) instead of normalized
+ * cx/cy/w/h, NMS can't deduplicate (no valid overlap math) and the
+ * class confidences are pulled below the detection threshold.
+ *
+ * Determined empirically by comparing kit `frame dump` head with the
+ * host TFLite output of the same model on the same input. The
+ * constant matches `-Dequantize_581_x_zero_point * Dequantize_581_
+ * x_scale` from the compiled `network.c` weight metadata. Re-derive
+ * if you swap the model. */
+#define AI_OD_YOLOV8_DEQUANT_BIAS                 (1.5495f)
 
 /** @} */
 /*----------------------------------------------------------------------------*/
