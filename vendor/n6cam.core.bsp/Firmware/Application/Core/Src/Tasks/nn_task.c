@@ -533,6 +533,33 @@ static void _nn_frame_process(void)
   /* Release FLASH */
   flash_acquire(false);
 
+  /* Ultralytics-exported YOLOv8 outputs RAW LOGITS (pre-sigmoid). The
+   * vendor's post-proc assumes already-sigmoided class probabilities.
+   * Apply sigmoid in-place to the class-channel portion of the output
+   * (channels 4..3+NB_CLASSES) before the post-proc reads it. Layout is
+   * CHW = [1, 4+NB_CLASSES, NUM_BOXES], stride NUM_BOXES per channel.
+   *
+   * Only applies when NB_CLASSES > 1 — for the vendor 1-class model the
+   * sigmoid is already baked in (we'd be double-sigmoiding otherwise). */
+#if (AI_OD_YOLOV8_PP_NB_CLASSES > 1)
+  if (_nn_out[0] != NULL && _nn_out_len[0] >= (4U + AI_OD_YOLOV8_PP_NB_CLASSES) * AI_OD_YOLOV8_PP_TOTAL_BOXES * sizeof(float32_t))
+  {
+    SCB_InvalidateDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
+    float32_t *out = (float32_t*)_nn_out[0];
+    const uint32_t NB  = AI_OD_YOLOV8_PP_TOTAL_BOXES;
+    /* channels 4..3+NB_CLASSES are class logits */
+    for (uint32_t c = 4U; c < 4U + AI_OD_YOLOV8_PP_NB_CLASSES; c++)
+    {
+      for (uint32_t a = 0U; a < NB; a++)
+      {
+        float32_t x = out[c * NB + a];
+        out[c * NB + a] = 1.0f / (1.0f + expf(-x));
+      }
+    }
+    SCB_CleanDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
+  }
+#endif
+
   /* Debug: capture head/tail of output[0] for shell inspection. The model
    * output is float32 (NB_CLASSES + 4 bbox per box, * num_boxes). */
   if (_nn_out[0] != NULL && _nn_out_len[0] > 0U)
