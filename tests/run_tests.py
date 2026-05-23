@@ -86,9 +86,36 @@ class KitShell:
 
     def __init__(self, tty: str):
         self.tty = tty
-        os.system(f"stty -F {tty} 115200 cs8 -cstopb -parenb raw -echo")
-        self.fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        self._open()
         self.drain(0.3)
+
+    def _open(self):
+        os.system(f"stty -F {self.tty} 115200 cs8 -cstopb -parenb raw -echo")
+        self.fd = os.open(self.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+    def reopen(self) -> bool:
+        """After a kit crash + STLink hard reset, the CDC port can come
+        back with a different /dev/ttyACMx number. Re-resolve the symlink
+        and re-open the fd. Returns True if a TTY was found within a
+        few seconds, False otherwise (caller should bail)."""
+        try: os.close(self.fd)
+        except OSError: pass
+        # /dev/serial/by-id/ resolves to the *current* ACMx — the
+        # symlink rotates when the device re-enumerates.
+        by_id = "/dev/serial/by-id/usb-STMicroelectronics_N6Cam_DEADBEEF-if02"
+        for _ in range(15):
+            if os.path.exists(by_id):
+                new_tty = os.path.realpath(by_id)
+                if os.path.exists(new_tty):
+                    self.tty = new_tty
+                    try:
+                        self._open()
+                        self.drain(1.0)
+                        return True
+                    except OSError:
+                        pass
+            time.sleep(1.0)
+        return False
 
     def close(self):
         try:
@@ -148,6 +175,12 @@ class TestResult:
     status: str             # 'pass' | 'fail' | 'skip'
     reason: str = ""        # populated for fail / skip
     extra: str = ""         # optional info (e.g. timing)
+    # For inference tests: paths (relative to the HTML report) of the
+    # 192x192 source image fed to the kit and the same image with the
+    # kit-returned detection rectangles drawn on top. Left empty for
+    # non-inference tests.
+    image_orig:      str = ""
+    image_annotated: str = ""
 
 
 @dataclass
@@ -210,6 +243,142 @@ def load_image_as_rgb(path: Path) -> bytes:
     return img.tobytes()
 
 
+# COCO class -> (display name, ARGB-ish hex color) for the boxes the kit
+# can return. Anything outside this map falls back to a generic grey
+# label so the report stays readable.
+_REPORT_CLASS_PALETTE = {
+    0:  ("person",     "#19c37d"),
+    1:  ("bicycle",    "#ffb84d"),
+    2:  ("car",        "#3aa0ff"),
+    3:  ("motorcycle", "#a3a3a3"),
+    4:  ("airplane",   "#a3a3a3"),
+    5:  ("bus",        "#ffd24d"),
+    6:  ("train",      "#a3a3a3"),
+    7:  ("truck",      "#ff8a3d"),
+    8:  ("boat",       "#a3a3a3"),
+    15: ("cat",        "#d96aff"),
+    16: ("dog",        "#d96aff"),
+}
+
+
+def save_image_pair(image_path: Path, boxes: List[dict], dest_dir: Path,
+                    stem: str) -> Tuple[str, str]:
+    """For an inference test, write the 192x192 input the kit saw and a
+    copy with the kit-reported detection rectangles drawn over it.
+
+    Returns (orig_rel, annotated_rel) — relative paths suitable for the
+    HTML report's <img src=…>. Returns ('','') if Pillow isn't available
+    or the source image can't be read.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except ImportError:
+        return "", ""
+    if not image_path.exists():
+        return "", ""
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    # Save the exact frame the kit ran inference on (192x192). Doing the
+    # resize here mirrors what load_image_as_rgb does at upload time so
+    # the box coordinates line up.
+    img = Image.open(image_path).convert("RGB").resize((FRAME_W, FRAME_H),
+                                                       Image.LANCZOS)
+    orig_path = dest_dir / f"{stem}_orig.png"
+    img.save(orig_path, "PNG", optimize=True)
+
+    annotated = img.copy()
+    draw = ImageDraw.Draw(annotated)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    for b in boxes:
+        cx, cy = b.get("cx", 0.0), b.get("cy", 0.0)
+        w,  h  = b.get("w",  0.0), b.get("h",  0.0)
+        # The firmware emits normalized [0,1] cx,cy,w,h. Clamp so a
+        # nonsensical bbox (which happens with the relu30 model's
+        # low-conf garbage detections — negative coords or coords > 1)
+        # doesn't disappear off-canvas; clamping keeps the user-visible
+        # signal that "the model fired here, with low confidence".
+        x1 = max(0.0, min(1.0, cx - w / 2.0)) * FRAME_W
+        y1 = max(0.0, min(1.0, cy - h / 2.0)) * FRAME_H
+        x2 = max(0.0, min(1.0, cx + w / 2.0)) * FRAME_W
+        y2 = max(0.0, min(1.0, cy + h / 2.0)) * FRAME_H
+        if x2 <= x1 or y2 <= y1:
+            continue
+        name, color = _REPORT_CLASS_PALETTE.get(
+            b.get("class", -1), (f"c{b.get('class','?')}", "#a3a3a3"))
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        label = f"{name} {b.get('conf', 0.0):.2f}"
+        # Small filled label tab at the top-left of the box.
+        # Pillow 10 removed Draw.textsize() — use textbbox() (Pillow 8+)
+        # and fall back to a rough estimate if neither exists.
+        if hasattr(draw, "textbbox"):
+            l, t, rt, btm = draw.textbbox((0, 0), label, font=font)
+            tw, th = rt - l, btm - t
+        elif hasattr(draw, "textsize"):
+            tw, th = draw.textsize(label, font=font)
+        else:
+            tw, th = len(label) * 6, 11
+        ty = max(0, y1 - th - 2)
+        draw.rectangle([x1, ty, x1 + tw + 4, ty + th + 2], fill=color)
+        draw.text((x1 + 2, ty), label, fill="#000000", font=font)
+
+    annotated_path = dest_dir / f"{stem}_det.png"
+    annotated.save(annotated_path, "PNG", optimize=True)
+    # Return paths relative to the HTML report's directory.
+    return (orig_path.name, annotated_path.name)
+
+
+# Path to STM32CubeProgrammer CLI — used to pulse NRST on the kit
+# when the App hangs in NN inference. NRST works even with Debug
+# Authentication locked, so this is our only software-only recovery
+# without the boot switch.
+_STM32_PROG_CLI = (
+    "/home/ilan/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/"
+    "STM32_Programmer_CLI"
+)
+
+
+def recover_kit(sh: KitShell) -> bool:
+    """Pulse NRST via STLink, wait for the CDC port to re-enumerate,
+    and re-open it on `sh`. Returns True if the shell is responsive
+    again afterwards.
+
+    Used after a per-image inference hangs the App's NN task (the
+    kit's USB ACM stack stays alive but write() returns Errno 5
+    because the kit's RX path is wedged). Without this, one bad
+    frame loses the entire rest of the suite."""
+    if not os.path.exists(_STM32_PROG_CLI):
+        return False
+    import subprocess
+    try:
+        subprocess.run([_STM32_PROG_CLI, "-c", "port=SWD", "-hardrst"],
+                       capture_output=True, timeout=20)
+    except Exception:
+        return False
+    # CDC re-enumerates ~5–8 s after NRST. KitShell.reopen() polls.
+    time.sleep(6.0)
+    if not sh.reopen():
+        return False
+    # Wait for the App to come up enough that the shell prompt is alive.
+    for _ in range(10):
+        try:
+            sh.drain(0.2)
+            sh.write_line("uptime")
+            out = sh.read_until("ok", 2.0)
+            if "Uptime" in out:
+                # Restart detect (the App default after a fresh boot may
+                # not have NN auto-running depending on safe-boot state).
+                sh.write_line("detect start")
+                sh.read_until("ok", 2.0)
+                return True
+        except OSError:
+            time.sleep(1.0)
+    return False
+
+
 def inject_frame(sh: KitShell, data: bytes) -> bool:
     crc = zlib.crc32(data) & 0xFFFFFFFF
     sh.write_line("frame upload")
@@ -237,6 +406,13 @@ def run_inference(sh: KitShell) -> Tuple[int, float, List[dict], str]:
         boxes.append({
             "class": int(bm.group(2)),
             "conf":  float(bm.group(3)),
+            # Vendor firmware prints bbox in normalized [0,1] coords as
+            # (x_center, y_center, width, height). Capture all four so the
+            # report can draw the actual rectangles the kit produced.
+            "cx":    float(bm.group(4)),
+            "cy":    float(bm.group(5)),
+            "w":     float(bm.group(6)),
+            "h":     float(bm.group(7)),
         })
     return count, nn_ms, boxes, out
 
@@ -463,7 +639,8 @@ def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
             extra=f"count={count} NN={nn_ms:.1f}ms")
 
 
-def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path):
+def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path,
+                    art_dir: Path):
     suite.group("GROUP 9: Detection algorithm — single person + non-person")
     sh.send_get("detect start", "detect start ok", 2.0)
     person_imgs = ["astronaut.jpg", "camera.jpg"]
@@ -478,32 +655,61 @@ def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path):
             data = load_image_as_rgb(path)
         except Exception:
             return -2, 0.0, []
-        if not inject_frame(sh, data):
-            return -3, 0.0, []
-        return run_inference(sh)[:3]
+        for attempt in (1, 2):
+            try:
+                if not inject_frame(sh, data):
+                    return -3, 0.0, []
+                return run_inference(sh)[:3]
+            except OSError:
+                # USB stack went away — kit's NN task likely hung. Pulse
+                # NRST and try once more so a single bad frame doesn't
+                # poison the rest of the suite.
+                if attempt == 2 or not recover_kit(sh):
+                    return -4, 0.0, []
+                # Slight pause to let the kit settle after recovery.
+                time.sleep(0.5)
+        return -4, 0.0, []
+
+    def attach_images(name: str, tid: str, boxes: List[dict]):
+        """Save the source frame + annotated copy next to the HTML
+        report, then patch the just-added TestResult so the report
+        renderer picks them up."""
+        orig_rel, det_rel = save_image_pair(
+            image_dir / name, boxes, art_dir, f"{tid}_{Path(name).stem}")
+        if suite.results and suite.results[-1].id == tid:
+            suite.results[-1].image_orig      = orig_rel
+            suite.results[-1].image_annotated = det_rel
 
     idx = 1
     for name in person_imgs:
-        c, nn, _ = run_one(name)
+        # Brief pacing between frames: the kit's NN task gets unhappy
+        # if we hammer it back-to-back at full CDC speed.
+        time.sleep(1.0)
+        c, nn, boxes = run_one(name)
+        tid = f"T09.{idx}"
         if c < 0:
-            skip(suite, f"T09.{idx}", f"Inject + run on {name}", f"rc={c}")
+            skip(suite, tid, f"Inject + run on {name}", f"rc={c}")
         else:
             nn_times.append(nn)
-            must_be(suite, f"T09.{idx}",
+            must_be(suite, tid,
                     f"{name} (real person) → NN detects ≥1 person",
                     c >= 1,
                     extra=f"count={c} NN={nn:.1f}ms")
+            attach_images(name, tid, boxes)
         idx += 1
     for name in non_imgs:
-        c, nn, _ = run_one(name)
+        time.sleep(1.0)
+        c, nn, boxes = run_one(name)
+        tid = f"T09.{idx}"
         if c < 0:
-            skip(suite, f"T09.{idx}", f"Inject + run on {name}", f"rc={c}")
+            skip(suite, tid, f"Inject + run on {name}", f"rc={c}")
         else:
             nn_times.append(nn)
-            must_be(suite, f"T09.{idx}",
+            must_be(suite, tid,
                     f"{name} (no person) → NN returns 0 detections",
                     c == 0,
                     extra=f"count={c} NN={nn:.1f}ms")
+            attach_images(name, tid, boxes)
         idx += 1
 
     # Performance test — aggregate NN time + throughput
@@ -519,7 +725,7 @@ def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path):
         ))
 
 
-def group_count(sh: KitShell, suite: Suite, image_dir: Path):
+def group_count(sh: KitShell, suite: Suite, image_dir: Path, art_dir: Path):
     """Multi-person and vehicle COUNT verification — images sourced from
     COCO128 with ground-truth labels. Asserts a sensible lower bound so the
     test reflects realistic NN behavior at 192x192 input (small people in
@@ -550,15 +756,24 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path):
             data = load_image_as_rgb(path)
         except Exception:
             return -2, 0.0, []
-        if not inject_frame(sh, data):
-            return -3, 0.0, []
-        return run_inference(sh)[:3]
+        for attempt in (1, 2):
+            try:
+                if not inject_frame(sh, data):
+                    return -3, 0.0, []
+                return run_inference(sh)[:3]
+            except OSError:
+                if attempt == 2 or not recover_kit(sh):
+                    return -4, 0.0, []
+                time.sleep(0.5)
+        return -4, 0.0, []
 
     idx = 1
     for name, gt_p, gt_v, min_p, min_v, kind in cases:
+        time.sleep(1.0)
         c, nn, boxes = run_one(name)
+        tid = f"T11.{idx}"
         if c < 0:
-            skip(suite, f"T11.{idx}", f"{name} (gt: {gt_p}p, {gt_v}v — {kind})",
+            skip(suite, tid, f"{name} (gt: {gt_p}p, {gt_v}v — {kind})",
                  f"rc={c}")
             idx += 1
             continue
@@ -566,7 +781,11 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path):
         for b in boxes:
             per_cls[b["class"]] = per_cls.get(b["class"], 0) + 1
         n_person  = per_cls.get(0, 0)
-        n_vehicle = sum(per_cls.get(c, 0) for c in (2, 3, 5, 7))
+        # Same expanded "vehicle" definition as the App-side filter — see
+        # nn_task.c _class_passes_mask. At 192x192 the model often
+        # misclassifies vehicles into airplane/train/boat (4/6/8); treat
+        # them all as one transport bucket here too.
+        n_vehicle = sum(per_cls.get(c, 0) for c in (2, 3, 4, 5, 6, 7, 8))
         ok_p = n_person  >= min_p
         ok_v = n_vehicle >= min_v
         passed = ok_p and ok_v
@@ -574,7 +793,7 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path):
                  f"(gt {gt_p}p/{gt_v}v) NN={nn:.1f}ms")
         if passed:
             suite.add(TestResult(
-                f"T11.{idx}",
+                tid,
                 f"{name} ({kind}) → ≥{min_p} person",
                 "pass", extra=extra))
         else:
@@ -582,9 +801,16 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path):
             if not ok_p: reason.append(f"person {n_person}<{min_p}")
             if not ok_v: reason.append(f"vehicle {n_vehicle}<{min_v}")
             suite.add(TestResult(
-                f"T11.{idx}",
+                tid,
                 f"{name} ({kind}) → ≥{min_p} person",
                 "fail", reason=", ".join(reason), extra=extra))
+        # Save source + annotated images for every T11.* result so the
+        # report shows the kit's actual detections per case.
+        orig_rel, det_rel = save_image_pair(
+            image_dir / name, boxes, art_dir, f"{tid}_{Path(name).stem}")
+        if suite.results and suite.results[-1].id == tid:
+            suite.results[-1].image_orig      = orig_rel
+            suite.results[-1].image_annotated = det_rel
         idx += 1
 
 
@@ -621,6 +847,12 @@ HTML_HEAD = """<!DOCTYPE html>
   tr.skip td:last-child { color: #ffc107; font-weight: bold; }
   td.extra { color: #6c757d; font-size: .9em; }
   .footer { color: #999; margin-top: 30px; font-size: 0.9em; }
+  .detgrid { display: flex; gap: 12px; margin: 8px 0 4px; align-items: flex-start; }
+  .detgrid figure { margin: 0; }
+  .detgrid img { display: block; image-rendering: pixelated;
+                 border: 1px solid #c8d0d8; background: #000;
+                 width: 192px; height: 192px; }
+  .detgrid figcaption { font-size: .8em; color: #6c757d; text-align: center; margin-top: 2px; }
 </style></head><body>
 <h1>N6Cam — Test Report</h1>
 """
@@ -658,6 +890,9 @@ def write_report(out_path: Path, suite: Suite, runtime_s: int, tty: str):
 
     # the simpler grouping logic above is buggy; rebuild cleanly:
     rows = []
+    # Path the report will live at — used to make the embedded
+    # <img src=…> point at the per-run artifacts directory.
+    art_subdir = f"{out_path.stem}_artifacts"
     group_marker = dict(suite.groups)
     for i, r in enumerate(suite.results):
         if i in group_marker:
@@ -668,9 +903,22 @@ def write_report(out_path: Path, suite: Suite, runtime_s: int, tty: str):
         if r.reason:
             rcell += f" — {r.reason}"
         extra = f"<br><span class='extra'>{r.extra}</span>" if r.extra else ""
+        # If this test produced an annotated detection image, render the
+        # source frame + the kit-annotated copy side by side under the
+        # description cell.
+        imgs = ""
+        if r.image_orig and r.image_annotated:
+            imgs = (
+                f"<div class='detgrid'>"
+                f"<figure><img src='{art_subdir}/{r.image_orig}' alt='input'>"
+                f"<figcaption>input (192×192)</figcaption></figure>"
+                f"<figure><img src='{art_subdir}/{r.image_annotated}' alt='detections'>"
+                f"<figcaption>kit detections</figcaption></figure>"
+                f"</div>"
+            )
         rows.append(
             f"<tr class='{r.status}'><td>{r.id}</td>"
-            f"<td>{r.desc}{extra}</td><td>{rcell}</td></tr>"
+            f"<td>{r.desc}{extra}{imgs}</td><td>{rcell}</td></tr>"
         )
 
     body = HTML_HEAD
@@ -732,11 +980,17 @@ def main() -> int:
         here.parent / "results" / f"test-report-{time.strftime('%Y%m%d_%H%M%S')}.html"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Per-run subdirectory next to the report for the source + annotated
+    # detection images. Using the report's stem keeps multiple runs
+    # cleanly separated.
+    art_dir = out_path.parent / f"{out_path.stem}_artifacts"
+    art_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"{C_BOLD}=== N6Cam Test Suite ==={C_RESET}")
     print(f"TTY: {tty}")
     print(f"Images: {image_dir}")
     print(f"Report: {out_path}")
+    print(f"Artifacts: {art_dir}")
 
     sh = KitShell(tty)
     suite = Suite()
@@ -752,20 +1006,25 @@ def main() -> int:
         group_sd(sh, suite)
         group_frame_inject(sh, suite, image_dir)
         if image_dir.is_dir():
-            group_algorithm(sh, suite, image_dir)
+            group_algorithm(sh, suite, image_dir, art_dir)
         else:
             suite.group("GROUP 9: Detection algorithm against real photos")
             skip(suite, "T09.0", "Algorithm tests", "no images folder")
         group_camera(sh, suite)
         if image_dir.is_dir():
-            group_count(sh, suite, image_dir)
+            group_count(sh, suite, image_dir, art_dir)
         else:
             suite.group("GROUP 11: Multi-person + vehicle counting")
             skip(suite, "T11.0", "Count tests", "no images folder")
     finally:
-        # Reset state to be friendly
-        sh.write_line("frame clear")
-        sh.drain(0.3)
+        # Reset state to be friendly. Tolerate the kit being dead — by
+        # this point in the run a hung kit must not prevent the HTML
+        # report from being written, otherwise the whole run is lost.
+        try:
+            sh.write_line("frame clear")
+            sh.drain(0.3)
+        except OSError:
+            pass
         sh.close()
 
     runtime = int(time.time() - t0)

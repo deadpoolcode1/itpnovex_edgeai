@@ -19,6 +19,12 @@ Output:
 - Coloured PASS/FAIL/SKIP table on stdout
 - `results/test-report-<timestamp>.html` (V20_SDVR-style)
 - `results/test-report-<timestamp>.pdf` if `wkhtmltopdf` or headless Chrome is on PATH
+- `results/test-report-<timestamp>_artifacts/` — for every per-image
+  inference test (group 9 + 11) this directory contains the 192×192
+  source frame the kit actually saw plus the same frame with the
+  kit-reported detection rectangles drawn on top. The HTML report
+  embeds both side-by-side under each row so you can verify what the
+  device detected without re-running anything.
 
 ## What's covered
 
@@ -56,9 +62,27 @@ To extend with your own images, drop them in `tests/images/` and adjust the `per
 
 ## Multi-class (vehicle) detection — current status
 
-The default model `vendor/n6cam.core.bsp/Firmware/Model/yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` is **person-only** — `detect profile 2 X` (vehicles bit) will always return 0 detections regardless of input.
+**Multi-class is live on master.** The firmware now ships the 80-class
+`yolov8n_relu30` model (compiled with stedgeai 4.0 + matching LL_ATON
+runtime) and both people and vehicle detections fire end-to-end on the
+kit at ~42 ms / inference. The test suite's GROUP 11 covers
+`cars_15.jpg`, `cars_18.jpg`, and `13ppl_5trucks.jpg`; the embedded
+detection images in the HTML report show the actual bounding boxes the
+kit returned.
 
-The **firmware-side wiring is multi-class capable** (class filter, regression suite, registry persistence). What's blocking production multi-class is the **model accuracy** after the quantization step required for the ATON NPU. This section documents what we tried and where the gap is.
+What's still soft is **detection quality, not pipeline plumbing**: at
+192×192 the model often misclassifies cars into the adjacent COCO
+transport categories (airplane / train / boat). The App-side filter in
+`nn_task.c::_class_passes_mask` treats the whole transport-vehicle
+band (COCO 2/3/4/5/6/7/8) as one bucket so the W6 SoW "is there a
+vehicle?" semantic works as expected. Confidences in this quantised
+multi-class model cap around 0.30–0.34 — see `MULTICLASS_STATUS.md` in
+the repo root for the longer story about why the pristine pretrained
+weights deadlock the ATON runtime and why we ended up on the 30-epoch
+fine-tuned variant.
+
+See the section below for the historical journey through PTQ variants;
+the conclusion (point 2 — light fine-tuning) is what is now deployed.
 
 ### Pipeline status
 

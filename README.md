@@ -156,11 +156,13 @@ A comprehensive regression suite drives the kit's CDC shell and exercises every 
 ./modular-tools.sh test
 ```
 
-Latest baseline: **46 / 47 PASS in 15 s, NN inference 17 ms / frame** on the 1-class person model. Output goes to `results/test-report-<timestamp>.html` (and `.pdf` if `wkhtmltopdf` or headless Chrome is on PATH) in the same format as the V20_SDVR reports.
+Latest baseline: **50 / 56 PASS in ~100 s, NN inference ~42 ms / frame** on the multi-class people+vehicles model. Output goes to `results/test-report-<timestamp>.html` (and `.pdf` if `wkhtmltopdf` or headless Chrome is on PATH) in the same format as the V20_SDVR reports.
+
+Per-image inference tests (groups 9 + 11) embed the 192×192 source frame next to a copy with the device-returned detection rectangles drawn on top, so the report is a self-contained record of what the kit actually saw and what it labeled. The image pairs land in `results/test-report-<timestamp>_artifacts/` next to the HTML.
 
 ## 6. Detection model
 
-The model in flash today is the vendor's pre-quantized `yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` (person-only, 192×192 input, INT8 on the ATON NPU). Inference: ~17 ms / frame.
+The model in flash today is `yolov8n_relu30` — 80-class COCO YOLOv8n, lightly fine-tuned on COCO128, INT8 on the ATON NPU at 192×192 input, ~42 ms / inference. People and vehicle classes both fire end-to-end via the firmware's expanded class filter (`nn_task.c::_class_passes_mask` treats COCO 2/3/4/5/6/7/8 — car/motorcycle/airplane/bus/train/truck/boat — as one transport bucket because the 192×192 quantised model frequently misclassifies vehicles into adjacent categories). The historical 1-class model (`yolov8n_192_quant_pc_uf_od_coco-person-st.tflite`, 17 ms / frame) is preserved at `vendor/n6cam.core.bsp/Firmware/Model/_backup_person_only/` if you ever need a smaller / faster single-class baseline.
 
 The firmware-side wiring is multi-class capable — `detect profile <det_msk> <act_msk>` filters by class bitmask (bit 0 = people, bit 1 = vehicles → COCO 2/3/5/7), and the regression suite already understands `car=N` / `truck=N` / etc. The moment a multi-class quantized model lands in `vendor/.../Model/network_data.hex`, vehicles light up automatically with no firmware code changes — just bump `AI_OD_YOLOV8_PP_NB_CLASSES` from 1 to N and re-run `./modular-tools.sh build && ./modular-tools.sh update` + `./modular-tools.sh update model`.
 
