@@ -80,5 +80,10 @@ yolov8n_saved_model/
 # Live-detection capture used in the milestone email — keep tracked
 !captures/n6cam_live_detection_*.jpg
 
+# Soak HTML/PDF artifacts are large + regenerable; keep only the CSV summaries
+results/soak-*/*.html
+results/soak-*/*.pdf
+results/soak-*/*_artifacts/
+
 # LibreOffice lock files
 .~lock*#
