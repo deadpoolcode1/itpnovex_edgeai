@@ -76,7 +76,7 @@ extern "C" {
  * However, it is essential to balance the threshold value to ensure that you do not miss too many true positives.
  *
  * This value is set following the evaluation curves obtained from Ultralytics YOLOv8 model training. */
-#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.3f)
+#define AI_OD_YOLOV8_PP_CONF_THRESHOLD           (0.25f)
 
 /** Intersection over Union (IoU) threshold for Non-Maximum Suppression (NMS).
  * A high IoU threshold means that more overlapping will be allowed between boxes, while a lower threshold will allow less boxes to be retained.
@@ -136,8 +136,11 @@ static const t_sai_class SAI_CLASSES[SAI_CLASS_NB] = {
   [0]  = { "person"     , 0x00FF00FFu },
   [2]  = { "car"        , 0x0000FFFFu },
   [3]  = { "motorcycle" , 0x00FFFFFFu },
+  [4]  = { "airplane"   , 0x00C0C0FFu },  /* sometimes a misclassified car */
   [5]  = { "bus"        , 0xFFFF00FFu },
+  [6]  = { "train"      , 0x80C0FFFFu },  /* sometimes a misclassified car */
   [7]  = { "truck"      , 0xFF7F00FFu },
+  [8]  = { "boat"       , 0x40A0FFFFu },
 };
 
 

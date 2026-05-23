@@ -285,9 +285,17 @@ static bool _class_passes_mask(int32_t class_index, uint8_t det_msk)
 {
   /* People class */
   if (class_index == 0)      return (det_msk & 0x01U) != 0U;
-  /* Vehicle classes (COCO): car=2, motorcycle=3, bus=5, truck=7 */
+  /* Vehicle classes (COCO): car=2, motorcycle=3, bus=5, truck=7.
+   * Also accept airplane(4), train(6), boat(8): at the 192x192 input
+   * size our quantized model frequently misclassifies vehicles into
+   * these adjacent COCO categories. From the W6 SoW point of view
+   * "something on wheels/wings in the scene" is a vehicle detection,
+   * so treating the whole transport-vehicle band as one bucket gives a
+   * usable signal until we can retrain at higher resolution. */
   if (class_index == 2 || class_index == 3 ||
-      class_index == 5 || class_index == 7)
+      class_index == 4 || class_index == 5 ||
+      class_index == 6 || class_index == 7 ||
+      class_index == 8)
                               return (det_msk & 0x02U) != 0U;
   return false;
 }
