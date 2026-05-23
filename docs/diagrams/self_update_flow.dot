@@ -1,0 +1,130 @@
+digraph self_update_flow {
+  rankdir=TB;
+  bgcolor="white";
+  pad=0.5;
+  splines=spline;
+  fontname="Helvetica";
+  nodesep=0.4;
+  ranksep=0.7;
+  compound=true;
+
+  node [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box,
+        height=0.55, margin="0.20,0.12"];
+  edge [fontname="Helvetica", fontsize=10, color="#444444"];
+
+  // ── Host side ────────────────────────────────────────────────────
+  subgraph cluster_host {
+    label = " 1.  Dev host (laptop) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#1F4E79";
+    penwidth = 2;
+    fontcolor = "#163A5C";
+    fontsize = 13;
+    fillcolor = "#E1ECF7";
+
+    user [label="$ ./n6cam-update.py\n   --target app|model\n   <file>.bin",
+          fillcolor="#FFFFFF", color="#1F4E79"];
+    py   [label="n6cam-update.py\n• CRC32 the payload\n• stty raw 115200\n• open /dev/ttyACMx",
+          fillcolor="#FFFFFF", color="#1F4E79"];
+    user -> py;
+  }
+
+  // ── CDC wire ─────────────────────────────────────────────────────
+  cdc [label="USB CDC-ACM\n@ 115200 8N1\nno hardware mod",
+       shape="cylinder", fillcolor="#FFF4D6", color="#C9A227", penwidth=2,
+       fontsize=11];
+  py -> cdc -> shell [label=" 'update {app|model}\\n'\n then UPDT + size + crc + payload "];
+
+  // ── Kit side ─────────────────────────────────────────────────────
+  subgraph cluster_kit {
+    label = " 2.  SIANA N6Cam  —  STM32N657 application ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#A23B72";
+    penwidth = 2;
+    fontcolor = "#6E1F49";
+    fontsize = 13;
+    fillcolor = "#F4E0EC";
+
+    shell  [label="shell_task\nrecognises 'update' command\nbuffers the binary payload",
+            fillcolor="#FFFFFF", color="#A23B72"];
+    update [label="Bootloader-class self-updater\n(developed in this project)\n\n• verify UPDT magic + CRC32\n• suspend NN, drop xSPI memory-map\n• erase target slot\n• stream-write to xSPI NOR\n• re-enable memory-map\n• NVIC_SystemReset()",
+            fillcolor="#FFFFFF", color="#A23B72"];
+    shell -> update;
+  }
+
+  // ── xSPI NOR layout ──────────────────────────────────────────────
+  subgraph cluster_flash {
+    label = " 3.  xSPI NOR layout (32 MiB MX66UW1G45G) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#465A14";
+    penwidth = 2;
+    fontcolor = "#2A3A05";
+    fontsize = 13;
+    fillcolor = "#E7EDD3";
+
+    fsbl    [label="FSBL\n@ 0x70000000\nsigned -hv 2.3\n— SWD only —",
+             fillcolor="#FFFFFF", color="#465A14"];
+    slot1app[label="Application (SLOT1_APP)\n@ 0x70400000  ≤ 1 MiB\nsigned -hv 2.3\nself-updatable via CDC",
+             fillcolor="#FFFFFF", color="#465A14"];
+    slot1w  [label="Model weights (SLOT1_WEIGHTS)\n@ 0x70600000  ≤ 16 MiB\nraw network_atonbuf.xSPI2.raw\nself-updatable via CDC",
+             fillcolor="#FFFFFF", color="#465A14"];
+
+    { rank=same; fsbl; slot1app; slot1w; }
+  }
+
+  update -> slot1app [label=" target=app ", color="#A23B72", fontcolor="#6E1F49"];
+  update -> slot1w   [label=" target=model ", color="#A23B72", fontcolor="#6E1F49"];
+
+  // ── SWD recovery (fallback) ──────────────────────────────────────
+  subgraph cluster_swd {
+    label = " 4.  SWD recovery (fallback only — boot-switch toggle required) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#C9A227";
+    penwidth = 2;
+    fontcolor = "#7A6005";
+    fontsize = 13;
+    fillcolor = "#FFF4D6";
+
+    swd [label="STM32_Programmer_CLI -c port=SWD\n-el MX66UW1G45G_STM32N6570-DK.stldr\n-w <signed.bin | network_data.hex> <addr>",
+         fillcolor="#FFFFFF", color="#C9A227"];
+  }
+
+  swd -> fsbl     [style="dashed", color="#C9A227", fontcolor="#7A6005",
+                   label=" only when FSBL bricked "];
+  swd -> slot1app [style="dashed", color="#C9A227", fontcolor="#7A6005",
+                   label=" only when App fully bricked\n & CDC self-update can't run "];
+  swd -> slot1w   [style="dashed", color="#C9A227", fontcolor="#7A6005",
+                   label=" alternative model load "];
+
+  // ── Boot path ────────────────────────────────────────────────────
+  subgraph cluster_boot {
+    label = " 5.  Boot path (every reset, including post-update) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#1B4332";
+    penwidth = 2;
+    fontcolor = "#0D241B";
+    fontsize = 13;
+    fillcolor = "#D8F0DA";
+
+    rom   [label="STM32N6 ROM\n• verify FSBL signature\n• jump → FSBL",
+           fillcolor="#FFFFFF", color="#1B4332"];
+    fsbl2 [label="FSBL\n• map xSPI as memory\n• verify Application signature\n• jump → Application",
+           fillcolor="#FFFFFF", color="#1B4332"];
+    appboot [label="Application boot\n• stedgeai ATON runtime\n  loads weights from SLOT1_WEIGHTS\n• camera + NN + shell come up",
+             fillcolor="#FFFFFF", color="#1B4332"];
+
+    rom -> fsbl2 -> appboot;
+  }
+
+  fsbl     -> fsbl2   [color="#1B4332", style="dotted", arrowhead="none",
+                       label=" loaded by ROM "];
+  slot1app -> appboot [color="#1B4332", style="dotted", arrowhead="none",
+                       label=" loaded by FSBL "];
+  slot1w   -> appboot [color="#1B4332", style="dotted", arrowhead="none",
+                       label=" mmaped by\n ATON runtime "];
+}

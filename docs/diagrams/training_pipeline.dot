@@ -1,0 +1,95 @@
+digraph training_pipeline {
+  rankdir=TB;
+  bgcolor="white";
+  pad=0.4;
+  splines=spline;
+  fontname="Helvetica";
+  nodesep=0.4;
+  ranksep=0.5;
+
+  node [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box,
+        height=0.55, margin="0.18,0.10"];
+  edge [fontname="Helvetica", fontsize=10, color="#444444"];
+
+  // ─ NVIDIA Jetson Orin ────────────────────────────────────────────
+  subgraph cluster_orin {
+    label = " 1.  NVIDIA Jetson Orin  (10.100.102.137) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#75AC44";
+    penwidth = 2;
+    fontcolor = "#2F5510";
+    fontsize = 13;
+    fillcolor = "#E8F3DC";
+
+    pt   [label="yolov8n.pt\nUltralytics 80-class COCO\nSiLU activations",
+          fillcolor="#FFFFFF", color="#75AC44"];
+    swap [label="SiLU → ReLU\nactivation swap\n(per Conv module)",
+          fillcolor="#FFFFFF", color="#75AC44"];
+    train[label="Fine-tune (GPU)\ncoco128 / coco val2017\n10–50 epochs @ 192×192",
+          fillcolor="#FFFFFF", color="#75AC44"];
+    exp  [label="Ultralytics export\nFP32 SavedModel\n(.pb + variables)",
+          fillcolor="#FFFFFF", color="#75AC44"];
+    quant[label="TFLite PTQ INT8\nrepresentative dataset = COCO128\nuint8 input, float32 output",
+          fillcolor="#FFFFFF", color="#75AC44"];
+    tflite[label="*.tflite\nINT8, 192×192, uint8 in / f32 out\n~3.4 MB",
+           fillcolor="#FFFFFF", color="#75AC44"];
+
+    pt -> swap -> train -> exp -> quant -> tflite;
+  }
+
+  // ─ Dev host ──────────────────────────────────────────────────────
+  subgraph cluster_host {
+    label = " 2.  Dev host (laptop) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#1F4E79";
+    penwidth = 2;
+    fontcolor = "#163A5C";
+    fontsize = 13;
+    fillcolor = "#E1ECF7";
+
+    stai [label="stedgeai 4.0 generate\n--target stm32n6\n--st-neural-art …",
+          fillcolor="#FFFFFF", color="#1F4E79"];
+    artifacts [label="Compiled artifacts\nnetwork.c / stai_network.{c,h}\nnetwork_ecblobs.h\nnetwork_atonbuf.xSPI2.raw",
+               fillcolor="#FFFFFF", color="#1F4E79"];
+    bsp [label="vendor/n6cam.core.bsp/\nFirmware/Model/\n(drop-in replace)",
+         fillcolor="#FFFFFF", color="#1F4E79"];
+    build [label="make all  (arm-none-eabi)\n→ Application.bin",
+           fillcolor="#FFFFFF", color="#1F4E79"];
+    sign [label="STM32_SigningTool_CLI\n-hv 2.3 -align\n→ Application_signed.bin",
+          fillcolor="#FFFFFF", color="#1F4E79"];
+    hex [label="objcopy → network_data.hex\n@ base 0x70600000\n(SWD path only)",
+         fillcolor="#FFFFFF", color="#1F4E79"];
+
+    stai -> artifacts;
+    artifacts -> bsp;
+    bsp -> build -> sign;
+    artifacts -> hex;
+  }
+
+  // ─ SIANA N6Cam ───────────────────────────────────────────────────
+  subgraph cluster_kit {
+    label = " 3.  SIANA N6Cam  (STM32N657 + ATON NPU) ";
+    labeljust = "l";
+    style = "filled,rounded";
+    color  = "#A23B72";
+    penwidth = 2;
+    fontcolor = "#6E1F49";
+    fontsize = 13;
+    fillcolor = "#F4E0EC";
+
+    inference [label="ATON NPU @ 800 MHz\n80-class inference\n25 ms / frame  •  ≈40 FPS budget\nperson + vehicle detection",
+               fillcolor="#FFFFFF", color="#A23B72"];
+  }
+
+  // ─ Cross-cluster transfers ───────────────────────────────────────
+  tflite -> stai [label="  scp from Orin → host  ",
+                  color="#75AC44", fontcolor="#2F5510", penwidth=1.5];
+
+  sign -> inference [label="  CDC self-update (App)\n  see flow 2  ",
+                     color="#A23B72", fontcolor="#6E1F49", penwidth=1.5];
+  hex  -> inference [label="  SWD recovery\n  see flow 2  ",
+                     color="#C9A227", fontcolor="#9B7B0F",
+                     style="dashed", penwidth=1.5];
+}
