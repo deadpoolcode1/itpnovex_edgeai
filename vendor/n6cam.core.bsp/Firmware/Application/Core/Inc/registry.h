@@ -146,13 +146,14 @@ typedef struct
   uint8_t   motion_sensitivity;   /* 0..100 */
   uint32_t  motion_no_motion_timeout_s;
 
-  /* V4 — reserved. Was a flash-backed bootloop counter (the comment was
-   * mistaken — TAMP backup registers survive reset just fine on this
-   * kit once HAL_PWR_EnableBkUpAccess() + RTCAPB clock are enabled).
-   * Counter migrated to TAMP->BKP1R + a FSBL-side bump in v1.5.2 so it
-   * also catches App-init crashes that never reach shell_task.
-   * Kept here only to preserve registry struct layout / NV format. */
-  uint8_t   boot_count;        /* deprecated, unused — keep for ABI */
+  /* V4 — safe-boot bootloop counter (flash-backed because TAMP + SRAM
+   * are both wiped on this kit's NVIC_SystemReset path). The shell task
+   * bumps it on boot, clears it after ~60 s of healthy uptime. If we
+   * reach BOOTLOOP_THRESHOLD before that healthy point, the previous
+   * boot(s) crashed before becoming healthy — typically nn_task hitting
+   * a bad model — and the App switches to safe mode (skip auto-detect)
+   * so the user can push a fix over CDC. */
+  uint8_t   boot_count;
 
 } t_registry_data;
 
