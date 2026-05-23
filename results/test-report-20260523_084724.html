@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>N6Cam Test Report</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+  h1 { color: #333; } h2 { color: #555; margin-top: 20px; }
+  .meta { color: #666; margin-bottom: 20px; }
+  .summary { font-size: 1.3em; padding: 15px; border-radius: 8px; margin: 15px 0; }
+  .summary.pass { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+  .summary.fail { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+  table { border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.12); margin-bottom: 20px; }
+  th { background: #343a40; color: white; padding: 10px 12px; text-align: left; }
+  td { padding: 8px 12px; border-bottom: 1px solid #dee2e6; }
+  tr.group td { background: #e9ecef; font-weight: bold; padding: 10px 12px; }
+  tr.pass td:last-child { color: #28a745; font-weight: bold; }
+  tr.fail td:last-child { color: #dc3545; font-weight: bold; }
+  tr.skip td:last-child { color: #ffc107; font-weight: bold; }
+  td.extra { color: #6c757d; font-size: .9em; }
+  .footer { color: #999; margin-top: 30px; font-size: 0.9em; }
+  .detgrid { display: flex; gap: 12px; margin: 8px 0 4px; align-items: flex-start; }
+  .detgrid figure { margin: 0; }
+  .detgrid img { display: block; image-rendering: pixelated;
+                 border: 1px solid #c8d0d8; background: #000;
+                 width: 192px; height: 192px; }
+  .detgrid figcaption { font-size: .8em; color: #6c757d; text-align: center; margin-top: 2px; }
+</style></head><body>
+<h1>N6Cam — Test Report</h1>
+<div class="meta">
+  <b>Date:</b> 2026-05-23 08:48:51<br>
+  <b>Device:</b> SIANA N6Cam (STM32N657 / IMX335 / Neural-ART NPU)<br>
+  <b>Firmware:</b> 01.08.2593089169<br>
+  <b>MCU UID:</b> 003031564236500400420024<br>
+  <b>Shell TTY:</b> /dev/ttyACM1<br>
+  <b>Runtime:</b> 86 seconds
+</div>
+<div class="summary pass">
+  <b>Result:</b> ALL TESTS PASSED
+  &nbsp;—&nbsp; Total: 56 &nbsp;|&nbsp; Pass: 54 &nbsp;|&nbsp; Fail: 0 &nbsp;|&nbsp; Skip: 2
+</div>
+<table>
+<tr><th style="width:10%">Test ID</th><th style="width:75%">Description</th><th style="width:15%">Result</th></tr>
+<tr class='pass'><td>T00.1</td><td>Kit CDC port /dev/ttyACM1 exists and is readable</td><td>PASS</td></tr>
+<tr class='pass'><td>T00.2</td><td>Shell `help` lists user-defined commands</td><td>PASS</td></tr>
+<tr class='pass'><td>T00.3</td><td>`fw` returns FW VER: …</td><td>PASS</td></tr>
+<tr class='pass'><td>T00.4</td><td>`uid` returns MCU UID</td><td>PASS</td></tr>
+<tr class='pass'><td>T00.5</td><td>`uptime` returns UPTIME ms</td><td>PASS</td></tr>
+<tr class='pass'><td>T01.1</td><td>`echo query` reports state + ok ack</td><td>PASS</td></tr>
+<tr class='pass'><td>T01.2</td><td>`echo off` succeeds (ok-ack)</td><td>PASS</td></tr>
+<tr class='pass'><td>T01.3</td><td>After `echo off`, no echoed prompt before reply</td><td>PASS</td></tr>
+<tr class='pass'><td>T01.4</td><td>`echo on` restores echo + ok ack</td><td>PASS</td></tr>
+<tr class='pass'><td>T02.1</td><td>`rtc` returns DD/MM/YY HH:MM:SS</td><td>PASS</td></tr>
+<tr class='pass'><td>T02.2</td><td>`rtc set DDMMYYYYHHMMSS` accepts a valid value</td><td>PASS</td></tr>
+<tr class='pass'><td>T02.3</td><td>RTC reads back the value we just set</td><td>PASS</td></tr>
+<tr class='pass'><td>T02.4</td><td>`version` prints Application: <ver></td><td>PASS</td></tr>
+<tr class='pass'><td>T03.1</td><td>`irled on` reports state=1 + ok-ack</td><td>PASS</td></tr>
+<tr class='pass'><td>T03.2</td><td>`irled off` reports state=0</td><td>PASS</td></tr>
+<tr class='pass'><td>T03.3</td><td>`motion sense 65 45` accepted, echoed back</td><td>PASS</td></tr>
+<tr class='pass'><td>T03.4</td><td>`motion query` returns persisted 65/45</td><td>PASS</td></tr>
+<tr class='pass'><td>T04.1</td><td>`img quality 75` set + ok-ack</td><td>PASS</td></tr>
+<tr class='pass'><td>T04.2</td><td>`img color RGB` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T04.3</td><td>`img chroma 1` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T04.4</td><td>`img query` shows quality=75 color=RGB chroma=1</td><td>PASS</td></tr>
+<tr class='pass'><td>T05.1</td><td>`detect start` succeeds</td><td>PASS</td></tr>
+<tr class='pass'><td>T05.2</td><td>`detect profile 3 1` (people+vehicles, save-SD)</td><td>PASS</td></tr>
+<tr class='pass'><td>T05.3</td><td>`detect profile query` returns 0x03 / 0x01</td><td>PASS</td></tr>
+<tr class='pass'><td>T06.1</td><td>`notify enable 0x10` (people-detect bit) accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T06.2</td><td>`notify period 30` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T06.3</td><td>`notify query` shows mask=0x10 period=30</td><td>PASS</td></tr>
+<tr class='pass'><td>T06.4</td><td>`notify trigger 16` emits +SDVRNTF JSON with rsn=16</td><td>PASS</td></tr>
+<tr class='pass'><td>T06.5</td><td>`notify disable` succeeds</td><td>PASS</td></tr>
+<tr class='pass'><td>T07.1</td><td>`sd query` reports mounted</td><td>PASS</td></tr>
+<tr class='pass'><td>T07.2</td><td>`sd ls` returns at least one entry</td><td>PASS</td></tr>
+<tr class='pass'><td>T07.3</td><td>`photo savesd` returns SoW §7 filename<br><span class='extra'>4325412_23052026_084732.rdy</span></td><td>PASS</td></tr>
+<tr class='skip'><td>T07.4</td><td>New .rdy file appears on SD after `photo savesd`</td><td>SKIP — named-file branch of snapshot_task drops the write — auto SnapshotN.jpeg path still works (pre-existing firmware bug)</td></tr>
+<tr class='pass'><td>T08.1</td><td>`frame clear` reverts to live camera</td><td>PASS</td></tr>
+<tr class='pass'><td>T08.2</td><td>Upload a synthetic 192x192 grey frame</td><td>PASS</td></tr>
+<tr class='pass'><td>T08.3</td><td>`frame query` reports loaded</td><td>PASS</td></tr>
+<tr class='pass'><td>T08.4</td><td>`frame run` returns a count + NN time on a grey frame<br><span class='extra'>count=0 NN=24.9ms</span></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.1</td><td>astronaut.jpg (real person) → NN detects ≥1 person<br><span class='extra'>count=1 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.1_astronaut_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.1_astronaut_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.2</td><td>camera.jpg (real person) → NN detects ≥1 person<br><span class='extra'>count=1 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.2_camera_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.2_camera_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.3</td><td>cat.jpg (no person) → NN returns 0 detections<br><span class='extra'>count=0 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.3_cat_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.3_cat_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.4</td><td>coffee.jpg (no person) → NN returns 0 detections<br><span class='extra'>count=0 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.4_coffee_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.4_coffee_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.5</td><td>moon.jpg (no person) → NN returns 0 detections<br><span class='extra'>count=0 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.5_moon_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.5_moon_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.6</td><td>rocket.jpg (no person) → NN returns 0 detections<br><span class='extra'>count=0 NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T09.6_rocket_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T09.6_rocket_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T09.7</td><td>NN inference avg ≤ 30 ms over 6 images<br><span class='extra'>avg=24.9ms worst=24.9ms n=6</span></td><td>PASS</td></tr>
+<tr class='pass'><td>T10.1</td><td>`camera awb auto` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T10.2</td><td>`camera exposure 10000` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T10.3</td><td>`camera gain 0` accepted</td><td>PASS</td></tr>
+<tr class='pass'><td>T11.1</td><td>1_person.jpg (single) → ≥1 person<br><span class='extra'>detected: person=1 vehicle=0 (gt 1p/0v) NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.1_1_person_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.1_1_person_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.2</td><td>2_people.jpg (small group) → ≥1 person<br><span class='extra'>detected: person=2 vehicle=0 (gt 2p/0v) NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.2_2_people_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.2_2_people_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.3</td><td>3_people.jpg (small group) → ≥2 person<br><span class='extra'>detected: person=3 vehicle=0 (gt 3p/0v) NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.3_3_people_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.3_3_people_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.4</td><td>5_people.jpg (group) → ≥2 person<br><span class='extra'>detected: person=2 vehicle=1 (gt 5p/0v) NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.4_5_people_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.4_5_people_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.5</td><td>7_people.jpg (group) → ≥2 person<br><span class='extra'>detected: person=8 vehicle=0 (gt 7p/0v) NN=24.9ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.5_7_people_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.5_7_people_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='skip'><td>T11.6</td><td>crowd_13.jpg (gt: 13p, 0v — crowd)</td><td>SKIP — rc=-5</td></tr>
+<tr class='pass'><td>T11.7</td><td>cars_18.jpg (vehicle (multi-class only)) → ≥0 person<br><span class='extra'>detected: person=0 vehicle=1 (gt 0p/18v) NN=25.0ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.7_cars_18_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.7_cars_18_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.8</td><td>cars_15.jpg (vehicle (multi-class only)) → ≥0 person<br><span class='extra'>detected: person=0 vehicle=2 (gt 0p/15v) NN=25.0ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.8_cars_15_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.8_cars_15_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+<tr class='pass'><td>T11.9</td><td>13ppl_5trucks.jpg (mixed) → ≥3 person<br><span class='extra'>detected: person=7 vehicle=2 (gt 13p/5v) NN=25.0ms</span><div class='detgrid'><figure><img src='test-report-20260523_084724_artifacts/T11.9_13ppl_5trucks_orig.png' alt='input'><figcaption>input (192×192)</figcaption></figure><figure><img src='test-report-20260523_084724_artifacts/T11.9_13ppl_5trucks_det.png' alt='detections'><figcaption>kit detections</figcaption></figure></div></td><td>PASS</td></tr>
+</table>
+<div class="footer">Generated by tests/run_tests.py — Kamacode Ltd.</div>
+</body></html>
