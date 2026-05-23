@@ -66,7 +66,7 @@ RE_FRAME_RUN = re.compile(
     r"frame run:\s+(\d+)\s+detection\(s\),?\s*(?:NN\s+([\d.]+)\s*ms)?"
 )
 RE_FRAME_BOX = re.compile(
-    r"\[(\d+)\]\s+class=(-?\d+)\s+conf=([\d.]+)\s+bbox=\(([\d.]+),([\d.]+),([\d.]+),([\d.]+)\)"
+    r"\[(\d+)\]\s+class=(-?\d+)\s+conf=([\d.]+)\s+bbox=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)"
 )
 RE_SD_QUERY = re.compile(r"sd:\s+(mounted|not mounted)")
 
