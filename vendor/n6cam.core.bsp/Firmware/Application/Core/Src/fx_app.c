@@ -162,6 +162,15 @@ int32_t fx_app_list_root(char *out, size_t out_size)
 
   rtos_mutex_acquire(&_fx_task.mtx, true);
 
+  /* Flush any pending FAT writes before iterating — without this the
+   * directory cursor can miss files that were just created (FileX's
+   * in-memory directory state lags behind what's been committed to
+   * media until the next flush). Observed empirically: after
+   * fx_app_write_file_exact returns SUCCESS the file is readable via
+   * fx_file_open but invisible to fx_directory_first_full_entry_find
+   * until a flush forces FileX to reconcile state. */
+  (void)fx_media_flush(&_fx_task.sdio);
+
   status = fx_directory_first_full_entry_find(
     &_fx_task.sdio, entry_name, &attr, &size,
     &year, &month, &day, &hour, &minute, &second

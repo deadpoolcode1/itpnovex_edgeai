@@ -101,6 +101,25 @@ void snapshot_create(t_draw *draw);
 bool snapshot_trigger(void);
 
 /**
+ * @brief Atomic "claim a snapshot slot with this filename" — the
+ *        snapshot_set_filename / snapshot_trigger pair is racy when
+ *        multiple producers compete (shell `photo savesd` vs nn_task's
+ *        auto-detect path): one caller can win the trigger and another
+ *        can clobber its filename a microsecond later because the
+ *        filename slot is a single static buffer.
+ *
+ *        This call sets the filename and triggers in one critical
+ *        section; if the snapshot pipeline isn't AVAILABLE, returns
+ *        false WITHOUT touching the pending filename.
+ *
+ * @param filename  Name to use for this snapshot, or NULL to fall
+ *                  back to the default Snapshot{idx}.jpeg
+ * @return true if the slot was claimed (trigger fired), false if the
+ *         pipeline is busy or no SD card is present
+ */
+bool snapshot_request(const char *filename);
+
+/**
  * @brief Override the next snapshot's filename (SoW §7 timestamped names).
  *        Pass NULL to revert to the default 'Snapshot{idx}.jpeg'. The
  *        override is consumed by the next snapshot then cleared.

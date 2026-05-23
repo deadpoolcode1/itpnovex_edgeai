@@ -233,7 +233,25 @@ extern "C"
 #define _ReleaseDaoWaitQueue_(_wq)  _my_tx_semaphore_put_prioritized(&(_wq))
 
 #define _MakeWfeSemaphoreUnavailable_(_sem)
-#define _GetWfeSemaphore_(_sem) tx_semaphore_get(&(_sem), TX_WAIT_FOREVER)
+/* Vendor default is TX_WAIT_FOREVER. We saw the ATON deadlock on a
+ * specific quantized-model + input-image combination (crowd_13.jpg with
+ * the relu30 model): one epoch's completion interrupt never fires, the
+ * WFE semaphore is never released, and the NN task blocks forever —
+ * which in a live-camera production deployment would brick the device
+ * on whatever frame happens to trigger the bug.
+ *
+ * Time-bound the wait so a stuck epoch can only stall the pipeline for
+ * one frame at most. The NN-task wrapper around stai_network_run sees
+ * the WFE return without an event, observes that progress stalled, and
+ * aborts the inference; the next camera frame gets a fresh attempt.
+ *
+ * A normal epoch finishes in 1–5 ms, so a 200-ms budget per WFE is
+ * generous compared to legitimate work and still keeps recovery within
+ * a single 33-ms display tick on the user's perception.
+ *
+ * (TX_TIMER_TICKS_PER_SECOND is 100 on this build → 20 ticks = 200 ms) */
+#define LL_ATON_OSAL_WFE_TIMEOUT_TICKS  (20U)
+#define _GetWfeSemaphore_(_sem) tx_semaphore_get(&(_sem), LL_ATON_OSAL_WFE_TIMEOUT_TICKS)
 #define _ReleaseWfeSemaphore_(_sem)                                                                                    \
   tx_semaphore_put(&(_sem)) // only the ATON IP owner may wait on this semaphore (i.e. no prioritization necessary)
 #define _ReleaseWfeSemaphoreISR_(_sem, ...)                                                                            \

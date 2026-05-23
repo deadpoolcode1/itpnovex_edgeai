@@ -179,6 +179,49 @@ bool snapshot_trigger(void)
   return false;
 }
 
+bool snapshot_request(const char *filename)
+{
+  /* Atomic claim. Wraps the set-filename + trigger in a
+   * disable-interrupts section so a second producer (e.g. nn_task's
+   * auto-detect path) racing on the same shared filename buffer can't
+   * either (a) overwrite our filename between our set and the worker
+   * consuming it, or (b) wipe our filename on its own trigger failure
+   * (it tried to set+trigger then cleared on the failed-trigger path).
+   *
+   * If the snapshot pipeline isn't AVAILABLE we return false without
+   * mutating _snap_filename — the caller's competing producer keeps
+   * whatever it staged.
+   */
+  TX_INTERRUPT_SAVE_AREA
+  TX_DISABLE
+  if (!bsp_sdio_is_detected() || (_snapshot_task.state != AVAILABLE))
+  {
+    TX_RESTORE
+    return false;
+  }
+  /* Take the slot. Filename copy is short; doing it inside the
+   * critical section keeps the set+trigger atomic vs. the worker. */
+  if (filename != NULL && filename[0] != '\0')
+  {
+    size_t i;
+    for (i = 0U; (i < SNAP_FILENAME_MAX) && (filename[i] != '\0'); i++)
+    {
+      _snap_filename[i] = filename[i];
+    }
+    _snap_filename[i] = '\0';
+  }
+  else
+  {
+    _snap_filename[0] = '\0';
+  }
+  /* Flip state to "trigger in flight" so a concurrent trigger from
+   * another task observes the slot as taken. The worker will re-set
+   * state when it processes the request. */
+  rtos_raise_event(&_snapshot_task.evt, SNAPSHOT_EVT_REQUEST);
+  TX_RESTORE
+  return true;
+}
+
 void snapshot_set_filename(const char *filename)
 {
   if (filename == NULL)

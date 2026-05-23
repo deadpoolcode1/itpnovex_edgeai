@@ -266,11 +266,7 @@ void nn_task_simulate_detection(uint32_t boxes)
                (unsigned long)ser,
                (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
                (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
-      snapshot_set_filename(fname);
-      if (!snapshot_trigger())
-      {
-        snapshot_set_filename(NULL);
-      }
+      (void)snapshot_request(fname);
     }
     LINFO(TRACE_NN, "[simulate] %lu object(s)", (unsigned long)boxes);
   }
@@ -382,12 +378,11 @@ static void _nn_task_run(uint32_t args)
                    (unsigned long)ser,
                    (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
                    (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
-          snapshot_set_filename(fname);
-          if (!snapshot_trigger())
-          {
-            /* SD busy/missing — drop this one; don't block inference */
-            snapshot_set_filename(NULL);
-          }
+          /* Atomic claim so we don't clobber a competing producer
+           * (shell `photo savesd`) racing on the shared filename
+           * buffer. If the pipeline is already busy, drop this one
+           * — we can't block inference waiting for SD. */
+          (void)snapshot_request(fname);
         }
         /* bit1 = report cellular: handled when modem channel is wired
          * (W11/W13). For now we still log the detection via trace. */
@@ -520,15 +515,49 @@ static void _nn_frame_process(void)
   /* Acquire FLASH (weights) */
   flash_acquire(true);
 
-  /* Run ATON */
+  /* Run ATON.
+   *
+   * Watchdog: cap the total time we'll spin in the inner WFE loop. A
+   * normal inference is ~25 ms; legitimate epochs all return within a
+   * few ms of WFE. If we see >1 second of looping (which has only
+   * been observed on specific model + input combinations where the
+   * ATON deadlocks an epoch's completion IRQ) we abort the inference,
+   * mark this frame as a no-detection, and return so the kit keeps
+   * processing live camera frames instead of bricking on a single
+   * bad frame. */
   stat_time_start(STAT_TIME_NN_MODEL);
   stai_return_code ret;
+  uint32_t wdog_ticks = tx_time_get();
+  uint32_t wdog_iters = 0U;
+  bool     wdog_fired = false;
+  const uint32_t WDOG_TICKS_MAX  = 100U;     /* ~1 s @ 100Hz */
+  const uint32_t WDOG_ITERS_MAX  = 4000U;    /* belt-and-braces */
 
   do {
     ret = stai_network_run(network_context, STAI_MODE_ASYNC);
     if (ret == STAI_RUNNING_WFE)
       LL_ATON_OSAL_WFE();
+    wdog_iters++;
+    if (wdog_iters > WDOG_ITERS_MAX ||
+        (tx_time_get() - wdog_ticks) > WDOG_TICKS_MAX)
+    {
+      wdog_fired = true;
+      break;
+    }
   } while (ret == STAI_RUNNING_WFE || ret == STAI_RUNNING_NO_WFE);
+
+  if (wdog_fired)
+  {
+    LERROR(TRACE_NN, "NN inference watchdog fired after %lu ticks / %lu iters — aborting frame",
+           (unsigned long)(tx_time_get() - wdog_ticks), (unsigned long)wdog_iters);
+    /* Reset inference state so the next frame starts clean. */
+    (void)stai_ext_network_new_inference(network_context);
+    stat_time_stop(STAT_TIME_NN_MODEL);
+    flash_acquire(false);
+    /* Report zero detections for this frame and bail. */
+    _pp_box_count = 0;
+    return;
+  }
 
   ret = stai_ext_network_new_inference(network_context);
   if (ret != STAI_SUCCESS)

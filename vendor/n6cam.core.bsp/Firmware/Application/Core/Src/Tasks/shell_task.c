@@ -925,14 +925,36 @@ static int32_t _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   }
   if (strcmp(sub, "ls") == 0)
   {
-    static char ls_buf[1536];
+    /* Buffer sized to hold ~200 entries of "<filename-up-to-40-chars> <size>\n".
+     * Each CMD_PRINTF caps at SHELL_OUT_SIZE bytes (currently 1 KB), so
+     * we can't dump the whole buffer in one call — the listing would be
+     * truncated past entry ~38 and newly-created files (which sit at
+     * the tail of the FAT directory) would be silently invisible to the
+     * shell even though fx_file_open could still read them. Chunk the
+     * output instead, one line at a time, so the full listing reaches
+     * the stream regardless of how many files are on media.
+     *
+     * Static-allocated so we don't blow the shell command's stack. */
+    static char ls_buf[8192];
     int32_t status = fx_app_list_root(ls_buf, sizeof(ls_buf));
     if (status != FX_SUCCESS)
     {
       CMD_PRINTF(stream, "sd ls: failed (%ld)%s", (long)status, lwshell_eol());
       return LWSHELL_OK;
     }
-    CMD_PRINTF(stream, "%s", ls_buf);
+    /* Walk ls_buf line by line, printing each through CMD_PRINTF. The
+     * lines from fx_app_list_root already end in '\n', so we restore
+     * that as the LF in lwshell_eol() doesn't matter — but to keep
+     * terminals happy emit CRLF via lwshell_eol(). */
+    char *p = ls_buf;
+    while (*p)
+    {
+      char *nl = strchr(p, '\n');
+      if (nl) { *nl = '\0'; }
+      CMD_PRINTF(stream, "%s%s", p, lwshell_eol());
+      if (!nl) break;
+      p = nl + 1;
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -985,14 +1007,16 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 
   if (savesd)
   {
-    /* Override the snapshot filename and request a capture. display_task will
-     * call snapshot_create on the next frame, the snapshot task encodes the
-     * JPEG and writes it to SD via fx_app_write_file_exact. */
-    snapshot_set_filename(fname);
-    if (!snapshot_trigger())
+    /* Claim a snapshot slot atomically — display_task will call
+     * snapshot_create on the next camera frame, the snapshot task
+     * encodes the JPEG and writes it to SD via fx_app_write_file_exact.
+     * Using snapshot_request (atomic) instead of set_filename+trigger
+     * avoids races with nn_task's auto-detect path that, when detect
+     * is running, would otherwise overwrite our filename and silently
+     * drop our write. */
+    if (!snapshot_request(fname))
     {
       CMD_PRINTF(stream, "photo savesd: trigger failed (no SD card / busy)%s", lwshell_eol());
-      snapshot_set_filename(NULL);
       return LWSHELL_OK;
     }
     CMD_PRINTF(stream, "photo savesd: capturing -> %s%s", fname, lwshell_eol());

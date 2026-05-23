@@ -627,36 +627,21 @@ def group_sd(sh: KitShell, suite: Suite):
             m is not None,
             extra=m.group(1) if m else "")
     # Wait for snapshot_task to encode JPEG + flush via FileX, then poll
-    # `sd ls` until the new file shows up (or 20 s timeout). FAT flush on a
+    # `sd ls` until the new file shows up (or 15 s timeout). FAT flush on a
     # clean 32 GB card is async and can take a couple of seconds.
-    #
-    # Known issue: on this kit the named-file path from photo savesd
-    # ("<ser>_<dd><mm><yyyy>_<hh><mm><ss>.rdy") frequently fires the
-    # +SDVRNTF notification but never lands the file on SD. The auto-
-    # detect path that writes "SnapshotN.jpeg" works fine in the same
-    # filesystem, so it's the override-filename branch in snapshot_task
-    # that's broken, not FileX. Until that's fixed in firmware, mark
-    # the absence as a SKIP (known limitation) instead of a FAIL so the
-    # suite communicates "not regressing" rather than "broken".
     new_name = m.group(1) if m else ""
     found = False
     if new_name:
-        for _ in range(20):
+        for _ in range(15):
             time.sleep(1.0)
-            poll_out = sh.send_get("sd ls", "sd ls ok", 4.0)
+            poll_out = sh.send_get("sd ls", "sd ls ok", 6.0)
             if new_name in poll_out:
                 found = True
                 break
-    if found:
-        suite.add(TestResult(
-            "T07.4",
+    must_be(suite, "T07.4",
             "New .rdy file appears on SD after `photo savesd`",
-            "pass", extra=new_name))
-    else:
-        skip(suite, "T07.4",
-             "New .rdy file appears on SD after `photo savesd`",
-             "named-file branch of snapshot_task drops the write — "
-             "auto SnapshotN.jpeg path still works (pre-existing firmware bug)")
+            found, reason="not seen in sd ls within 15s" if not found else "",
+            extra=new_name if found else "")
 
 
 def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
@@ -819,8 +804,19 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path, art_dir: Path):
                     return -3, 0.0, []
                 c, nn_ms, boxes = run_inference(sh)[:3]
                 if c < 0:
-                    # NN inference timed out — image is a kit-killer.
-                    # Pulse NRST and retry once.
+                    # `frame run` didn't return inside the host's 4-s
+                    # window. This happens when a model+image
+                    # combination triggers a hardfault deep in the ATON
+                    # runtime: the kit's internal IWDG resets the MCU
+                    # within ~1 s and the App boots clean (verified by
+                    # uptime poll). For the test we still time-out on
+                    # this attempt but the kit recovers on its own —
+                    # in production live-mode it's a ~5-s glitch, not
+                    # a stuck device. Pulse NRST via STLink to skip
+                    # the reboot wait, then retry once. If the same
+                    # frame crashes again it's a deterministic kit-
+                    # killer and we SKIP it (rc=-5) so subsequent
+                    # frames still run.
                     if attempt == 2 or not recover_kit(sh):
                         return -5, 0.0, []
                     time.sleep(0.5)
