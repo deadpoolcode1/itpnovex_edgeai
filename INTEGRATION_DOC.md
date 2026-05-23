@@ -188,7 +188,46 @@ Emitted on:
 - the CDC shell as `+SDVRNTF: { … }\r\n`
 - (when M3 wires up) over the modem channel via `SDVR+NTFA=…`
 
-### 3.4 Self-update protocol (M1 / A4)
+### 3.4 Safe-boot / bootloop guard
+
+The FSBL increments a counter in `TAMP->BKP1R` on every boot, before clock
+/ xSPI / App-jump — so even App-init crashes (bad model, ATON HW init,
+camera bring-up) get counted. The App's `shell_task` reads the counter
+as soon as it's up; once it crosses **3** consecutive crash reboots, the
+App enters **safe mode**:
+
+- NN auto-start is suppressed (the most common crash vector — bad model
+  weights — can't run again).
+- Operator's CDC shell stays alive; `update app` / `update model` work
+  normally, so the kit recovers without SWD.
+
+After ~30 s of healthy uptime, the App clears `BKP1R` and the next reboot
+starts the count over.
+
+| BKP register | Purpose | Set by | Cleared by |
+|---|---|---|---|
+| `BKP0R` | Recovery magic `0xDEADBEEF` — halts FSBL pre-xSPI for SWD reflash | App `recovery` cmd | FSBL on next boot |
+| `BKP1R` | Bootloop counter (0–255) | FSBL increments every boot | App after 30 s uptime, or `safeboot clear` |
+
+**Shell command (App side):**
+
+```
+> safeboot status         # current counter, threshold, safe-mode flag
+boot_count = 1/3, safe_mode = no
+safeboot status ok
+
+> safeboot clear          # zero the counter (use after fixing root cause)
+> safeboot test           # force counter to 3 and reboot — verifies safe
+                          # mode engages correctly (DEV USE ONLY)
+```
+
+This closes the only remaining "needs JTAG" recovery scenario: a bad App
+or model push that today would require boot-switch + SWD reflash now
+self-recovers via USB after 3 boot attempts. TAMP survives reset but not
+power-off, which is the right semantic — a user-initiated power cycle is
+a fresh start.
+
+### 3.5 Self-update protocol (M1 / A4)
 
 See `M1_M2_WORKFLOW.md` for the diagram. Wire format:
 

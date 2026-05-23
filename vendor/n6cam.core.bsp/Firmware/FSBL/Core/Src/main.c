@@ -125,6 +125,21 @@ int main(void)
     }
   }
 
+  /* Safe-boot bootloop counter. Increment in FSBL — before xSPI / Clock /
+   * App jump — so crashes during App init still bump the count. The App's
+   * shell_task reads TAMP->BKP1R after it comes up and enters safe mode
+   * once it crosses threshold; clears the counter after ~30 s of uptime.
+   *
+   * TAMP backup registers survive reset but not power-off, which is
+   * exactly what we want: a user-initiated power cycle is "fresh start". */
+  {
+    uint32_t bn = TAMP->BKP1R;
+    if (bn < 0xFFU)
+    {
+      TAMP->BKP1R = bn + 1U;
+    }
+  }
+
   /* Configure system clock */
   Clock_Config();
 

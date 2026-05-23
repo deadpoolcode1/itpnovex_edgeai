@@ -151,6 +151,12 @@ cmd_bsp_clone() {
         info "BSP already cloned at ${BSP_DIR}"
         return 0
     fi
+    # Vendored (checked-in) BSP: detect by presence of the FSBL source tree.
+    # Skip clone — the BSP is part of this repo.
+    if [ -f "${BSP_DIR}/Firmware/FSBL/Core/Src/main.c" ]; then
+        info "BSP vendored at ${BSP_DIR} (no clone needed)"
+        return 0
+    fi
     step "Cloning SIANA N6Cam BSP (~218 MB)"
     mkdir -p "$(dirname "${BSP_DIR}")"
     git clone --depth 1 "${BSP_REPO_URL}" "${BSP_DIR}"
