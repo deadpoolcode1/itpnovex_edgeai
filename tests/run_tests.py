@@ -691,12 +691,15 @@ def group_sd(sh: KitShell, suite: Suite):
 
 def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
     suite.group("GROUP 8: Frame injection mechanics")
-    _safe_detect_start(sh)
-    # query empty
+    # Keep detection STOPPED for T08.1 — `frame clear` reverts to live camera,
+    # and live-camera NN can hit a T11.6-family ATON-problematic frame and
+    # reset the kit. We don't actually need NN running to test that frame_clear
+    # returns its ack. Detection is re-enabled after the inject.
+    sh.send_get("detect stop", "detect stop ok", 3.0)
     out = sh.send_get("frame clear", "frame clear ok", 3.0)
     must_be(suite, "T08.1", "`frame clear` reverts to live camera",
             "frame clear ok" in out)
-    # synth frame
+    # synth frame — inject before re-enabling detect so NN sees the gray frame
     try:
         from PIL import Image
         img = Image.new("RGB", (FRAME_W, FRAME_H), color=(128, 128, 128))
@@ -704,6 +707,7 @@ def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
         must_be(suite, "T08.2", "Upload a synthetic 192x192 grey frame", ok)
     except Exception as e:
         skip(suite, "T08.2", "Synthetic frame inject", f"Pillow not available: {e}")
+    sh.send_get("detect start", "detect start ok", 2.0)  # safe now — gray frame is loaded
     out = sh.send_get("frame query", "frame query ok", 3.0)
     m = RE_FRAME_QUERY.search(out)
     must_be(suite, "T08.3", "`frame query` reports loaded",

@@ -835,6 +835,12 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     /* Cache flush so the NPU sees the bytes we just wrote (NN runs from RAM). */
     SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
     _frame_loaded = true;
+    /* Register the uploaded buffer as the NN test-frame override IMMEDIATELY.
+     * Without this, a subsequent 'detect start' wakes NN_task with no override
+     * set, so it processes a live camera frame on its first cycle. If that
+     * live frame happens to be ATON-problematic (T11.6-family), the kit
+     * hardfaults — making frame-injection tests inadvertently dangerous. */
+    nn_task_set_test_frame(_frame_test_buf);
     CMD_PRINTF(stream, "frame upload: ok (%lu bytes, CRC 0x%08lx)%s",
                (unsigned long)size, (unsigned long)got_crc, lwshell_eol());
     _cmd_ack(stream, argv, argc);

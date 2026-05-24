@@ -71,6 +71,33 @@ def kit_uptime_ms(tty: str) -> int | None:
         return None
 
 
+def wait_kit_stable(tty_path: str, timeout: float = 120.0) -> bool:
+    """Wait until the kit's CDC has been continuously present for several
+    seconds AND responds to a basic shell query. Returns False if timeout.
+
+    When a previous iteration crashed the kit, the bootloop cycles the
+    CDC every ~15-20 s and the by-id symlink may flicker. Running the
+    next iteration during this window all but guarantees another empty
+    result. Holding off until the kit is verifiably back avoids cascading
+    failures. Uses the by-id path (not the realpath /dev/ttyACMx) so we
+    survive ttyACM1↔ttyACM2 renumbering during the bootloop."""
+    by_id = "/dev/serial/by-id/usb-STMicroelectronics_N6Cam_DEADBEEF-if02"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(by_id):
+            # Hold for a few seconds — if the kit's mid-reboot the symlink
+            # will vanish again within this window.
+            time.sleep(4.0)
+            if not os.path.exists(by_id):
+                continue
+            # Confirm the shell is actually answering (not just CDC enumerated).
+            up = kit_uptime_ms(os.path.realpath(by_id))
+            if up is not None and up > 2000:  # at least 2 s post-boot
+                return True
+        time.sleep(0.5)
+    return False
+
+
 def run_one_iter(out_dir: Path, iter_id: int) -> tuple[dict, list[float]]:
     """Run the regression suite once. Returns (summary-dict, [nn-times])."""
     html = out_dir / f"soak-{iter_id:05d}.html"
@@ -137,6 +164,21 @@ def main() -> int:
                 if deadline and time.time() >= deadline:
                     break
                 iter_id += 1
+
+                # Wait for the kit to be stably enumerated before running the
+                # next iteration. If the previous iter crashed the kit, the
+                # CDC will be flapping; running tests in that window guarantees
+                # 0/0 results and corrupts the soak data.
+                if not wait_kit_stable(tty, timeout=120.0):
+                    print(f"  iter {iter_id:4d}: SKIPPED — kit didn't come back within 120 s")
+                    w.writerow([iter_id, int(time.time() - t0), 0, 1,
+                                0, 0, 0, 0, 0, "0.0", "0.0"])
+                    f.flush()
+                    unexpected_reboots += 1
+                    continue
+                # Re-resolve the realpath in case the kernel re-assigned
+                # ttyACMx after the reboot cycle.
+                tty = os.path.realpath("/dev/serial/by-id/usb-STMicroelectronics_N6Cam_DEADBEEF-if02")
 
                 pre_uptime = kit_uptime_ms(tty)
                 rebooted = (pre_uptime is not None
