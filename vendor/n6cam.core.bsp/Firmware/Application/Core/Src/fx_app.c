@@ -36,6 +36,15 @@
 #include "fx_stm32_config.h"
 #include "fx_stm32_sd_driver.h"
 #include "n6cam_sdio.h"
+#include "registry.h"
+#include "slib32_registry.h"
+
+/* Safe-mode SD rescue threshold — must match BOOT_GUARD_THRESHOLD in
+ * shell_task.c. When boot_count reaches this value, the kit is in a
+ * confirmed bootloop; if FX init keeps failing, we attempt a one-shot
+ * SD reformat to escape the loop (typical cause: corrupted FAT
+ * structures from a power-cut during a previous test session). */
+#define FX_SAFE_RESCUE_THRESHOLD    3U
 
 /*-->> Private Tunables <<----------------------------------------------------*/
 
@@ -422,7 +431,64 @@ static void _fx_task_run(uint32_t input)
     if (status != FX_SUCCESS)
     {
       LERROR(TRACE_FX, "FS init failed!");
-      goto DISCONNECT;
+
+      /* Safe-mode SD rescue: if the kit is in a confirmed bootloop
+       * (boot_count >= FX_SAFE_RESCUE_THRESHOLD) and FS init keeps
+       * failing, the SD's FAT structures are probably corrupted.
+       * Attempt a one-shot reformat to escape the loop.
+       *
+       * DESTRUCTIVE — only runs when the boot counter proves we're
+       * stuck. On a healthy first boot with a bad SD this won't trigger
+       * until after a few crash cycles, at which point losing SD
+       * contents is the lesser evil vs. an unrecoverable kit. */
+      bool try_rescue = false;
+      t_registry_data *reg = registry_acquire();
+      if (reg != NULL)
+      {
+        try_rescue = (reg->boot_count >= FX_SAFE_RESCUE_THRESHOLD);
+        registry_release();
+      }
+      if (try_rescue)
+      {
+        LERROR(TRACE_FX,
+               "Safe-mode rescue: reformatting SD (boot_count >= %u)",
+               (unsigned)FX_SAFE_RESCUE_THRESHOLD);
+        status = fx_media_format(
+          &_fx_task.sdio, fx_stm32_sd_driver, NULL,
+          _fx_task.media, _fx_task.size,
+          "N6CAM",  /* volume name */
+          1,        /* FATs */
+          32,       /* dir entries */
+          0,        /* hidden sectors */
+          0,        /* total sectors (0 = let driver report) */
+          512,      /* bytes per sector */
+          8,        /* sectors per cluster */
+          1,        /* heads */
+          1         /* sectors per track */
+        );
+        if (status == FX_SUCCESS)
+        {
+          LINFO(TRACE_FX, "Reformat OK — reopening filesystem");
+          status = fx_media_open(
+            &_fx_task.sdio, FX_SD_VOLUME_NAME,
+            fx_stm32_sd_driver, NULL,
+            _fx_task.media, _fx_task.size
+          );
+        }
+        if (status == FX_SUCCESS)
+        {
+          LINFO(TRACE_FX, "SD rescued");
+        }
+        else
+        {
+          LERROR(TRACE_FX, "SD rescue failed (%d)", (int)status);
+        }
+      }
+
+      if (status != FX_SUCCESS)
+      {
+        goto DISCONNECT;
+      }
     }
 
     /* Connected and working! */

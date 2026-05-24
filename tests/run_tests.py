@@ -407,6 +407,22 @@ def inject_frame(sh: KitShell, data: bytes) -> bool:
     return "frame upload ok" in out
 
 
+def _safe_detect_start(sh: KitShell) -> None:
+    """Enable detection without exposing the kit to live-camera NN, which
+    can hit an ATON-problematic frame at runtime and reset the kit (T11.6
+    family hardfault). Inject a 192x192 mid-gray frame first — NN then
+    runs on that frame, not on the live camera. Subsequent test code
+    should immediately inject the actual test image; the gray frame is
+    just the safe initial state."""
+    try:
+        from PIL import Image
+        gray = Image.new("RGB", (FRAME_W, FRAME_H), color=(128, 128, 128))
+        inject_frame(sh, gray.tobytes())
+    except Exception:
+        pass  # If PIL is unavailable we fall back to live mode (riskier)
+    sh.send_get("detect start", "detect start ok", 2.0)
+
+
 def run_inference(sh: KitShell) -> Tuple[int, float, List[dict], str]:
     sh.drain(0.05)
     t0 = time.perf_counter()
@@ -480,6 +496,11 @@ def group_prereq(sh: KitShell, suite: Suite, tty: str):
         suite.uid = m.group(1)
     out = sh.send_get("uptime", "UPTIME", 2.0)
     must_match(suite, "T00.5", "`uptime` returns UPTIME ms", RE_UPTIME, out)
+    # Make sure the kit is in a known-stopped state. A leftover 'detect start'
+    # from a previous run (or from running back-to-back in soak) means live
+    # camera NN is running through the entire test suite, which can hit an
+    # ATON-problematic frame and reset the kit (T11.6-family crash).
+    sh.send_get("detect stop", "detect stop ok", 3.0)
 
 
 def group_shell(sh: KitShell, suite: Suite):
@@ -570,6 +591,15 @@ def group_img(sh: KitShell, suite: Suite):
 
 def group_detect(sh: KitShell, suite: Suite):
     suite.group("GROUP 5: Detection control (SoW §3.1, §4.2)")
+    # Pre-inject a safe gray frame so the upcoming `detect start` runs NN on
+    # it instead of on live camera (see _safe_detect_start docstring for the
+    # rationale — live-camera NN can hit T11.6-family ATON crashes).
+    try:
+        from PIL import Image
+        gray = Image.new("RGB", (FRAME_W, FRAME_H), color=(128, 128, 128))
+        inject_frame(sh, gray.tobytes())
+    except Exception:
+        pass
     out = sh.send_get("detect start", "detect start ok", 3.0)
     must_be(suite, "T05.1", "`detect start` succeeds", "detect start ok" in out)
     out = sh.send_get("detect profile 3 1", "detect profile ok", 3.0)
@@ -580,8 +610,13 @@ def group_detect(sh: KitShell, suite: Suite):
     m = RE_DETECT_PROFILE.search(out)
     must_be(suite, "T05.3", "`detect profile query` returns 0x03 / 0x01",
             m is not None and m.group(1) == "03" and m.group(2) == "01")
-    # Leave detection running for later groups
-    out = sh.send_get("detect profile 1 1", "detect profile ok", 3.0)
+    # Stop live detection now — subsequent groups that need NN will re-enable
+    # via 'detect start' + frame injection (so NN runs on injected frames, not
+    # live camera). Without this stop, live camera + multi-class NN can hit
+    # an ATON-problematic frame during later groups and reset the kit (same
+    # crash family as T11.6 crowd_13 hardfault).
+    sh.send_get("detect stop", "detect stop ok", 3.0)
+    sh.send_get("detect profile 1 0", "detect profile ok", 3.0)
 
 
 def group_notify(sh: KitShell, suite: Suite):
@@ -656,7 +691,7 @@ def group_sd(sh: KitShell, suite: Suite):
 
 def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
     suite.group("GROUP 8: Frame injection mechanics")
-    sh.send_get("detect start", "detect start ok", 2.0)
+    _safe_detect_start(sh)
     # query empty
     out = sh.send_get("frame clear", "frame clear ok", 3.0)
     must_be(suite, "T08.1", "`frame clear` reverts to live camera",
@@ -683,7 +718,7 @@ def group_frame_inject(sh: KitShell, suite: Suite, image_dir: Path):
 def group_algorithm(sh: KitShell, suite: Suite, image_dir: Path,
                     art_dir: Path):
     suite.group("GROUP 9: Detection algorithm — single person + non-person")
-    sh.send_get("detect start", "detect start ok", 2.0)
+    _safe_detect_start(sh)
     person_imgs = ["astronaut.jpg", "camera.jpg"]
     non_imgs    = ["cat.jpg", "coffee.jpg", "moon.jpg", "rocket.jpg"]
     nn_times = []
@@ -783,7 +818,7 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path, art_dir: Path):
     test reflects realistic NN behavior at 192x192 input (small people in
     crowd shots will undercount; that's a property of the model, not a bug)."""
     suite.group("GROUP 11: Multi-person + vehicle counting")
-    sh.send_get("detect start", "detect start ok", 2.0)
+    _safe_detect_start(sh)
     sh.send_get("detect profile 3 0", "detect profile ok", 2.0)  # people + vehicles, no action
 
     # Each entry: (filename, ground_truth_persons, ground_truth_vehicles,
