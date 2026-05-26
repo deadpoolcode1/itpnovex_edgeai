@@ -87,3 +87,8 @@ results/soak-*/*_artifacts/
 
 # LibreOffice lock files
 .~lock*#
+
+# Local-only model backups (large binaries, not for the repo)
+vendor/n6cam.core.bsp/Firmware/Model/_backup_*/
+# Local Claude Code settings
+.claude/
