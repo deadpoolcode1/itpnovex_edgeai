@@ -107,7 +107,9 @@ extern int8_t sai_transform_od(const t_nn_box *detect, t_sai_object * dst);
 /* API: Transform a single Detection instance. */
 int8_t sai_transform(const t_nn_box *detect, t_sai_object * dst)
 {
-  #if POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF
+  #if (POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF) || (POSTPROCESS_TYPE == POSTPROCESS_OD_SSD_UF)
+    /* Both YOLOv8 and SSD PPs emit normalized centroid boxes in t_nn_box,
+     * so the same object transform applies. */
     return sai_transform_od(detect, dst);
   #else
     #error "Transform not implemented for this post-processing type"

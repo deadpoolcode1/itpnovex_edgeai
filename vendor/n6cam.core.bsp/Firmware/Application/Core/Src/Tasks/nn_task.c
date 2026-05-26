@@ -274,24 +274,20 @@ void nn_task_simulate_detection(uint32_t boxes)
 }
 
 /* COCO-class -> SoW class mapping (proposal W5/W6).
- *   bit0 = person; bit1 = car|motorcycle|bus|truck.
- *   Bicycle (class 1) is intentionally ignored — the SoW only lists
- *   people + vehicles. Other COCO classes also drop. */
+ *   bit0 = person (COCO 0); bit1 = vehicles.
+ * Vehicle COCO ids: bicycle 1, car 2, motorcycle 3, bus 5, truck 7, plus
+ * the airplane 4 / train 6 / boat 8 bucket (the model occasionally labels
+ * a car/truck as one of these; "something on wheels/wings/water" still
+ * counts as a vehicle for the W6 signal). */
 static bool _class_passes_mask(int32_t class_index, uint8_t det_msk)
 {
-  /* People class */
+  /* People class (COCO person = 0) */
   if (class_index == 0)      return (det_msk & 0x01U) != 0U;
-  /* Vehicle classes (COCO): car=2, motorcycle=3, bus=5, truck=7.
-   * Also accept airplane(4), train(6), boat(8): at the 192x192 input
-   * size our quantized model frequently misclassifies vehicles into
-   * these adjacent COCO categories. From the W6 SoW point of view
-   * "something on wheels/wings in the scene" is a vehicle detection,
-   * so treating the whole transport-vehicle band as one bucket gives a
-   * usable signal until we can retrain at higher resolution. */
-  if (class_index == 2 || class_index == 3 ||
-      class_index == 4 || class_index == 5 ||
-      class_index == 6 || class_index == 7 ||
-      class_index == 8)
+  /* Vehicle classes */
+  if (class_index == 2 || class_index == 1 ||   /* car, bicycle        */
+      class_index == 3 || class_index == 5 ||   /* motorcycle, bus     */
+      class_index == 7 || class_index == 4 ||   /* truck, airplane     */
+      class_index == 6 || class_index == 8)     /* train, boat         */
                               return (det_msk & 0x02U) != 0U;
   return false;
 }
@@ -570,41 +566,28 @@ static void _nn_frame_process(void)
   /* Release FLASH */
   flash_acquire(false);
 
-  /* Ultralytics-exported YOLOv8 outputs RAW LOGITS (pre-sigmoid). The
-   * vendor's post-proc assumes already-sigmoided class probabilities.
-   * Apply sigmoid in-place to the class-channel portion of the output
-   * (channels 4..3+NB_CLASSES) before the post-proc reads it. Layout is
-   * CHW = [1, 4+NB_CLASSES, NUM_BOXES], stride NUM_BOXES per channel.
-   *
-   * Only applies when NB_CLASSES > 1 — for the vendor 1-class model the
-   * sigmoid is already baked in (we'd be double-sigmoiding otherwise). */
-#if (AI_OD_YOLOV8_PP_NB_CLASSES > 1)
+  /* The active model (yolov8n, conv-only INT8 with the head kept in
+   * float) outputs FULLY-DECODED detections: class channels are already
+   * sigmoid probabilities and box channels are pixel cx/cy/w/h in
+   * [0..input_size]. So we need NEITHER the sigmoid nor the stedgeai
+   * dequant-bias correction the relu30 model required (float32 output
+   * here carries the dequant). The only fix-up is scaling the 4 box
+   * channels to the normalized [0,1] range the PP/display/SoW box report
+   * expect. Layout is CHW = [4+NB_CLASSES, NUM_BOXES], stride NUM_BOXES. */
+#if (POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF)
   if (_nn_out[0] != NULL && _nn_out_len[0] >= (4U + AI_OD_YOLOV8_PP_NB_CLASSES) * AI_OD_YOLOV8_PP_TOTAL_BOXES * sizeof(float32_t))
   {
     SCB_InvalidateDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
-    float32_t *out = (float32_t*)_nn_out[0];
-    const uint32_t N    = (4U + AI_OD_YOLOV8_PP_NB_CLASSES) * AI_OD_YOLOV8_PP_TOTAL_BOXES;
-    const float32_t BIAS = AI_OD_YOLOV8_DEQUANT_BIAS;
-
-    /* Stedgeai 4.0 emits `float = int8 * scale` at the output
-     * DequantizeLinear epoch instead of `float = (int8 - zero_point)
-     * * scale`. For the multi-class relu30 model that means every
-     * channel of the 84x756 output tensor lands `-zero_point * scale`
-     * (= 1.5495) below where it should. The post-proc then sees
-     * negative bbox cx/cy/w/h and below-threshold class probs.
-     *
-     * Re-apply the missing bias here so the data the post-proc reads
-     * matches what host-side TFLite produces on the same input:
-     * bbox channels become normalized [0,1] cx/cy/w/h (with width or
-     * height occasionally > 1 for huge boxes), class channels become
-     * post-sigmoid probabilities. The 1-class vendor model has its
-     * dequant baked in correctly so the #if guard keeps this off the
-     * default path. */
-    for (uint32_t i = 0U; i < N; i++)
+    float32_t      *out = (float32_t*)_nn_out[0];
+    const float32_t inv = 1.0f / (float32_t)CAMERA_ANCILLARY_WIDTH;   /* 256 */
+    const uint32_t  NB  = AI_OD_YOLOV8_PP_TOTAL_BOXES;
+    for (uint32_t ch = 0U; ch < 4U; ch++)        /* x_center, y_center, w, h */
     {
-      out[i] += BIAS;
+      for (uint32_t b = 0U; b < NB; b++)
+      {
+        out[ch * NB + b] *= inv;
+      }
     }
-
     SCB_CleanDCache_by_Addr(_nn_out[0], _nn_out_len[0]);
   }
 #endif
@@ -655,13 +638,17 @@ static void _nn_frame_process(void)
  */
 static void _pp_publish_objects(t_nn_boxes *out)
 {
-  /* Convert boxes */
+  /* Convert boxes. The SSD PP can return more detections than our buffer
+   * holds (up to max_boxes_limit * nb_classes); clamp to NN_BOXES_MAX_NUM
+   * so we never overflow _pp_box_buff (and the shell's stack copy of it). */
   memset(_pp_box_buff, 0x00U, sizeof(_pp_box_buff));
-  for (int32_t idx = 0; idx < out->nb_detect; idx++)
+  int32_t n = out->nb_detect;
+  if (n > NN_BOXES_MAX_NUM) { n = NN_BOXES_MAX_NUM; }
+  for (int32_t idx = 0; idx < n; idx++)
   {
     _pp_box_buff[idx] = (t_nn_box)(out->pOutBuff[idx]);
   }
-  _pp_box_count = out->nb_detect;
+  _pp_box_count = (size_t)n;
 
 }
 

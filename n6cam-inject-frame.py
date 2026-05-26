@@ -32,8 +32,9 @@ import sys
 import time
 import zlib
 
-FRAME_W = 192
-FRAME_H = 192
+# SSD-MobileNetV2/VOC takes 300x300x3 (the NN ancillary buffer size).
+FRAME_W = 300
+FRAME_H = 300
 FRAME_BYTES = FRAME_W * FRAME_H * 3
 
 

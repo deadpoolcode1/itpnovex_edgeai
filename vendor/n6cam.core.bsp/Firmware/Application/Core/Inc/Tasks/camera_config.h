@@ -108,10 +108,10 @@ extern "C" {
   #define CAMERA_ANCILLARY_HEIGHT       2000U
   #define CAMERA_ANCILLARY_BUFFER_NUM   1U
 #else
-  /* User defined: NPU input size */
+  /* User defined: NPU input size. yolov8n (full-COCO) takes 256x256x3. */
   #define CAMERA_ANCILLARY_RBSWAP       1
-  #define CAMERA_ANCILLARY_WIDTH        192U
-  #define CAMERA_ANCILLARY_HEIGHT       192U
+  #define CAMERA_ANCILLARY_WIDTH        256U
+  #define CAMERA_ANCILLARY_HEIGHT       256U
   #define CAMERA_ANCILLARY_BUFFER_NUM   2U
 #endif /* ISP_MW_TUNING_TOOL_SUPPORT */
 #define CAMERA_ANCILLARY_BUFFER_SIZE    (CAMERA_ANCILLARY_WIDTH * CAMERA_ANCILLARY_HEIGHT * CAMERA_ANCILLARY_BPP)

@@ -54,8 +54,11 @@ extern "C" {
 * @{
 *//*--------------------------------------------------------------------------*/
 
-/* NN detection boxes */
-#define NN_BOXES_MAX_NUM        AI_OD_YOLOV8_PP_MAX_BOXES_LIMIT
+/* NN detection boxes. Kept small (published set is clamped to this in
+ * _pp_publish_objects) because the shell `frame run` handler stacks a
+ * t_nn_box buf[NN_BOXES_MAX_NUM] on its 2 KB task stack. Plenty for a
+ * people/vehicle counter — the count saturates here per frame. */
+#define NN_BOXES_MAX_NUM        (20)
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_Definitions -->
@@ -74,7 +77,15 @@ extern "C" {
 /** NN detection box */
 typedef od_pp_outBuffer_t             t_nn_box;
 typedef od_pp_out_t                   t_nn_boxes;
+/* PP static-param type must match the selected POSTPROCESS_TYPE so the
+ * single _pp_params instance in nn_task.c is sized/laid-out correctly. */
+#if POSTPROCESS_TYPE == POSTPROCESS_OD_SSD_UF
+typedef od_ssd_pp_static_param_t      t_nn_params;
+#elif POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF
 typedef od_yolov8_pp_static_param_t   t_nn_params;
+#else
+#error "t_nn_params: unsupported POSTPROCESS_TYPE"
+#endif
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_Types -->
 *//*-----------------------------------------------------------------------*//**

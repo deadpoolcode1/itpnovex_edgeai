@@ -59,6 +59,26 @@ extern "C" {
 
 #define POSTPROCESS_TYPE                          POSTPROCESS_OD_YOLO_V8_UF
 
+/* ACTIVE model: custom yolov8n fine-tuned on full COCO @256, conv-only
+ * INT8 (head kept float so box-decode + class sigmoid survive), uint8
+ * HWC in / float32 out. Output (84,1344) CHW = 4 box (pixels, normalized
+ * to [0,1] in nn_task) + 80 COCO class probabilities. YOLOv8 is the
+ * architecture proven ATON-safe on this kit (relu30). See below for cfg.
+ *
+ * The SSD macros are retained but inactive (the od_ssd PP module is
+ * POSTPROCESS_TYPE-guarded and compiles out while YOLOv8 is selected). */
+#define AI_OD_SSD_PP_NB_CLASSES                   (21)
+#define AI_OD_SSD_PP_TOTAL_DETECTIONS             (3000)
+#define AI_OD_SSD_PP_XY_VARIANCE                  (0.1f)
+#define AI_OD_SSD_PP_WH_VARIANCE                  (0.2f)
+#define AI_OD_SSD_PP_MAX_BOXES_LIMIT              (20)
+#define AI_OD_SSD_PP_CONF_THRESHOLD               (0.45f)
+#define AI_OD_SSD_PP_IOU_THRESHOLD                (0.45f)
+
+/* The legacy YOLOv8 macros below are retained but inactive: the YOLOv8
+ * PP module and the nn_task output fix-up are POSTPROCESS_TYPE-guarded,
+ * so they compile out while SSD is selected. */
+
 /* Postprocessing YOLOv8 object detection configuration */
 
 /**  Number of classes in the detection model. */
@@ -67,7 +87,7 @@ extern "C" {
 /**  Total number of boxes predicted by the model.
  * These are evaluated by the post-processing algorithm.
  */
-#define AI_OD_YOLOV8_PP_TOTAL_BOXES              (756)
+#define AI_OD_YOLOV8_PP_TOTAL_BOXES              (1344)   /* 256 input: 32^2+16^2+8^2 */
 
 /** Maximum number of boxes per class to be considered after post-processing. */
 #define AI_OD_YOLOV8_PP_MAX_BOXES_LIMIT          (20)
@@ -150,13 +170,17 @@ typedef struct
  *    };
  *    ...
  */
+/* Indexed by the yolov8 COCO class id. Only the people + vehicle classes
+ * the SoW cares about are named; unnamed entries are skipped by
+ * sai_utils_get_info() (and dropped by nn_task's class filter anyway). */
 static const t_sai_class SAI_CLASSES[SAI_CLASS_NB] = {
   [0]  = { "person"     , 0x00FF00FFu },
+  [1]  = { "bicycle"    , 0x00FFFFFFu },
   [2]  = { "car"        , 0x0000FFFFu },
   [3]  = { "motorcycle" , 0x00FFFFFFu },
-  [4]  = { "airplane"   , 0x00C0C0FFu },  /* sometimes a misclassified car */
+  [4]  = { "airplane"   , 0x00C0C0FFu },  /* sometimes a misclassified vehicle */
   [5]  = { "bus"        , 0xFFFF00FFu },
-  [6]  = { "train"      , 0x80C0FFFFu },  /* sometimes a misclassified car */
+  [6]  = { "train"      , 0x80C0FFFFu },  /* sometimes a misclassified vehicle */
   [7]  = { "truck"      , 0xFF7F00FFu },
   [8]  = { "boat"       , 0x40A0FFFFu },
 };

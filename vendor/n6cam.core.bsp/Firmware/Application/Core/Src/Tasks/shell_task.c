@@ -224,7 +224,7 @@ static int32_t  _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Test-frame protocol: 'FRMI' magic + size_le(4) + crc32_le(4) + payload */
 #define FRAME_MAGIC                 "FRMI"
 #define FRAME_HDR_SIZE              12U
-#define FRAME_EXPECTED_SIZE         (192U * 192U * 3U)   /* = CAMERA_ANCILLARY_BUFFER_SIZE */
+#define FRAME_EXPECTED_SIZE         (CAMERA_ANCILLARY_BUFFER_SIZE)   /* NN input size (300*300*3 for SSD) */
 #define FRAME_RX_TIMEOUT_MS         15000U
 
 /* Test-frame buffer for NN injection. Same layout as the camera ancillary
@@ -464,21 +464,26 @@ void _shell_task_init(void)
       boot_n = reg->boot_count;
       safe_mode = (boot_n >= BOOT_GUARD_THRESHOLD);
 
+      /* SoW §3.1: detection must be explicitly started. We deliberately do
+       * NOT auto-restore a persisted "started" state on cold boot: if a model
+       * wedges the NPU on live frames, auto-starting hard-hangs the app before
+       * the shell is reachable, leaving no recovery but SWD. Always boot with
+       * NN off; the operator (or a script) issues `detect start`. The det/
+       * action masks below are still restored so the profile persists. */
       bool persisted_detect = (reg->detect_enable != 0U);
-      nn_task_detect_set(safe_mode ? false : persisted_detect);
+      (void)persisted_detect;
+      nn_task_detect_set(false);
       if (safe_mode)
       {
         LERROR(TRACE_SHELL,
           "*** SAFE BOOT *** %u consecutive crash-reboots detected. "
-          "NN auto-start suppressed; issue 'detect start' to resume "
-          "or 'safeboot clear' to exit safe mode.",
+          "NN auto-start suppressed.",
           (unsigned)boot_n);
       }
       else
       {
-        LINFO(TRACE_SHELL, "Boot %u/%u — auto-detect=%d",
-              (unsigned)boot_n, (unsigned)BOOT_GUARD_THRESHOLD,
-              (int)persisted_detect);
+        LINFO(TRACE_SHELL, "Boot %u/%u — NN off (issue 'detect start' to run)",
+              (unsigned)boot_n, (unsigned)BOOT_GUARD_THRESHOLD);
       }
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
@@ -1542,6 +1547,11 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream,
   }
 
   CMD_PRINTF(stream, "Writing %lu bytes...%s", (unsigned long)size, lwshell_eol());
+  /* Single BSP_XSPI_NOR_Write for the whole payload — proven for the ~3MB
+   * models (relu30, yolov8n). NOTE: chunking this into 64KB calls was tried
+   * for the abandoned ~11MB SSD model and BROKE the ~3MB case (the write
+   * stalled without completing, leaving MMP disabled). For models larger
+   * than the single-write can handle, use the SWD external-loader path. */
   status = BSP_XSPI_NOR_Write(0, (uint8_t*)src, xspi_offset, (uint32_t)size);
   if (status != BSP_OK)
   {

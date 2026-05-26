@@ -674,13 +674,15 @@ static int8_t _display_detection(t_sai_object * det, t_draw * dst, t_draw_font *
   }
   uint32_t color = COLOR_WITH_ALPHA(class->color, DISPLAY_ALPHA_VALUE);
 
-#if POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF
+#if (POSTPROCESS_TYPE == POSTPROCESS_OD_YOLO_V8_UF) || (POSTPROCESS_TYPE == POSTPROCESS_OD_SSD_UF)
 
-  /* Draw bounding box */
+  /* Draw bounding box. det->{x,y,width,height} are already in display
+   * coordinates (sai_transform_od maps the PP's normalized centroid box),
+   * so this draw path is detector-agnostic for OD models. */
   draw_rect_hw( dst, det->x,  det->y, det->width,  det->height, color);
   draw_printf_hw(dst, font, det->x, det->y, det->width, "C: %s - %5.1f %%", class->name, det->score *100.0f);
 
-# else 
+# else
   #error " Display not implemented for this post-processing type"
 #endif /* POSTPROCESS_TYPE */
 
