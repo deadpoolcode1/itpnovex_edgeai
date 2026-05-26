@@ -1531,7 +1531,7 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream,
   if (status != BSP_OK)
   {
     CMD_PRINTF(stream, "ERROR: DisableMMP=%ld%s", (long)status, lwshell_eol());
-    return status;
+    goto recover;
   }
 
   CMD_PRINTF(stream, "Erasing %lux64KB blocks at xSPI offset 0x%08lx...%s",
@@ -1542,27 +1542,69 @@ static int32_t _fwupd_flash_and_reset(const t_stream *stream,
     if (status != BSP_OK)
     {
       CMD_PRINTF(stream, "ERROR: erase block %lu failed (%ld)%s", (unsigned long)b, (long)status, lwshell_eol());
-      return status;
+      goto recover;
     }
+    tx_thread_sleep(1);   /* yield: feed watchdog_task between erases */
   }
 
-  CMD_PRINTF(stream, "Writing %lu bytes...%s", (unsigned long)size, lwshell_eol());
-  /* Single BSP_XSPI_NOR_Write for the whole payload — proven for the ~3MB
-   * models (relu30, yolov8n). NOTE: chunking this into 64KB calls was tried
-   * for the abandoned ~11MB SSD model and BROKE the ~3MB case (the write
-   * stalled without completing, leaving MMP disabled). For models larger
-   * than the single-write can handle, use the SWD external-loader path. */
-  status = BSP_XSPI_NOR_Write(0, (uint8_t*)src, xspi_offset, (uint32_t)size);
-  if (status != BSP_OK)
+  /* Write page-by-page in 64KB chunks, YIELDING between each. The vendor
+   * watchdog_task refreshes the IWDG from its own thread (it sleeps on its
+   * window), so a multi-second non-yielding blocking write starves it and
+   * the write never completes. tx_thread_sleep(1) lets the watchdog_task +
+   * CDC run between chunks. Progress is printed so any failure pinpoints an
+   * offset. (Only the NN task reads xSPI2 NOR and it is suspended, so the
+   * tasks that run during the yield — camera/jpeg/display/CDC — touch only
+   * PSRAM/internal RAM and are safe with NOR MMP disabled.) */
+  /* Round the write up to whole 64KB blocks and pad the tail with 0xFF (the
+   * erased-flash value). A SHORT final partial page after many full pages
+   * fails the MX66 page-program on this kit: BSP_XSPI_NOR_Write returns -3 at
+   * the same *payload* offset regardless of the chip address (confirmed
+   * data-independent — a random payload of the model's exact size fails
+   * identically, while an all-full-64KB-chunk payload flashes completely).
+   * Writing only whole 64KB chunks is the pattern that flashes reliably. The
+   * erase above already cleared `blocks` whole blocks, and the NN reads only
+   * the model's own bytes, so the extra 0xFF tail is harmless. */
+  uint32_t write_size = blocks * 0x10000U;        /* == ceil(size / 64KB) * 64KB */
+  if (write_size > (uint32_t)size)
   {
-    CMD_PRINTF(stream, "ERROR: write failed (%ld)%s", (long)status, lwshell_eol());
-    return status;
+    memset((uint8_t*)src + size, 0xFF, write_size - (uint32_t)size);
+  }
+
+  CMD_PRINTF(stream, "Writing %lu bytes (padded to %lu)...%s",
+             (unsigned long)size, (unsigned long)write_size, lwshell_eol());
+  {
+    const uint32_t WR_CHUNK = 0x10000U;   /* 64 KB — always a whole chunk now */
+    for (uint32_t off = 0U; off < write_size; off += WR_CHUNK)
+    {
+      status = BSP_XSPI_NOR_Write(0, (uint8_t*)src + off, xspi_offset + off, WR_CHUNK);
+      if (status != BSP_OK)
+      {
+        CMD_PRINTF(stream, "ERROR: write failed (%ld) at +0x%08lx%s",
+                   (long)status, (unsigned long)off, lwshell_eol());
+        goto recover;
+      }
+      if ((off % 0x80000U) == 0U)   /* progress every 512KB */
+      {
+        CMD_PRINTF(stream, "  written %lu/%lu...%s",
+                   (unsigned long)off, (unsigned long)write_size, lwshell_eol());
+      }
+      tx_thread_sleep(1);
+    }
   }
 
   CMD_PRINTF(stream, "Done. Resetting...%s", lwshell_eol());
   HAL_Delay(50);  /* let CDC TX drain */
   NVIC_SystemReset();
   return BSP_OK;  /* unreachable */
+
+recover:
+  /* A failed flash previously returned with MMP still DISABLED, leaving the
+   * kit wedged (every later CDC update -> DisableMMP=-24, needing SWD or a
+   * power-cycle). Re-enable memory-mapped mode and resume the NN task so the
+   * shell stays usable and the update can simply be retried over CDC. */
+  (void)BSP_XSPI_NOR_EnableMemoryMappedMode(0);
+  (void)nn_task_resume_thread();
+  return status;
 }
 
 static int32_t _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
