@@ -199,6 +199,8 @@ static void     _recovery_trigger(void);
 /* System -------------------------------------*/
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _system_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _commands_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _safeboot_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _update_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
@@ -303,6 +305,8 @@ static __ALIGN_BEGIN uint8_t _uart_recov_buf[UART_RECOV_BUF_SIZE] __ALIGN_END;
 static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _rtc_cmd                , .name = "rtc"       , .help = "[set DDMMYYYYHHMMSS] - get or set RTC" },
   {.run = _version_cmd            , .name = "version"   , .help = "Print application version" },
+  {.run = _system_cmd             , .name = "system"    , .help = "[version] - main-CPU version details (fw/uid/dev/rev) (SoW §3.7)" },
+  {.run = _commands_cmd           , .name = "commands"  , .help = "List supported shell commands and parameters (SoW §3.7)" },
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
@@ -321,6 +325,20 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _wifi_cmd               , .name = "wifi"      , .help = "WiFi control"    },
   #endif /* N6CAM_WIFI_MURATA */
 };
+
+/* SoW §3.7: enumerate the registered command table (name + help, where the
+ * help string already documents sub-commands and parameters). Defined here,
+ * after _shell_cmd[], so ARRAY_SIZE sees the complete array. */
+static int32_t _commands_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  for (size_t i = 0U; i < ARRAY_SIZE(_shell_cmd); i++)
+  {
+    CMD_PRINTF(stream, "%-10s %s%s",
+               _shell_cmd[i].name, _shell_cmd[i].help, lwshell_eol());
+  }
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
+}
 
 /* Firmware-update receive buffers: live in PSRAM (xSPI1, 32 MB). Separate
  * buffers per target so the App update path can't accidentally overflow
@@ -675,6 +693,29 @@ static int32_t _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 static int32_t _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 {
   CMD_PRINTF(stream, "Application: %s%s", FW_VERSION, lwshell_eol());
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
+}
+
+/* SoW §3.7: "Query system version details of main CPU." Reports the
+ * application firmware string plus the STM32N6 silicon identity (96-bit
+ * MCU UID, device and revision IDs) so a host can fingerprint the board.
+ * Accepts bare "system" or "system version". */
+static int32_t _system_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  if ((argc >= 2U) && (strcmp((char*)argv[1], "version") != 0))
+  {
+    return LWSHELL_ERROR_SYNTAX_CMD;
+  }
+
+  CMD_PRINTF(stream, "fw: %s%s", FW_VERSION, lwshell_eol());
+  CMD_PRINTF(stream, "uid: %08lX%08lX%08lX%s",
+             (unsigned long)HAL_GetUIDw2(),
+             (unsigned long)HAL_GetUIDw1(),
+             (unsigned long)HAL_GetUIDw0(), lwshell_eol());
+  CMD_PRINTF(stream, "dev: 0x%03lX rev: 0x%04lX%s",
+             (unsigned long)HAL_GetDEVID(),
+             (unsigned long)HAL_GetREVID(), lwshell_eol());
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
 }
