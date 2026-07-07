@@ -71,6 +71,20 @@ RE_FRAME_BOX = re.compile(
     r"\[(\d+)\]\s+class=(-?\d+)\s+conf=([\d.]+)\s+bbox=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)"
 )
 RE_SD_QUERY = re.compile(r"sd:\s+(mounted|not mounted)")
+# Tiled multi-crop detection (`tile` command). The run/live report line and
+# the per-detection box line (bbox is full-frame normalized x1,y1,x2,y2).
+RE_TILE_RUN = re.compile(
+    r"tile (?:run|live):\s+(\d+)\s+tiles\s+\((\d+)x(\d+)\)\s+crop\s+(\d+)\s+over"
+    r"\s+(\d+)x(\d+),\s+(\d+)\s+raw\s+->\s+(\d+)\s+over-thresh\s+->\s+(\d+)"
+    r"\s+after NMS,\s+(\d+)\s+ms"
+)
+RE_TILE_QUERY = re.compile(
+    r"tile:\s+frame\s+(\d+)x(\d+)\s+grid\s+(\d+)x(\d+)\s+crop\s+(\d+)"
+)
+RE_TILE_BOX = re.compile(
+    r"\[(\d+)\]\s+(\w+)\((-?\d+)\)\s+conf=([\d.]+)\s+"
+    r"bbox=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)"
+)
 
 # ANSI colours
 C_RED   = "\033[91m"
@@ -407,6 +421,20 @@ def inject_frame(sh: KitShell, data: bytes) -> bool:
         sh.write_bytes(data[i:i + 4096])
     out = sh.read_until("frame upload ok", max_secs=4.0)
     return "frame upload ok" in out
+
+
+def inject_tile_frame(sh: KitShell, data: bytes) -> bool:
+    """Upload a full frame for the tiled detector (`tile upload`). Same FRMI
+    framing as inject_frame, but the payload is the configured tile-frame size
+    (W*H*3), not the 256x256 NN input. `tile frame W H` must be set first."""
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    sh.write_line("tile upload")
+    sh.read_until("Ready", max_secs=3.0)
+    sh.write_bytes(FRAME_MAGIC + struct.pack("<II", len(data), crc))
+    for i in range(0, len(data), 4096):
+        sh.write_bytes(data[i:i + 4096])
+    out = sh.read_until("tile upload ok", max_secs=15.0)
+    return "tile upload ok" in out
 
 
 def _safe_detect_start(sh: KitShell) -> None:
@@ -936,6 +964,94 @@ def group_count(sh: KitShell, suite: Suite, image_dir: Path, art_dir: Path):
         idx += 1
 
 
+def group_tile(sh: KitShell, suite: Suite, image_dir: Path):
+    """Tiled multi-crop detection: config mechanics + an end-to-end tiled run on
+    an uploaded high-res frame (crop -> resize -> NN per tile -> remap -> NMS) +
+    the live-camera sweep path. Model is unchanged (256x256 yolov8n); tiling
+    only changes what pixels reach it."""
+    suite.group("GROUP 12: Tiled multi-crop detection")
+
+    # -- config mechanics --------------------------------------------------
+    out = sh.send_get("tile default", "tile default ok", 3.0)
+    must_be(suite, "T12.1", "`tile default` restores 5x4/576 factory settings",
+            "grid 5x4 crop 576" in out and "conf>=0.45" in out)
+
+    out = sh.send_get("tile query", "tile query ok", 3.0)
+    m = RE_TILE_QUERY.search(out)
+    must_be(suite, "T12.2", "`tile query` reports frame/grid/crop geometry",
+            m is not None and m.group(3) == "5" and m.group(4) == "4"
+            and m.group(5) == "576")
+
+    out = sh.send_get("tile grid 2 2", "tile grid ok", 3.0)
+    out = sh.send_get("tile query", "tile query ok", 3.0)
+    m = RE_TILE_QUERY.search(out)
+    must_be(suite, "T12.3", "`tile grid 2 2` persists (query reflects it)",
+            m is not None and m.group(3) == "2" and m.group(4) == "2")
+
+    # -- end-to-end tiled run on an uploaded frame -------------------------
+    try:
+        from PIL import Image
+    except Exception as e:  # pragma: no cover
+        skip(suite, "T12.4", "Tiled run E2E", f"Pillow not available: {e}")
+        sh.send_get("tile default", "tile default ok", 3.0)
+        return
+    img_path = image_dir / "5_people.jpg"
+    if not img_path.exists():
+        skip(suite, "T12.4", "Tiled run E2E", "5_people.jpg missing")
+        sh.send_get("tile default", "tile default ok", 3.0)
+        return
+
+    # Small frame keeps the upload + 4-tile sweep quick while still exercising
+    # crop/resize/remap/NMS. NN must be alive (safe gray frame first).
+    _safe_detect_start(sh)
+    sh.send_get("tile frame 512 512", "tile frame ok", 3.0)
+    sh.send_get("tile grid 2 2", "tile grid ok", 3.0)
+    sh.send_get("tile crop 384", "tile crop ok", 3.0)
+    sh.send_get("tile thresh 40 40", "tile thresh ok", 3.0)
+
+    frame = Image.open(img_path).convert("RGB").resize((512, 512), Image.LANCZOS)
+    ok = inject_tile_frame(sh, frame.tobytes())
+    must_be(suite, "T12.4", "`tile upload` accepts a 512x512 frame (CRC ok)", ok)
+
+    sh.write_line("tile run")
+    out = sh.read_until("tile run ok", max_secs=10.0)
+    rm = RE_TILE_RUN.search(out)
+    must_be(suite, "T12.5", "`tile run` reports tiles + raw/thresh/NMS + timing",
+            rm is not None,
+            extra=(rm.group(0)[:88] if rm else out[:88].replace("\n", " ")))
+
+    persons = sum(1 for bm in RE_TILE_BOX.finditer(out) if bm.group(2) == "person")
+    must_be(suite, "T12.6", "tiled run detects >=1 person in 5_people.jpg",
+            persons >= 1, extra=f"persons={persons}")
+
+    if rm is not None:
+        raw, over, kept = int(rm.group(7)), int(rm.group(8)), int(rm.group(9))
+        must_be(suite, "T12.7",
+                "NMS is non-expanding (raw >= over-thresh >= after-NMS)",
+                raw >= over >= kept, extra=f"raw={raw} thresh={over} nms={kept}")
+    else:
+        skip(suite, "T12.7", "NMS non-expanding check", "no run line to parse")
+
+    # -- live-camera sweep path -------------------------------------------
+    # Can't assert a positive detection (depends on what the lens sees), but the
+    # live path must snapshot the main pipe, tile it, and return a valid report
+    # without wedging the kit.
+    sh.send_get("tile grid 3 2", "tile grid ok", 3.0)
+    sh.send_get("tile crop 400", "tile crop ok", 3.0)
+    sh.write_line("tile live")
+    out = sh.read_until("tile live ok", max_secs=10.0)
+    lm = RE_TILE_RUN.search(out)
+    must_be(suite, "T12.8",
+            "`tile live` sweeps the live camera and returns a report",
+            lm is not None and lm.group(5) == "800" and lm.group(6) == "600",
+            extra=(lm.group(0)[:88] if lm else out[:88].replace("\n", " ")))
+
+    # -- restore defaults + confirm kit still healthy ----------------------
+    out = sh.send_get("tile default", "tile default ok", 3.0)
+    must_be(suite, "T12.9", "`tile default` restores after live + kit healthy",
+            "grid 5x4 crop 576" in out)
+
+
 def group_camera(sh: KitShell, suite: Suite):
     suite.group("GROUP 10: Camera control passthrough")
     out = sh.send_get("camera awb auto", "Auto", 3.0)
@@ -1173,6 +1289,11 @@ def main() -> int:
         else:
             suite.group("GROUP 11: Multi-person + vehicle counting")
             skip(suite, "T11.0", "Count tests", "no images folder")
+        if image_dir.is_dir():
+            group_tile(sh, suite, image_dir)
+        else:
+            suite.group("GROUP 12: Tiled multi-crop detection")
+            skip(suite, "T12.0", "Tile tests", "no images folder")
     finally:
         # Reset state to be friendly. Tolerate the kit being dead — by
         # this point in the run a hung kit must not prevent the HTML

@@ -319,7 +319,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
-  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|query|clear] - tiled multi-crop detection" },
+  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
@@ -986,18 +986,29 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 #define TILE_MAX_DETS       256U    /* pre-NMS accumulation cap                */
 #define TILE_NN_SIDE        CAMERA_ANCILLARY_WIDTH   /* 256 - NN input side    */
 
-/* Tiling configuration (persisted between commands). Defaults mirror the
- * I.T.P. Novex 90-deg-FOV example: 5x4 grid, 576 px square crops over a
- * 2592x1944 sensor frame. */
-static uint16_t _tile_cols     = 5U;
-static uint16_t _tile_rows     = 4U;
-static uint16_t _tile_crop     = 576U;   /* square crop side, full-frame px    */
-static uint16_t _tile_ovl_h    = 0U;     /* 0 = auto (even distribution)       */
-static uint16_t _tile_ovl_v    = 0U;
-static uint16_t _tile_fw       = 2592U;  /* uploaded full-frame width          */
-static uint16_t _tile_fh       = 1944U;  /* uploaded full-frame height         */
-static float    _tile_conf     = 0.45f;  /* keep detections >= this conf       */
-static float    _tile_iou      = 0.40f;  /* NMS suppression IoU threshold      */
+/* Factory defaults, mirroring the I.T.P. Novex 90-deg-FOV example: 5x4 grid,
+ * 576 px square crops over a 2592x1944 sensor frame, auto overlap, conf 0.45,
+ * IoU 0.40. `tile default` restores exactly these. */
+#define TILE_DEF_COLS       5U
+#define TILE_DEF_ROWS       4U
+#define TILE_DEF_CROP       576U
+#define TILE_DEF_OVL_H      0U       /* 0 = auto (even distribution)           */
+#define TILE_DEF_OVL_V      0U
+#define TILE_DEF_FW         2592U
+#define TILE_DEF_FH         1944U
+#define TILE_DEF_CONF       0.45f
+#define TILE_DEF_IOU        0.40f
+
+/* Tiling configuration (persisted between commands). */
+static uint16_t _tile_cols     = TILE_DEF_COLS;
+static uint16_t _tile_rows     = TILE_DEF_ROWS;
+static uint16_t _tile_crop     = TILE_DEF_CROP;   /* square crop side, px       */
+static uint16_t _tile_ovl_h    = TILE_DEF_OVL_H;
+static uint16_t _tile_ovl_v    = TILE_DEF_OVL_V;
+static uint16_t _tile_fw       = TILE_DEF_FW;     /* uploaded full-frame width  */
+static uint16_t _tile_fh       = TILE_DEF_FH;     /* uploaded full-frame height */
+static float    _tile_conf     = TILE_DEF_CONF;   /* keep detections >= conf    */
+static float    _tile_iou      = TILE_DEF_IOU;    /* NMS suppression IoU        */
 static bool     _tile_loaded   = false;  /* a full frame is in _fwupd_model_buf*/
 
 /* Post-remap detection in full-frame normalized [0,1] corner coordinates. */
@@ -1135,32 +1146,29 @@ static void _tile_nms(uint32_t n, float iou_th)
 }
 
 /* `tile run` core: crop -> resize -> NN -> remap -> accumulate -> NMS. */
-static int32_t _tile_run(const t_stream *stream)
+/* Core sweep, shared by `tile run` (uploaded frame) and `tile live` (live
+ * camera snapshot): crop each grid tile from `frame` (RGB888, fw x fh),
+ * bilinear-resize it to the 256x256 NN input, run the detector, remap boxes to
+ * full-frame normalized coords, accumulate, then class-aware IoU-NMS. `label`
+ * tags the report line ("run"/"live"). */
+static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
+                                uint16_t fw, uint16_t fh, const char *label)
 {
-  if (!_tile_loaded)
-  {
-    CMD_PRINTF(stream, "tile run: no frame (use 'tile upload' first)%s", lwshell_eol());
-    return LWSHELL_OK;
-  }
   if (!nn_task_detect_get())
   {
-    CMD_PRINTF(stream, "tile run: NN stopped - run 'detect start' first%s", lwshell_eol());
+    CMD_PRINTF(stream, "tile %s: NN stopped - run 'detect start' first%s", label, lwshell_eol());
     return LWSHELL_OK;
   }
-  if (_tile_crop > _tile_fw || _tile_crop > _tile_fh)
-  {
-    CMD_PRINTF(stream, "tile run: crop %u exceeds frame %ux%u%s",
-               (unsigned)_tile_crop, (unsigned)_tile_fw, (unsigned)_tile_fh, lwshell_eol());
-    return LWSHELL_OK;
-  }
+  uint16_t crop = _tile_crop;               /* clamp so a crop can't exceed the */
+  if (crop > fw) crop = fw;                  /* frame (whole-axis = 1 region)    */
+  if (crop > fh) crop = fh;
 
   uint16_t xs[TILE_MAX_AXIS], ys[TILE_MAX_AXIS], sx = 0U, sy = 0U;
-  _tile_axis_origins(_tile_cols, _tile_fw, _tile_crop, _tile_ovl_h, xs, &sx);
-  _tile_axis_origins(_tile_rows, _tile_fh, _tile_crop, _tile_ovl_v, ys, &sy);
+  _tile_axis_origins(_tile_cols, fw, crop, _tile_ovl_h, xs, &sx);
+  _tile_axis_origins(_tile_rows, fh, crop, _tile_ovl_v, ys, &sy);
 
-  const uint8_t *frame = _fwupd_model_buf;
-  const float inv_fw = 1.0f / (float)_tile_fw;
-  const float inv_fh = 1.0f / (float)_tile_fh;
+  const float inv_fw = 1.0f / (float)fw;
+  const float inv_fh = 1.0f / (float)fh;
   uint32_t n_acc = 0U, n_infer = 0U, n_raw = 0U;
   uint32_t t0 = HAL_GetTick();
 
@@ -1168,7 +1176,7 @@ static int32_t _tile_run(const t_stream *stream)
   {
     for (uint16_t c = 0U; c < _tile_cols; c++)
     {
-      _tile_resize_crop(frame, _tile_fw, _tile_fh, xs[c], ys[r], _tile_crop, _frame_test_buf);
+      _tile_resize_crop(frame, fw, fh, xs[c], ys[r], crop, _frame_test_buf);
       SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
 
       /* Route the NN at this tile and wait ~2 camera ticks for one inference. */
@@ -1185,10 +1193,10 @@ static int32_t _tile_run(const t_stream *stream)
         if (n_acc >= TILE_MAX_DETS) continue;
         /* box is normalized [0,1] within the tile -> tile px -> full-frame px
          * -> full-frame normalized. */
-        float bx = (float)xs[c] + buf[i].x_center * (float)_tile_crop;
-        float by = (float)ys[r] + buf[i].y_center * (float)_tile_crop;
-        float bw = buf[i].width  * (float)_tile_crop;
-        float bh = buf[i].height * (float)_tile_crop;
+        float bx = (float)xs[c] + buf[i].x_center * (float)crop;
+        float by = (float)ys[r] + buf[i].y_center * (float)crop;
+        float bw = buf[i].width  * (float)crop;
+        float bh = buf[i].height * (float)crop;
         _tile_det_t *d = &_tile_dets[n_acc++];
         d->x1   = (bx - bw * 0.5f) * inv_fw;
         d->y1   = (by - bh * 0.5f) * inv_fh;
@@ -1208,8 +1216,9 @@ static int32_t _tile_run(const t_stream *stream)
   for (uint32_t i = 0U; i < n_acc; i++) if (_tile_dets[i].keep) kept++;
 
   CMD_PRINTF(stream,
-    "tile run: %lu tiles (%ux%u), %lu raw -> %lu over-thresh -> %lu after NMS, %lu ms%s",
-    (unsigned long)n_infer, (unsigned)_tile_cols, (unsigned)_tile_rows,
+    "tile %s: %lu tiles (%ux%u) crop %u over %ux%u, %lu raw -> %lu over-thresh -> %lu after NMS, %lu ms%s",
+    label, (unsigned long)n_infer, (unsigned)_tile_cols, (unsigned)_tile_rows,
+    (unsigned)crop, (unsigned)fw, (unsigned)fh,
     (unsigned long)n_raw, (unsigned long)n_acc, (unsigned long)kept,
     (unsigned long)elapsed, lwshell_eol());
   if (n_acc >= TILE_MAX_DETS)
@@ -1229,6 +1238,63 @@ static int32_t _tile_run(const t_stream *stream)
     if (++shown >= 32U) { CMD_PRINTF(stream, "  ... (%lu more)%s",
         (unsigned long)(kept - shown), lwshell_eol()); break; }
   }
+  return LWSHELL_OK;
+}
+
+/* `tile run` - tiled sweep of the frame uploaded via `tile upload`. */
+static int32_t _tile_run(const t_stream *stream)
+{
+  if (!_tile_loaded)
+  {
+    CMD_PRINTF(stream, "tile run: no frame (use 'tile upload' first)%s", lwshell_eol());
+    return LWSHELL_OK;
+  }
+  return _tile_run_source(stream, _fwupd_model_buf, _tile_fw, _tile_fh, "run");
+}
+
+/* `tile live [n]` - bring tiling to the LIVE camera. The DCMIPP main pipe
+ * already carries the full FOV at 800x600 (higher-res than the 256x256 NN
+ * ancillary), so we snapshot it, expand RGB565->RGB888, and run the same
+ * tiling engine on it. This recovers small/distant targets that the single
+ * ancillary downscale loses, without touching the DCMIPP crop / ATON path.
+ * `n` back-to-back sweeps (default 1). */
+static int32_t _tile_live(const t_stream *stream, uint32_t sweeps)
+{
+  if (!nn_task_detect_get())
+  {
+    CMD_PRINTF(stream, "tile live: NN stopped - run 'detect start' first%s", lwshell_eol());
+    return LWSHELL_OK;
+  }
+  const uint16_t mw = (uint16_t)CAMERA_MAIN_WIDTH;
+  const uint16_t mh = (uint16_t)CAMERA_MAIN_HEIGHT;
+  uint8_t *rgb = _fwupd_model_buf;    /* RGB888 snapshot dest (mw*mh*3 bytes)   */
+
+  for (uint32_t s = 0U; s < sweeps; s++)
+  {
+    uint8_t *src = camera_get_buffer(DCMIPP_PIPE1);   /* live main RGB565       */
+    if (src == NULL)
+    {
+      CMD_PRINTF(stream, "tile live: no camera buffer (camera not streaming?)%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+    /* Snapshot + expand RGB565 -> RGB888 so the unchanged resize/NN path sees
+     * the same layout as an uploaded frame. Invalidate first: the pipe is
+     * DMA'd into PSRAM by the camera behind the D-cache. */
+    SCB_InvalidateDCache_by_Addr((uint32_t*)src, (int32_t)((uint32_t)mw * mh * 2U));
+    for (uint32_t p = 0U; p < (uint32_t)mw * mh; p++)
+    {
+      uint16_t px = (uint16_t)src[p * 2U] | ((uint16_t)src[p * 2U + 1U] << 8);
+      uint8_t r5 = (uint8_t)((px >> 11) & 0x1FU);
+      uint8_t g6 = (uint8_t)((px >> 5)  & 0x3FU);
+      uint8_t b5 = (uint8_t)( px        & 0x1FU);
+      rgb[p * 3U + 0U] = (uint8_t)((r5 << 3) | (r5 >> 2));
+      rgb[p * 3U + 1U] = (uint8_t)((g6 << 2) | (g6 >> 4));
+      rgb[p * 3U + 2U] = (uint8_t)((b5 << 3) | (b5 >> 2));
+    }
+    _tile_run_source(stream, rgb, mw, mh, "live");
+  }
+  _tile_loaded = false;             /* the live snapshot clobbered upload scratch */
+  nn_task_set_test_frame(NULL);     /* hand the NN back to the live camera        */
   return LWSHELL_OK;
 }
 
@@ -1421,6 +1487,41 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     int32_t rc = _tile_run(stream);
     if (rc == LWSHELL_OK) _cmd_ack(stream, argv, argc);
     return rc;
+  }
+
+  if (strcmp(sub, "live") == 0)
+  {
+    uint32_t n = 1U;
+    if (argc >= 3U)
+    {
+      long v = atol((char*)argv[2]);
+      if (v < 1 || v > 100)
+      {
+        CMD_PRINTF(stream, "tile live: sweeps must be 1..100%s", lwshell_eol());
+        return LWSHELL_OK;
+      }
+      n = (uint32_t)v;
+    }
+    int32_t rc = _tile_live(stream, n);
+    if (rc == LWSHELL_OK) _cmd_ack(stream, argv, argc);
+    return rc;
+  }
+
+  if (strcmp(sub, "default") == 0)
+  {
+    _tile_cols  = TILE_DEF_COLS;  _tile_rows  = TILE_DEF_ROWS;
+    _tile_crop  = TILE_DEF_CROP;
+    _tile_ovl_h = TILE_DEF_OVL_H; _tile_ovl_v = TILE_DEF_OVL_V;
+    _tile_fw    = TILE_DEF_FW;    _tile_fh    = TILE_DEF_FH;
+    _tile_conf  = TILE_DEF_CONF;  _tile_iou   = TILE_DEF_IOU;
+    _tile_loaded = false;
+    nn_task_set_test_frame(NULL);   /* also drop any stale NN override           */
+    CMD_PRINTF(stream,
+      "tile: restored defaults (grid %ux%u crop %u frame %ux%u overlap auto conf>=%.2f iou=%.2f)%s",
+      (unsigned)_tile_cols, (unsigned)_tile_rows, (unsigned)_tile_crop,
+      (unsigned)_tile_fw, (unsigned)_tile_fh, _tile_conf, _tile_iou, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
   }
 
   return LWSHELL_ERROR_SYNTAX_CMD;
