@@ -73,6 +73,7 @@ wait
 | `recovery` | Reboot into FSBL recovery halt (limited use on this kit — debug auth locks SWD in op mode regardless). |
 | `update [app\|model]` | Receive new App firmware (default) or NN model weights over CDC and reflash xSPI. Used by `n6cam-update.py` — you won't run this by hand. |
 | `frame upload\|load\|run\|clear\|query` | Test-frame injection — push a 192×192 RGB image into the NN input from the host, run inference, read back detections. Used by the regression suite to validate the algorithm without depending on the lens. |
+| `tile grid\|crop\|frame\|overlap\|thresh\|upload\|run\|live\|query\|clear\|default` | Tiled multi-crop detection (see [§6 Long-range mode](#tiled-multi-crop-detection-long-range--low-power-mode)). `run` sweeps a host-uploaded high-res frame; `live [n]` sweeps the live camera; `default` restores factory tile settings. Driven by `n6cam-tile.py`. |
 | `sd query\|ls\|format CONFIRM` | SD card status, root listing, destructive reformat (FAT32). |
 
 Successful commands respond `<cmd> [<sub>] ok`. Notifications appear on the same port as `+SDVRNTF: {"ser":...,"num":...,"rsn":...,...}` (SoW §6 JSON).
@@ -167,6 +168,30 @@ The model in flash today is `yolov8n_relu30` — 80-class COCO YOLOv8n, lightly 
 The firmware-side wiring is multi-class capable — `detect profile <det_msk> <act_msk>` filters by class bitmask (bit 0 = people, bit 1 = vehicles → COCO 2/3/5/7), and the regression suite already understands `car=N` / `truck=N` / etc. The moment a multi-class quantized model lands in `vendor/.../Model/network_data.hex`, vehicles light up automatically with no firmware code changes — just bump `AI_OD_YOLOV8_PP_NB_CLASSES` from 1 to N and re-run `./modular-tools.sh build && ./modular-tools.sh update` + `./modular-tools.sh update model`.
 
 The full pipeline for producing a custom model is committed under `tools/quantize_yolov8n.py` (ONNX Runtime static quantization with COCO128 calibration). What's blocking production multi-class today is **model accuracy after PTQ** — Ultralytics' post-training quantization on `yolov8n.pt` collapses confidence scores when fed through `stedgeai → ATON → vendor's app_postprocess_od_yolov8`. Production-grade accuracy requires either QAT (quantization-aware training on a GPU) or a vendor-blessed multi-class N6 model from ST. See `tests/README.md` for the experimental results and what each variant produced.
+
+### Tiled multi-crop detection (long-range / low-power mode)
+
+The NPU input is a **fixed 256×256**, but the sensor is far larger (multi-megapixel). Feeding a whole frame to the detector means downscaling it ~10× on each axis, so a person far from the camera collapses to a handful of pixels — below the ~40 px-on-target a detector needs to fire, and they are simply missed.
+
+Tiling fixes this **without changing the model**. Each frame is sliced into an overlapping grid of square crops (e.g. 5×4 tiles of 576 px). Each crop is downscaled only ~2× to 256×256 and run through the *same* detector; the resulting boxes are remapped to full-frame coordinates and merged with IoU-NMS so a person straddling two tiles is counted once. Every tile puts roughly **4–5× more pixels on each target** than the single full-frame downscale.
+
+**Power budget.** Tiling is designed to pair with a **low frame rate (~1 FPS)** for battery/thermal budget. You pay *N* inferences per frame instead of one (a 5×4 grid ≈ 20), but because the camera is deliberately slow, that extra per-frame time is effectively free — you are trading per-frame latency you don't need for range and small-object recall you do. Per-inference power is unchanged (same silicon, same model), so the average power stays governed by the 1 FPS duty cycle rather than the tile count.
+
+**Expected range improvement.** Pixels-on-target scale with the reduced downscale, so effective detection range roughly **triples** versus single-frame inference on a wide-FOV (≈90°) lens:
+
+| Person distance | Single full-frame → 256 | Tiled (576 crop → 256) |
+|---|---|---|
+| 20 m | ~15 px (missed) | ~50 px ✓ |
+| 30 m | ~10 px (missed) | ~34 px ✓ (borderline) |
+
+Roughly: usable wide-FOV person detection extends from ~10 m out to ~30 m, at the cost of ~0.6–2 s per fully-swept frame (fine at 1 FPS).
+
+**Two ways to run it** (see the `tile` command above, driven by `n6cam-tile.py`):
+
+- **`tile run`** — sweep a host-uploaded high-res frame (any `W×H` RGB over USB-C). Reproducible, lens-independent; used for validation and offline high-res imagery.
+- **`tile live [n]`** — sweep the live camera on-device. This snapshots the camera's preview pipe (800×600) and tiles that, which already recovers targets the 256×256 detection path loses; tiling the sensor at its *native* resolution (hardware crop) is a further step that widens the gain to the full figures above.
+
+Everything upstream (grid size, crop size, overlap, confidence/IoU thresholds) is configurable at runtime; `tile default` restores the factory 5×4 / 576 px layout.
 
 ## 7. Troubleshooting
 
