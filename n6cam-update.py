@@ -5,11 +5,20 @@ N6Cam kit over its CDC-ACM port. Replaces the SWD+boot-switch flash cycle
 for both daily firmware iteration AND model swaps.
 
 Usage:
-    n6cam-update.py [--target app|model] <file> [/dev/ttyACMx]
+    n6cam-update.py [--target app|model] <file> [/dev/ttyACMx | COMn]
 
 The kit's CDC port is usually /dev/ttyACM1 (STLink VCP is /dev/ttyACM0).
 Find it reliably with:
     ls /dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02
+
+On Windows it is the "STMicroelectronics ... Virtual COM Port" entry in Device
+Manager (e.g. COM7); pass it explicitly and pyserial will be used:
+    python n6cam-update.py --target app Application_signed.bin COM7
+
+This writes ONLY the App slot (xSPI 0x00400000). It does not touch the
+factory-provisioned auxiliary regions at 0x70080000 / 0x704C0000 / 0x703E0000,
+which is why it is the safe way to iterate — a full SWD reflash that leaves
+those erased produces a board that will not boot.
 
 Files:
     - For 'app' target: Application_signed.bin (signed by STM32_SigningTool,
@@ -110,24 +119,58 @@ def main() -> int:
     print(f"Target: {args.target}")
     print(f"Image:  {fn} ({size} bytes, CRC32 0x{crc:08x})")
 
-    # Put the tty into raw 115200 8N1
-    rc = os.system(f"stty -F {args.tty} 115200 cs8 -cstopb -parenb raw -echo")
-    if rc != 0:
-        print(f"stty failed on {args.tty}")
-        return 1
+    # Port setup differs by host. On Windows there is no stty and os.open()
+    # can't take a COM name, so use pyserial there; keep the original raw-fd
+    # path on POSIX so nothing about the proven Linux flow changes.
+    use_serial = (os.name == "nt") or args.tty.upper().startswith("COM")
 
-    # Use raw os.open with O_NONBLOCK so we don't block on modem control
-    # lines that the CDC ACM stack doesn't drive. Then os.write loops over
-    # the buffer manually with a small sleep on EAGAIN.
-    fd = os.open(args.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    if use_serial:
+        try:
+            import serial  # type: ignore
+        except ImportError:
+            print("pyserial is required on Windows:  python -m pip install pyserial")
+            return 1
+        # DTR/RTS must stay deasserted: toggling them resets the MCU, and a
+        # reset partway through an erase/write corrupts the App slot.
+        ser = serial.Serial()
+        ser.port = args.tty
+        ser.baudrate = 115200
+        ser.bytesize = serial.EIGHTBITS
+        ser.parity = serial.PARITY_NONE
+        ser.stopbits = serial.STOPBITS_ONE
+        ser.dtr = False
+        ser.rts = False
+        ser.timeout = 1
+        ser.open()
 
-    def write_all(buf: bytes):
-        n = 0
-        while n < len(buf):
-            try:
-                n += os.write(fd, buf[n:])
-            except BlockingIOError:
-                time.sleep(0.001)
+        def write_all(buf: bytes):
+            ser.write(buf)
+            ser.flush()
+
+        def close_port():
+            ser.close()
+    else:
+        # Put the tty into raw 115200 8N1
+        rc = os.system(f"stty -F {args.tty} 115200 cs8 -cstopb -parenb raw -echo")
+        if rc != 0:
+            print(f"stty failed on {args.tty}")
+            return 1
+
+        # Use raw os.open with O_NONBLOCK so we don't block on modem control
+        # lines that the CDC ACM stack doesn't drive. Then os.write loops over
+        # the buffer manually with a small sleep on EAGAIN.
+        fd = os.open(args.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+        def write_all(buf: bytes):
+            n = 0
+            while n < len(buf):
+                try:
+                    n += os.write(fd, buf[n:])
+                except BlockingIOError:
+                    time.sleep(0.001)
+
+        def close_port():
+            os.close(fd)
 
     try:
         # Trigger the shell 'update [app|model]' command.
@@ -150,7 +193,7 @@ def main() -> int:
               f"Device will erase+write+reboot — model can take ~90s, "
               f"app ~5s.")
     finally:
-        os.close(fd)
+        close_port()
 
     return 0
 
