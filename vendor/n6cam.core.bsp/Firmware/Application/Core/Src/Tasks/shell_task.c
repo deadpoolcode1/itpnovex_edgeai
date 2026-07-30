@@ -193,6 +193,7 @@ typedef struct
 
 static void     _shell_task_init(void);
 static void     _shell_task_run(uint32_t args);
+static void     _mdm_urc_forward(const char *line, size_t len, void *ctx);
 static void     _uart_recov_task_run(uint32_t args);
 static void     _recovery_trigger(void);
 
@@ -320,7 +321,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
   {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
-  {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo - MangOH modem pass-through (SoW §4.6)" },
+  {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
   {.run = _update_cmd             , .name = "update"    , .help = "[app | model] - Receive new firmware/model over CDC and reflash xSPI (default: app)" },
@@ -461,6 +462,13 @@ void _shell_task_init(void)
     LERROR(TRACE_SHELL, "CMD registration failed");
     Error_Handler();
   }
+
+  /* Register the modem URC forwarder up front, not on the first `mdm`
+   * command. The MangOH emits `+SDVRRDY: <ver>` once at its startup; with
+   * registration deferred, that banner — the single best proof that the
+   * modem->camera path works — was discarded unless the operator happened to
+   * have run an `mdm` command earlier in the same session. */
+  modem_set_urc_callback(_mdm_urc_forward, NULL);
 
   /* ── Safe-boot guard ───────────────────────────────────────────
    *
@@ -3119,7 +3127,10 @@ static const t_stream *volatile _mdm_urc_stream = NULL;
 static void _mdm_urc_forward(const char *line, size_t len, void *ctx)
 {
   (void)len; (void)ctx;
+  /* Fall back to the shell's own stream: the forwarder is now registered at
+   * shell init, before any `mdm` command has had a chance to set this. */
   const t_stream *s = _mdm_urc_stream;
+  if (s == NULL) s = _shell.stream;
   if (s == NULL) return;
   /* The shell task's CMD_PRINTF macro needs the static `_shell.out`
    * scratch, but the URC fires in modem_task context. Use stream_printf
@@ -3136,8 +3147,72 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   {
     CMD_PRINTF(stream, "Usage: mdm <at-command>%s"
                        "       mdm test echo            - HDLC loopback%s"
-                       "       mdm test urc <line>      - synthesise a URC%s",
-               lwshell_eol(), lwshell_eol(), lwshell_eol());
+                       "       mdm test urc <line>      - synthesise a URC%s"
+                       "       mdm stats [reset]        - link RX/TX counters%s"
+                       "       mdm raw on|off           - hex-dump raw RX%s",
+               lwshell_eol(), lwshell_eol(), lwshell_eol(),
+               lwshell_eol(), lwshell_eol());
+    return LWSHELL_OK;
+  }
+
+  /* `mdm stats` / `mdm raw` — link diagnostics. These exist because every
+   * layer below discards malformed input silently, so a link that is
+   * receiving corrupted bytes is indistinguishable from one receiving
+   * nothing. Handled before the URC registration so they stay side-effect
+   * free. */
+  if (strcmp((char*)argv[1], "stats") == 0)
+  {
+    if (argc >= 3U && strcmp((char*)argv[2], "reset") == 0)
+    {
+      modem_reset_stats();
+      CMD_PRINTF(stream, "mdm stats: cleared%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+    t_modem_stats st;
+    modem_get_stats(&st);
+    CMD_PRINTF(stream,
+      "rx: bytes=%lu frames=%lu badcrc=%lu stray=%lu err=%lu timeouts=%lu%s"
+      "tx: frames=%lu err=%lu   usart2 err(ORE/FE/NE)=%lu%s",
+      (unsigned long)st.rx_bytes, (unsigned long)st.rx_frames,
+      (unsigned long)st.rx_bad,   (unsigned long)st.rx_stray,
+      (unsigned long)st.rx_errors,(unsigned long)st.rx_timeouts, lwshell_eol(),
+      (unsigned long)st.tx_frames,(unsigned long)st.tx_errors,
+      (unsigned long)st.uart_errors, lwshell_eol());
+    /* Report the line rate the peripheral is REALLY running at. If this is
+     * not 115200 the link cannot work, however good the wiring is -- and a
+     * loopback test would still pass, because both directions would share the
+     * same wrong divisor. */
+    uint32_t fck    = bsp_uart_get_kernel_clock(UART_2);
+    uint32_t actual = bsp_uart_get_actual_baud(UART_2);
+    CMD_PRINTF(stream, "usart2: fck=%lu Hz brr=0x%04lX actual=%lu baud (want 115200)%s",
+               (unsigned long)fck,
+               (unsigned long)uart[UART_2].bsp.huart.Instance->BRR,
+               (unsigned long)actual, lwshell_eol());
+    if ((actual != 0U) &&
+        ((actual > 118000U) || (actual < 112000U)))
+    {
+      CMD_PRINTF(stream, "  -> BAUD IS WRONG (%lu vs 115200): BRR was computed "
+                         "against a different kernel clock%s",
+                 (unsigned long)actual, lwshell_eol());
+    }
+
+    if (st.rx_bytes == 0U)
+    {
+      CMD_PRINTF(stream, "  -> nothing reaching PF6: check wiring/GND/TX-RX cross%s",
+                 lwshell_eol());
+    }
+    else if (st.rx_frames == 0U)
+    {
+      CMD_PRINTF(stream, "  -> bytes arrive but never frame: far end not HDLC, "
+                         "or baud/level mismatch%s", lwshell_eol());
+    }
+    return LWSHELL_OK;
+  }
+  if (strcmp((char*)argv[1], "raw") == 0 && argc >= 3U)
+  {
+    bool on = (strcmp((char*)argv[2], "on") == 0);
+    modem_set_raw_dump(on);
+    CMD_PRINTF(stream, "mdm raw: %s%s", on ? "on" : "off", lwshell_eol());
     return LWSHELL_OK;
   }
 

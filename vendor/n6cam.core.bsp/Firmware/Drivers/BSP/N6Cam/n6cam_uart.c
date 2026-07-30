@@ -92,13 +92,19 @@
 t_uart                  uart[UART_NUM] = { 0 };
 
 /** UART RTOS naming */
-static const char*      _uart_name[UART_NUM][3U] = {
-  {"tx.evt.uart1", "tx.mtx.uart1.rx", "tx.mtx.uart1.tx"},
-  {"tx.evt.uart2", "tx.mtx.uart2.rx", "tx.mtx.uart2.tx"},
+static const char*      _uart_name[UART_NUM][4U] = {
+  {"tx.evt.uart1.rx", "tx.mtx.uart1.rx", "tx.mtx.uart1.tx", "tx.evt.uart1.tx"},
+  {"tx.evt.uart2.rx", "tx.mtx.uart2.rx", "tx.mtx.uart2.tx", "tx.evt.uart2.tx"},
 };
 
 /** AUX for RX complete */
 static volatile size_t  _uart_recv[UART_NUM];
+
+/** Peripheral error counter (ORE/FE/NE), per UART. Exposed via
+ *  bsp_uart_get_errors() so a stalled link can be told apart from a silent
+ *  one -- a rising count means bytes ARE hitting the pin but are malformed
+ *  (wrong baud, bad levels, noise), which no other diagnostic surfaces. */
+static volatile uint32_t _uart_errors[UART_NUM];
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_Data -->
@@ -162,7 +168,12 @@ int32_t bsp_uart_init(t_uart_id id, uint32_t baud, bool swap)
   }
 
   /* Init RTOS */
-  status = tx_event_flags_create(&uart[id].rtos.evt, (char*)_uart_name[id][0U]);
+  status = tx_event_flags_create(&uart[id].rtos.evt_rx, (char*)_uart_name[id][0U]);
+  if (status != TX_SUCCESS)
+  {
+    return status;
+  }
+  status = tx_event_flags_create(&uart[id].rtos.evt_tx, (char*)_uart_name[id][3U]);
   if (status != TX_SUCCESS)
   {
     return status;
@@ -216,6 +227,58 @@ int32_t bsp_uart_set_mode(t_uart_id id, t_uart_mode mode_rx, t_uart_mode mode_tx
   return BSP_OK;
 }
 
+uint32_t bsp_uart_get_errors(t_uart_id id)
+{
+  if (id >= UART_NUM)
+  {
+    return 0U;
+  }
+  return _uart_errors[id];
+}
+
+uint32_t bsp_uart_get_kernel_clock(t_uart_id id)
+{
+  switch (id)
+  {
+    case UART_1: return HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_USART1);
+    case UART_2: return HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_USART2);
+    default:     return 0U;
+  }
+}
+
+uint32_t bsp_uart_get_actual_baud(t_uart_id id)
+{
+  /* Recover the line rate the peripheral is REALLY running at, from the live
+   * BRR and the live kernel clock. Init.BaudRate only records what was asked
+   * for -- if the kernel clock changed after HAL_UART_Init() computed BRR
+   * (see TX_EVT_MODEM_REQUIRE), the two disagree and this is what exposes it.
+   * A TX->RX loopback cannot: both directions share the same wrong divisor. */
+  if ((id >= UART_NUM) || !uart[id].ready)
+  {
+    return 0U;
+  }
+
+  uint32_t fck = bsp_uart_get_kernel_clock(id);
+  uint32_t brr = uart[id].bsp.huart.Instance->BRR;
+  if ((fck == 0U) || (brr == 0U))
+  {
+    return 0U;
+  }
+
+  if (uart[id].bsp.huart.Init.OverSampling == UART_OVERSAMPLING_8)
+  {
+    /* OVER8: BRR[3] is forced 0 and BRR[2:0] hold the fraction in 1/8ths,
+     * so USARTDIV = (BRR & 0xFFF0) + ((BRR & 0x7) << 1), rate = 2*fck/DIV. */
+    uint32_t usartdiv = (brr & 0xFFF0U) + ((brr & 0x0007U) << 1U);
+    if (usartdiv == 0U)
+    {
+      return 0U;
+    }
+    return (uint32_t)(((uint64_t)fck * 2ULL) / (uint64_t)usartdiv);
+  }
+  return fck / brr;
+}
+
 t_stream *bsp_uart_get_stream(t_uart_id id)
 {
   /* Validate */
@@ -228,7 +291,8 @@ t_stream *bsp_uart_get_stream(t_uart_id id)
 
 int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout)
 {
-  uint32_t flags;
+  uint32_t flags = 0U;    /* must be zeroed: the EXIT path reads it even when
+                           * we jump there before tx_event_flags_get() runs */
   int32_t  status;
 
   /* Validate */
@@ -243,7 +307,7 @@ int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout
 
   /* Acquire and clear events */
   rtos_mutex_acquire(&uart[id].rtos.mtx_rx, true);
-  rtos_clear_event(&uart[id].rtos.evt, UART_STATUS_ALL);
+  rtos_clear_event(&uart[id].rtos.evt_rx, UART_STATUS_ALL);
 
   /* Handle cache */
   bsp_mcu_cache_clean_invalidate((uint32_t*)buff, size);
@@ -266,10 +330,13 @@ int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout
   }
 
   /* Wait for event */
-  status = tx_event_flags_get(&uart[id].rtos.evt, UART_STATUS_RX_CPLT | UART_STATUS_ERROR, TX_OR_CLEAR, &flags, timeout);
-  if (status == TX_NO_EVENTS)
+  status = tx_event_flags_get(&uart[id].rtos.evt_rx, UART_STATUS_RX_CPLT | UART_STATUS_ERROR, TX_OR_CLEAR, &flags, timeout);
+  if ((status == TX_NO_EVENTS) || (flags & UART_STATUS_ERROR))
   {
-    /* On timeout, abort */
+    /* Abort on timeout AND on error. For a framing/noise error in IT mode the
+     * HAL takes its "non-blocking" branch and leaves RxState == BUSY_RX, so
+     * without this abort every subsequent HAL_UARTEx_ReceiveToIdle_IT()
+     * returns HAL_BUSY and the caller spins while bytes arrive unread. */
     HAL_UART_AbortReceive(&uart[id].bsp.huart);
   }
 
@@ -296,7 +363,7 @@ int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout
 
 int32_t bsp_uart_write(t_uart_id id, const uint8_t* buff, size_t size, uint32_t timeout)
 {
-  uint32_t flags;
+  uint32_t flags = 0U;    /* see bsp_uart_read(): the EXIT path reads this */
   int32_t  status;
 
   /* Validate */
@@ -311,7 +378,7 @@ int32_t bsp_uart_write(t_uart_id id, const uint8_t* buff, size_t size, uint32_t 
 
   /* Acquire and clear events */
   rtos_mutex_acquire(&uart[id].rtos.mtx_tx, true);
-  rtos_clear_event(&uart[id].rtos.evt, UART_STATUS_ALL);
+  rtos_clear_event(&uart[id].rtos.evt_tx, UART_STATUS_ALL);
 
   /* Handle cache */
   bsp_mcu_cache_clean((uint32_t*)buff, size);
@@ -334,11 +401,13 @@ int32_t bsp_uart_write(t_uart_id id, const uint8_t* buff, size_t size, uint32_t 
   }
 
   /* Wait for event */
-  status = tx_event_flags_get(&uart[id].rtos.evt, UART_STATUS_TX_CPLT | UART_STATUS_ERROR, TX_OR_CLEAR, &flags, timeout);
+  status = tx_event_flags_get(&uart[id].rtos.evt_tx, UART_STATUS_TX_CPLT | UART_STATUS_ERROR, TX_OR_CLEAR, &flags, timeout);
   if (status == TX_NO_EVENTS)
   {
-    /* On timeout, abort */
-    HAL_UART_AbortReceive(&uart[id].bsp.huart);
+    /* On timeout, abort the TRANSMITTER. This used to call
+     * HAL_UART_AbortReceive(), which tore down the receiver on every TX
+     * timeout -- so a slow far end killed the RX path as a side effect. */
+    HAL_UART_AbortTransmit(&uart[id].bsp.huart);
   }
 
   /* Handle exit */
@@ -400,6 +469,13 @@ static int32_t _bsp_uart_init_gpio(t_uart_id id)
       /* Start clocks */
       USART2_RX_CLK_ENABLE();
       USART2_TX_CLK_ENABLE();
+
+      /* No internal pull on the USART2 (MangOH modem) lines. This link runs
+       * through the mangOH Yellow CN805 FXMA108 auto-direction level shifter,
+       * which requires any resistor on its data lines to be >50k; the STM32's
+       * ~40k internal pull-up disturbs its direction/one-shot circuitry and
+       * kills the modem->camera RX path. UART1 keeps its default pull. */
+      gpio.Pull      = GPIO_NOPULL;
 
       /* Set specifics */
       gpio.Pin       = USART2_RX_PIN;
@@ -638,7 +714,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
     }
     /* Handle internal */
     _uart_recv[idx] = size;
-    rtos_raise_event(&uart[idx].rtos.evt, UART_STATUS_RX_CPLT);
+    rtos_raise_event(&uart[idx].rtos.evt_rx, UART_STATUS_RX_CPLT);
     if (uart[idx].bsp.irq_cb)
     {
       uart[idx].bsp.irq_cb(idx, UART_STATUS_RX_CPLT);
@@ -658,7 +734,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
       continue;
     }
     /* Handle internal */
-    rtos_raise_event(&uart[idx].rtos.evt, UART_STATUS_TX_CPLT);
+    rtos_raise_event(&uart[idx].rtos.evt_tx, UART_STATUS_TX_CPLT);
     if (uart[idx].bsp.irq_cb)
     {
       uart[idx].bsp.irq_cb(idx, UART_STATUS_TX_CPLT);
@@ -677,8 +753,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     {
       continue;
     }
-    /* Handle internal */
-    rtos_raise_event(&uart[idx].rtos.evt, UART_STATUS_ERROR);
+    /* Handle internal. An error can strand a waiter on either side, so raise
+     * it on both groups -- whichever direction is blocked needs to see it. */
+    _uart_errors[idx]++;
+    rtos_raise_event(&uart[idx].rtos.evt_rx, UART_STATUS_ERROR);
+    rtos_raise_event(&uart[idx].rtos.evt_tx, UART_STATUS_ERROR);
     if (uart[idx].bsp.irq_cb)
     {
       uart[idx].bsp.irq_cb(idx, UART_STATUS_ERROR);

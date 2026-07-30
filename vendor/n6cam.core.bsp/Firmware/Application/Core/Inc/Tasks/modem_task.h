@@ -43,6 +43,35 @@ extern "C" {
  *  @param  user_ctx Pointer passed to modem_set_urc_callback. */
 typedef void (*t_modem_urc_cb)(const char *line, size_t len, void *user_ctx);
 
+/** Link diagnostics, reported by `mdm stats`.
+ *
+ *  Every layer of this link discards malformed input silently — bytes seen
+ *  before an opening 0x7E, frames whose CRC fails, responses that arrive
+ *  after a timeout. That makes a half-working link look exactly like a dead
+ *  one from the shell. These counters separate the cases:
+ *
+ *    rx_bytes == 0                  → nothing reaching PF6 at all
+ *    rx_bytes > 0, rx_stray high    → bytes arrive but never frame: far end
+ *                                     isn't speaking HDLC, or baud/levels are
+ *                                     wrong enough to corrupt every flag byte
+ *    rx_bad > 0                     → flags found but CRC fails: framing is
+ *                                     right, the line is corrupting payload
+ *    uart_errors climbing           → ORE/FE/NE at the peripheral
+ *    rx_frames > 0                  → the RX path is healthy end to end
+ */
+typedef struct
+{
+  uint32_t rx_bytes;      /*!< raw bytes read off USART2 */
+  uint32_t rx_frames;     /*!< CRC-valid HDLC frames decoded */
+  uint32_t rx_bad;        /*!< frames dropped: bad CRC or decoder overflow */
+  uint32_t rx_stray;      /*!< bytes seen outside any frame */
+  uint32_t rx_errors;     /*!< bsp_uart_read() error returns */
+  uint32_t rx_timeouts;   /*!< bsp_uart_read() timeouts (idle link) */
+  uint32_t tx_frames;     /*!< HDLC frames written to USART2 */
+  uint32_t tx_errors;     /*!< bsp_uart_write() failures */
+  uint32_t uart_errors;   /*!< USART2 ORE/FE/NE count (from the BSP) */
+} t_modem_stats;
+
 /**
  * @brief Start the modem task.
  * @return Error code (0 on success).
@@ -124,6 +153,28 @@ void modem_set_urc_callback(t_modem_urc_cb cb, void *user_ctx);
  * @param  len        Length of `line`.
  */
 void modem_inject_rx(const uint8_t *line, size_t len);
+
+/**
+ * @brief Snapshot the link diagnostics counters.
+ * @param out  Destination struct (ignored if NULL).
+ */
+void modem_get_stats(t_modem_stats *out);
+
+/**
+ * @brief Zero the link diagnostics counters (the USART2 error count kept by
+ *        the BSP is cumulative since boot and is not affected).
+ */
+void modem_reset_stats(void);
+
+/**
+ * @brief Enable/disable the raw RX hex dump to the trace log.
+ *
+ *        Off by default — at 115200 a chatty link can outrun the trace sink.
+ *        Turn it on only while diagnosing, via `mdm raw on`.
+ *
+ * @param  on  true to dump every received burst as hex.
+ */
+void modem_set_raw_dump(bool on);
 
 #ifdef __cplusplus
 }

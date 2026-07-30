@@ -30,12 +30,36 @@
 
 | Signal       | J503 pin | STM32N657 pin | Function | Direction |
 |---|---|---|---|---|
-| USART2 TX    | 7        | PF7 / AF7     | UART transmit to MangOH RX | OUT |
+| USART2 TX    | 7        | **PG3** / AF7 | UART transmit to MangOH RX | OUT |
 | USART2 RX    | 9        | PF6 / AF7     | UART receive from MangOH TX | IN |
 | GND          | 11       | —             | Common ground | — |
 | +3V3 (opt)   | 13       | —             | Logic-level reference | — |
 
+> **TX is PG3, not PF7.** Earlier revisions of this table said PF7; the firmware
+> has always driven **PG3** (`n6cam_io.h`: `USART2_TX_PORT GPIOG` / `GPIO_PIN_3`).
+> Confirm which J503 pin PG3 lands on against the schematic before probing — a
+> cable wired from the old table puts the TX wire on a pin USART2 never drives.
+
 All header logic is **3.3 V**. Match this on the MangOH side — do not drive 5 V into PF6.
+
+### 1.1.1 MangOH Yellow side (CN805 expansion connector)
+
+UART1 is on **CN805 pins 7–8 at 3.3 V**, reaching the WP76 (1.8 V) through a
+**FXMA108 auto-direction level translator**. The Linux node is **`/dev/ttyHS0`**
+(*not* ttyHSL1 — that node exists but isn't muxed out to CN805).
+
+Two things this part imposes:
+
+- **No pull-ups or pull-downs on its data lines.** The datasheet is explicit, and
+  the auto-direction one-shot misreads an externally driven edge as the far side
+  taking over. Any resistor must be >50 kΩ, so the STM32's ~40 kΩ internal pull-up
+  is *not* acceptable — USART2's pins are deliberately `GPIO_NOPULL`
+  (`n6cam_uart.c`, `_bsp_uart_init_gpio`). USART1 keeps its default pull.
+- **Identify TX empirically, don't trust a pinout.** With the camera unplugged
+  and `sdvrApp` running, whichever of pins 7/8 carries the `+SDVRRDY` burst on
+  `app restart sdvrApp` is the WP76's TX. That burst is a complete HDLC frame and
+  is readable in any terminal at 115200 8N1:
+  `7e 2b 53 44 56 52 52 44 59 3a 20 ... 0d 0a <crc-hi> <crc-lo> 7e`
 
 ### 1.2 SD card
 
