@@ -214,6 +214,18 @@ void Error_Handler(void);
 #define TX_EVT_SHELL_REQUIRE        (TX_EVT_SYSTEM_READY | TX_EVT_UX_CDC_READY)
 #define TX_EVT_SHELL_READY          (ENABLE_SHELL? BIT(20U) : 0U)
 
+/* modem_task must not touch USART2 until the clock tree is final.
+ *
+ * modem_task runs at APP_PRIO_USER_INTERFACE, system_task at
+ * APP_PRIO_BACKGROUND (the lowest priority in the system), so modem_task is
+ * always scheduled FIRST. Initialising USART2 there computes BRR from the
+ * BootROM-default kernel clock; _system_config_clocks() then reprograms
+ * PLL1/IC14/PCLK and the divisor is left stale, so USART2 ends up running at
+ * the wrong line rate while USART1 (initialised inside system_task, after the
+ * clock config) is correct. A TX->RX loopback cannot detect this because both
+ * directions share the same wrong divisor. */
+#define TX_EVT_MODEM_REQUIRE        (TX_EVT_BSP_READY)
+
 /*----------------------------------------------------------------------------*/
 #ifdef  __cplusplus
 }

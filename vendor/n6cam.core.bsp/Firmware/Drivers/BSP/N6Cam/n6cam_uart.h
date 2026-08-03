@@ -117,7 +117,14 @@ typedef struct
 /** UART RTOS instance */
 typedef struct
 {
-  TX_EVENT_FLAGS_GROUP  evt;
+  /* RX and TX own SEPARATE event-flag groups on purpose. They used to share
+   * one, and since both bsp_uart_read() and bsp_uart_write() clear
+   * UART_STATUS_ALL on entry, a transmit from one task would wipe the
+   * RX-complete/error flags out from under a concurrent reader in another
+   * task -- silently losing the burst that carried the reply. The mtx_rx /
+   * mtx_tx mutexes do not serialise the two directions against each other. */
+  TX_EVENT_FLAGS_GROUP  evt_rx;
+  TX_EVENT_FLAGS_GROUP  evt_tx;
   TX_MUTEX              mtx_rx;
   TX_MUTEX              mtx_tx;
 } t_uart_rtos;
@@ -172,6 +179,33 @@ int32_t bsp_uart_set_mode(t_uart_id id, t_uart_mode mode_rx, t_uart_mode mode_tx
  * @return Stream instance
  */
 t_stream *bsp_uart_get_stream(t_uart_id id);
+
+/**
+ * @brief Get the cumulative peripheral error count (ORE/FE/NE) for a UART
+ * @param id      UART ID
+ * @return Error count since boot, or 0 for an invalid id
+ */
+uint32_t bsp_uart_get_errors(t_uart_id id);
+
+/**
+ * @brief Get the UART's kernel (source) clock frequency in Hz
+ * @param id      UART ID
+ * @return Frequency in Hz, or 0 for an invalid id
+ */
+uint32_t bsp_uart_get_kernel_clock(t_uart_id id);
+
+/**
+ * @brief Get the line rate the UART is ACTUALLY running at, derived from the
+ *        live BRR and kernel clock.
+ *
+ *        Differs from Init.BaudRate whenever the kernel clock changed after
+ *        HAL_UART_Init() computed BRR. A TX->RX loopback cannot detect that
+ *        condition, since both directions share the same wrong divisor.
+ *
+ * @param id      UART ID
+ * @return Actual baud rate, or 0 if unknown/uninitialised
+ */
+uint32_t bsp_uart_get_actual_baud(t_uart_id id);
 
 /**
  * @brief Read from UART

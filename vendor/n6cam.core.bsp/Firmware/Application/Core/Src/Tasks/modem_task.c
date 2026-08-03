@@ -29,6 +29,7 @@
 #include "tx_app.h"
 #include "n6cam_uart.h"
 #include "n6cam_rtos.h"
+#include "n6cam_error.h"
 
 #include "hdlc.h"
 #include "modem_task.h"
@@ -75,11 +76,19 @@ typedef struct
   /* URC callback */
   t_modem_urc_cb        urc_cb;
   void                 *urc_ctx;
+
+  /* Link diagnostics. Every layer below this one discards malformed input
+   * silently, so without these counters "nothing on the wire" and "bytes
+   * arriving but never framing" look identical from the shell. Surfaced by
+   * `mdm stats`; the raw hex dump is opt-in via `mdm raw on`. */
+  t_modem_stats         stats;
+  bool                  raw_dump;
 } t_modem_task;
 
 static uint8_t          _modem_stack[MODEM_TASK_STACK_SIZE];
 static t_modem_task     _m;
 static const char       _crlf[] = "\r\n";
+static const char       _hexd[] = "0123456789abcdef";
 
 /*----------------------------------------------------------------------------*/
 /* Helpers                                                                    */
@@ -171,19 +180,57 @@ static void _dispatch_frame(const uint8_t *frame, size_t len)
   }
 }
 
+/* Hex-dump one received burst to the trace log. Opt-in (`mdm raw on`): at
+ * 115200 a chatty link can outrun the trace sink. */
+static void _dump_raw(const uint8_t *buf, size_t len)
+{
+  char line[(3U * 16U) + 1U];
+  for (size_t off = 0U; off < len; off += 16U)
+  {
+    size_t n = ((len - off) < 16U) ? (len - off) : 16U;
+    size_t p = 0U;
+    for (size_t i = 0U; i < n; i++)
+    {
+      line[p++] = _hexd[(buf[off + i] >> 4) & 0x0FU];
+      line[p++] = _hexd[buf[off + i] & 0x0FU];
+      line[p++] = ' ';
+    }
+    line[p] = '\0';
+    LINFO(TRACE_MODEM, "rx raw +%u: %s", (unsigned)off, line);
+  }
+}
+
 /* Drive the HDLC decoder with one received chunk. */
 static void _feed_chunk(const uint8_t *buf, size_t len)
 {
+  _m.stats.rx_bytes += (uint32_t)len;
+  if (_m.raw_dump)
+  {
+    _dump_raw(buf, len);
+  }
+
   for (size_t i = 0U; i < len; i++)
   {
     size_t finished = 0U;
+
+    /* Count bytes that arrive while we are between frames. A far end that
+     * speaks plain AT, or a baud/level mismatch, shows up here as a large
+     * rx_stray with rx_frames stuck at zero -- otherwise indistinguishable
+     * from a dead wire, since hdlc_decoder_feed() drops these silently. */
+    if (!_m.dec.in_frame && (buf[i] != HDLC_FLAG))
+    {
+      _m.stats.rx_stray++;
+    }
+
     if (!hdlc_decoder_feed(&_m.dec, buf[i], &finished))
     {
       /* Bad CRC / overflow — decoder is already reset; just keep going. */
+      _m.stats.rx_bad++;
       continue;
     }
     if (finished > 0U)
     {
+      _m.stats.rx_frames++;
       _dispatch_frame(_m.dec_out, finished);
       /* Re-arm decoder by re-init'ing — same buffer. */
       hdlc_decoder_init(&_m.dec, _m.dec_out, sizeof(_m.dec_out));
@@ -204,7 +251,30 @@ static int32_t _tx_framed(const uint8_t *payload, size_t payload_len,
     return -1;
   }
   int32_t rc = bsp_uart_write(MODEM_UART, wire, wire_len, timeout_ms);
-  return (rc >= 0) ? 0 : -1;
+  if (rc >= 0)
+  {
+    _m.stats.tx_frames++;
+    return 0;
+  }
+  _m.stats.tx_errors++;
+  return -1;
+}
+
+void modem_get_stats(t_modem_stats *out)
+{
+  if (out == NULL) return;
+  *out = _m.stats;
+  out->uart_errors = bsp_uart_get_errors(MODEM_UART);
+}
+
+void modem_reset_stats(void)
+{
+  memset(&_m.stats, 0, sizeof(_m.stats));
+}
+
+void modem_set_raw_dump(bool on)
+{
+  _m.raw_dump = on;
 }
 
 /*----------------------------------------------------------------------------*/
@@ -247,11 +317,26 @@ int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
     return -1;
   }
 
-  /* Wait for terminator or timeout. ThreadX ticks at 100 Hz here. */
+  /* Wait for terminator or timeout.
+   *
+   * Derive ticks from TX_TIMER_TICKS_PER_SECOND rather than hard-coding a
+   * divisor. This used to divide by 10 for a 100 Hz tick, but the app builds
+   * with tx_user.h's TX_TIMER_TICKS_PER_SECOND == 1000, so every `mdm`
+   * command waited only a tenth of its intended timeout (~200 ms instead of
+   * 2000 ms). The WP76 answers through Legato's le_atServer and a PTY, which
+   * routinely takes longer than that -- so the reply landed AFTER we had
+   * already given up and reported "no modem?", and the partial response in
+   * _m.resp_buf was discarded below. A TX->RX jumper loopback hides this
+   * completely, because the echo comes back in microseconds. */
   ULONG  got = 0U;
+  ULONG  timeout_ticks = ((ULONG)timeout_ms * TX_TIMER_TICKS_PER_SECOND) / 1000UL;
+  if (timeout_ticks == 0U)
+  {
+    timeout_ticks = 1U;
+  }
   UINT   tx_status = tx_event_flags_get(
       &_m.evt, MODEM_EVT_RESP_DONE | MODEM_EVT_RESP_OVERFLOW,
-      TX_OR_CLEAR, &got, (ULONG)(timeout_ms / 10U));
+      TX_OR_CLEAR, &got, timeout_ticks);
 
   int32_t out = 0;
   rtos_mutex_acquire(&_m.resp_mtx, true);
@@ -340,6 +425,13 @@ static void _modem_task_run(uint32_t args)
 
   LINFO(TRACE_MODEM, "Task started");
 
+  /* Wait for the BSP — specifically the clock tree — before touching USART2.
+   * Without this the UART's BRR is computed against the BootROM-default
+   * kernel clock and then invalidated when _system_config_clocks() switches
+   * to PLL1/IC14, leaving USART2 transmitting and receiving at the wrong
+   * line rate. See TX_EVT_MODEM_REQUIRE in common.h for the full rationale. */
+  task_wait_event(TX_EVT_MODEM_REQUIRE);
+
   /* Bring up USART2. */
   int32_t status = bsp_uart_init(MODEM_UART, MODEM_UART_BAUD, false);
   if (status != 0)
@@ -349,7 +441,10 @@ static void _modem_task_run(uint32_t args)
   else
   {
     bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
-    LINFO(TRACE_MODEM, "USART2 up @ %u baud, awaiting MangOH", (unsigned)MODEM_UART_BAUD);
+    LINFO(TRACE_MODEM, "USART2 up @ %u baud (fck=%lu Hz, actual=%lu baud)",
+          (unsigned)MODEM_UART_BAUD,
+          (unsigned long)bsp_uart_get_kernel_clock(MODEM_UART),
+          (unsigned long)bsp_uart_get_actual_baud(MODEM_UART));
   }
 
   hdlc_decoder_init(&_m.dec, _m.dec_out, sizeof(_m.dec_out));
@@ -362,8 +457,22 @@ static void _modem_task_run(uint32_t args)
     {
       _feed_chunk(rx, (size_t)n);
     }
-    /* On timeout / error / 0-byte, just retry. The shell can still inject
-     * test traffic via modem_inject_rx in the meantime. */
+    else if (n == BSP_ERROR_TIMEOUT)
+    {
+      /* Idle link — expected once a second while nothing is arriving. */
+      _m.stats.rx_timeouts++;
+    }
+    else if (n < 0)
+    {
+      /* Framing/noise/overrun on the line. bsp_uart_read() now aborts the
+       * stalled transfer so the next call can re-arm, but yield anyway: with
+       * no delay a persistent error spins this task at 100% CPU and starves
+       * everything below it. A climbing rx_errors with rx_bytes at zero means
+       * bytes ARE hitting PF6 but are malformed. */
+      _m.stats.rx_errors++;
+      tx_thread_sleep(2U);
+    }
+    /* The shell can still inject test traffic via modem_inject_rx. */
   }
 }
 
