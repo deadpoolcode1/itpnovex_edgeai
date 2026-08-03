@@ -3172,11 +3172,12 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     modem_get_stats(&st);
     CMD_PRINTF(stream,
       "rx: bytes=%lu frames=%lu badcrc=%lu stray=%lu err=%lu timeouts=%lu%s"
-      "tx: frames=%lu err=%lu   usart2 err(ORE/FE/NE)=%lu%s",
+      "tx: frames=%lu err=%lu retries=%lu   usart2 err(ORE/FE/NE)=%lu%s",
       (unsigned long)st.rx_bytes, (unsigned long)st.rx_frames,
       (unsigned long)st.rx_bad,   (unsigned long)st.rx_stray,
       (unsigned long)st.rx_errors,(unsigned long)st.rx_timeouts, lwshell_eol(),
       (unsigned long)st.tx_frames,(unsigned long)st.tx_errors,
+      (unsigned long)st.tx_retries,
       (unsigned long)st.uart_errors, lwshell_eol());
     /* Report the line rate the peripheral is REALLY running at. If this is
      * not 115200 the link cannot work, however good the wiring is -- and a

@@ -34,6 +34,11 @@ extern "C" {
 /** Per-call timeout default for AT command request/response. */
 #define MODEM_AT_TIMEOUT_MS (2000U)
 
+/** Attempts per modem_send_at() call: one send plus one retry on timeout.
+ *  Backstop under the flag preamble in _tx_framed(); see the comment there
+ *  for the CN805 direction-latch behaviour both are defending against. */
+#define MODEM_AT_ATTEMPTS   (2U)
+
 /** Maximum line length we'll forward as a URC. */
 #define MODEM_URC_MAX       (512U)
 
@@ -69,6 +74,7 @@ typedef struct
   uint32_t rx_timeouts;   /*!< bsp_uart_read() timeouts (idle link) */
   uint32_t tx_frames;     /*!< HDLC frames written to USART2 */
   uint32_t tx_errors;     /*!< bsp_uart_write() failures */
+  uint32_t tx_retries;    /*!< commands re-sent after a response timeout */
   uint32_t uart_errors;   /*!< USART2 ORE/FE/NE count (from the BSP) */
 } t_modem_stats;
 
