@@ -151,6 +151,13 @@ cmd_bsp_clone() {
         info "BSP already cloned at ${BSP_DIR}"
         return 0
     fi
+    # The BSP is also vendored straight into this repo (no nested .git). Treat a
+    # populated Firmware/ tree as "already present" so build works on a fresh
+    # checkout without Bitbucket credentials.
+    if [ -d "${BSP_DIR}/Firmware/STM32CubeIDE" ]; then
+        info "BSP vendored in-tree at ${BSP_DIR}"
+        return 0
+    fi
     step "Cloning SIANA N6Cam BSP (~218 MB)"
     mkdir -p "$(dirname "${BSP_DIR}")"
     git clone --depth 1 "${BSP_REPO_URL}" "${BSP_DIR}"
@@ -180,24 +187,60 @@ cmd_build() {
 
     mkdir -p "${CUBEIDE_WORKSPACE}"
 
+    # Build output goes to a log and is filtered for diagnostics rather than
+    # piped through `tail -5`. The tail was hiding real link errors: headless
+    # CubeIDE ends with a build-complete banner whether or not the link
+    # succeeded, so the last five lines looked identical for a good build and
+    # for one that silently kept the previous Application.bin. Two cycles were
+    # spent flashing a stale binary because of it.
+    #
+    # run_cubeide_build <project> <config> <artifact> — fails the script on any
+    # reported error, and on an artifact that did not change.
+    run_cubeide_build() {
+        local project="$1" config="$2" artifact="$3"
+        local log="${CUBEIDE_WORKSPACE}/build-${project}.log"
+        local before_stamp=""
+        [ -f "$artifact" ] && before_stamp="$(stat -c'%Y:%s' "$artifact")"
+
+        "${CUBEIDE_BIN}" \
+            --launcher.suppressErrors -nosplash \
+            -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
+            -data "${CUBEIDE_WORKSPACE}" \
+            -import "${BSP_DIR}/Firmware/STM32CubeIDE/${project}" \
+            -build "${config}" >"$log" 2>&1
+        local rc=$?
+
+        # Surface warnings and errors regardless of exit status — the headless
+        # builder has been seen to exit 0 with errors in the log.
+        grep -nE "(^|[: ])(error|Error|ERROR|undefined reference|multiple definition)" "$log" \
+            | grep -vE "0 errors?|errors?: 0" | head -40 && true
+        grep -cE "^.*warning:" "$log" | awk '{if ($1>0) printf "  %s compiler warning(s) — see '"$log"'\n", $1}'
+
+        if [ $rc -ne 0 ] || grep -qE "undefined reference|multiple definition|Error [0-9]+|make: \*\*\*" "$log"; then
+            tail -30 "$log"
+            error "${project} build failed (rc=$rc) — full log: $log"
+        fi
+        [ -f "$artifact" ] || error "${artifact##*/} not produced — full log: $log"
+
+        # Say plainly whether this produced a new binary. Not an error: an
+        # unchanged FSBL is normal when only Application sources were touched.
+        # It is reported because the failure this replaced was invisible —
+        # `tail -5` showed a success banner while a stale binary was reused,
+        # and two flash cycles were spent on it.
+        if [ -n "$before_stamp" ] && [ "$before_stamp" = "$(stat -c'%Y:%s' "$artifact")" ]; then
+            warn "${artifact##*/} UNCHANGED — nothing recompiled in ${project}. \
+Expected if you edited no ${project} source; otherwise the build was a no-op."
+        else
+            info "${artifact##*/} rebuilt"
+        fi
+    }
+
     step "Building FSBL/Release (headless CubeIDE)"
-    "${CUBEIDE_BIN}" \
-        --launcher.suppressErrors -nosplash \
-        -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
-        -data "${CUBEIDE_WORKSPACE}" \
-        -import "${BSP_DIR}/Firmware/STM32CubeIDE/FSBL" \
-        -build "FSBL/Release" 2>&1 | tail -5
-    [ -f "${FSBL_BIN}" ] || error "FSBL.bin not produced"
+    run_cubeide_build "FSBL" "FSBL/Release" "${FSBL_BIN}"
     success "FSBL: $(stat -c%s "${FSBL_BIN}") bytes"
 
     step "Building Application/Release (headless CubeIDE)"
-    "${CUBEIDE_BIN}" \
-        --launcher.suppressErrors -nosplash \
-        -application org.eclipse.cdt.managedbuilder.core.headlessbuild \
-        -data "${CUBEIDE_WORKSPACE}" \
-        -import "${BSP_DIR}/Firmware/STM32CubeIDE/Application" \
-        -build "Application/Release" 2>&1 | tail -5
-    [ -f "${APP_BIN}" ] || error "Application.bin not produced"
+    run_cubeide_build "Application" "Application/Release" "${APP_BIN}"
     success "Application: $(stat -c%s "${APP_BIN}") bytes"
 
     step "Signing binaries (-hv 2.3 -align, for STM32CubeProgrammer 2.21+)"
