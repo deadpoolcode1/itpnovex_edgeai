@@ -92,3 +92,7 @@ results/soak-*/*_artifacts/
 vendor/n6cam.core.bsp/Firmware/Model/_backup_*/
 # Local Claude Code settings
 .claude/
+
+# Scopus whole-system + integration suite reports — regenerated per run
+scopus/results/
+scopus/**/__pycache__/
