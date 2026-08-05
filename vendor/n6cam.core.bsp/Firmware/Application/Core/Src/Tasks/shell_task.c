@@ -977,6 +977,17 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   if (strcmp(sub, "upload") == 0)
   {
     uint8_t hdr[FRAME_HDR_SIZE];
+
+    /* Claim the stream for the whole transaction, banner included, BEFORE
+     * printing it. _stream_read_exact sets this too, but that is one line too
+     * late: the host sends `frame upload` and then reads for this banner, so a
+     * notification emitted in the gap between the command and the banner is
+     * what the host reads as the banner. It then streams the payload into a
+     * kit that is no longer expecting it, and the upload fails with an empty
+     * banner — reproducible on the bench simply by running the injector while
+     * detection is live. */
+    _shell_binary_rx = true;
+
     CMD_PRINTF(stream,
       "Ready. Send: 'FRMI' + size_le(4) + crc32_le(4) + %u bytes RGB%s",
       (unsigned)FRAME_EXPECTED_SIZE, lwshell_eol());
@@ -985,11 +996,13 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if (n != (int32_t)FRAME_HDR_SIZE)
     {
       CMD_PRINTF(stream, "ERROR: header timeout (%ld bytes)%s", (long)n, lwshell_eol());
+      _shell_binary_rx = false;
       return LWSHELL_OK;
     }
     if (memcmp(hdr, FRAME_MAGIC, 4) != 0)
     {
       CMD_PRINTF(stream, "ERROR: bad magic%s", lwshell_eol());
+      _shell_binary_rx = false;
       return LWSHELL_OK;
     }
     uint32_t size = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
@@ -998,12 +1011,14 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     {
       CMD_PRINTF(stream, "ERROR: size=%lu, expected %u%s",
                  (unsigned long)size, (unsigned)FRAME_EXPECTED_SIZE, lwshell_eol());
+      _shell_binary_rx = false;
       return LWSHELL_OK;
     }
     n = _stream_read_exact(stream, _frame_test_buf, size, FRAME_RX_TIMEOUT_MS);
     if (n != (int32_t)size)
     {
       CMD_PRINTF(stream, "ERROR: payload short (%ld/%lu)%s", (long)n, (unsigned long)size, lwshell_eol());
+      _shell_binary_rx = false;
       return LWSHELL_OK;
     }
     uint32_t got_crc = _crc32(_frame_test_buf, size);
@@ -1011,6 +1026,7 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     {
       CMD_PRINTF(stream, "ERROR: CRC mismatch (got 0x%08lx, expected 0x%08lx)%s",
                  (unsigned long)got_crc, (unsigned long)expect_crc, lwshell_eol());
+      _shell_binary_rx = false;
       return LWSHELL_OK;
     }
 
@@ -1026,6 +1042,7 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     CMD_PRINTF(stream, "frame upload: ok (%lu bytes, CRC 0x%08lx)%s",
                (unsigned long)size, (unsigned long)got_crc, lwshell_eol());
     _cmd_ack(stream, argv, argc);
+    _shell_binary_rx = false;
     return LWSHELL_OK;
   }
 
@@ -2229,18 +2246,23 @@ static uint32_t _crc32(const uint8_t *data, size_t len)
 static int32_t _stream_read_exact(const t_stream *stream, uint8_t *buf, size_t size, uint32_t timeout_ms)
 {
   size_t got = 0;
+  /* Save/restore rather than set/clear: a caller that owns a whole multi-read
+   * transaction (header then payload, see `frame upload`) has already claimed
+   * the stream, and clearing it here would open a gap between the two reads
+   * for a notification to land in. */
+  bool was_binary = _shell_binary_rx;
   _shell_binary_rx = true;
   while (got < size)
   {
     int32_t n = stream_read(stream, buf + got, size - got, timeout_ms);
     if (n <= 0)
     {
-      _shell_binary_rx = false;
+      _shell_binary_rx = was_binary;
       return (int32_t)got;  /* return what we have on timeout/error */
     }
     got += (size_t)n;
   }
-  _shell_binary_rx = false;
+  _shell_binary_rx = was_binary;
   return (int32_t)got;
 }
 
