@@ -41,6 +41,7 @@
 #include "stai.h"
 #include "stai_network.h"
 #include "snapshot_task.h"
+#include "shell_task.h"
 #include "n6cam_rtc.h"
 
 /*-------------------------------------------------------------------------*//**
@@ -380,8 +381,18 @@ static void _nn_task_run(uint32_t args)
            * — we can't block inference waiting for SD. */
           (void)snapshot_request(fname);
         }
-        /* bit1 = report cellular: handled when modem channel is wired
-         * (W11/W13). For now we still log the detection via trace. */
+        /* bit1 = report: emit the SoW §6 notification for this detection.
+         * shell_notify_emit writes it to the CDC shell and queues it to the
+         * modem; the modem leg is asynchronous, so this returns in
+         * microseconds and inference is not held behind the UART link.
+         *
+         * rsn=0x10 is the §4.2 "people detected" bit and rsd carries the
+         * count — the same pair `detect simulate` reports, so a simulated
+         * detection and a real one are indistinguishable downstream. */
+        if (_nn_action_mask & 0x02U)
+        {
+          shell_notify_emit(0x10U, cur_boxes, false);
+        }
         LINFO(TRACE_NN, "detected %lu object(s)", (unsigned long)cur_boxes);
       }
       _nn_prev_boxes = cur_boxes;

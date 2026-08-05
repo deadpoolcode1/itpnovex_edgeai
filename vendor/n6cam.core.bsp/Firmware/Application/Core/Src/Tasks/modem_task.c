@@ -49,6 +49,17 @@
 #define MODEM_EVT_RESP_DONE     BIT(0U)         /* set when an OK/ERROR is seen */
 #define MODEM_EVT_RESP_OVERFLOW BIT(1U)         /* set when reply buffer fills */
 
+/* The notifier worker: its own thread, its own event group. It must not
+ * share modem_task's group — modem_send_at clears bits there around every
+ * command, and a notifier waiting on the same group would race with it.
+ *
+ * Nor may the notifier's work be folded into _modem_task_run: that loop is
+ * the thing that *receives* the response modem_send_at waits for, so a
+ * modem_send_at call made from it could never complete. */
+#define MODEM_NOTIFY_TASK_STACK (2U * 1024U)
+#define MODEM_NOTIFY_PRIO       APP_PRIO_USER_INTERFACE
+#define MODEM_EVT_NOTIFY_WORK   BIT(0U)         /* something is in the queue */
+
 /*----------------------------------------------------------------------------*/
 /* State                                                                      */
 /*----------------------------------------------------------------------------*/
@@ -83,9 +94,20 @@ typedef struct
    * `mdm stats`; the raw hex dump is opt-in via `mdm raw on`. */
   t_modem_stats         stats;
   bool                  raw_dump;
+
+  /* Asynchronous notification queue (see modem_notify_async). Single-slot
+   * ring, producer-agnostic: shell_task's notification emitter and the NN
+   * loop both push here rather than blocking on the link themselves. */
+  TX_THREAD             ntf_thread;
+  TX_EVENT_FLAGS_GROUP  ntf_evt;
+  TX_MUTEX              ntf_mtx;      /* protects the ring below */
+  char                  ntf_q[MODEM_NOTIFY_DEPTH][MODEM_NOTIFY_MAX];
+  uint8_t               ntf_head;     /* next slot to send */
+  uint8_t               ntf_count;    /* slots currently occupied */
 } t_modem_task;
 
 static uint8_t          _modem_stack[MODEM_TASK_STACK_SIZE];
+static uint8_t          _modem_ntf_stack[MODEM_NOTIFY_TASK_STACK];
 static t_modem_task     _m;
 static const char       _crlf[] = "\r\n";
 static const char       _hexd[] = "0123456789abcdef";
@@ -472,6 +494,103 @@ int32_t modem_send_binary(const char *prefix_line,
   return 0;
 }
 
+int32_t modem_notify_async(const char *at_line)
+{
+  if ((at_line == NULL) || (at_line[0] == '\0'))
+  {
+    _m.stats.ntf_dropped++;
+    return -1;
+  }
+
+  size_t len = strlen(at_line);
+  if (len >= MODEM_NOTIFY_MAX)
+  {
+    /* Truncating an AT command would send a different command, so refuse.
+     * Loudly: a notification silently shortened to fit is worse than one
+     * that never left. */
+    LERROR(TRACE_MODEM, "notify: line of %u bytes exceeds %u, dropped",
+           (unsigned)len, (unsigned)(MODEM_NOTIFY_MAX - 1U));
+    _m.stats.ntf_dropped++;
+    return -1;
+  }
+
+  rtos_mutex_acquire(&_m.ntf_mtx, true);
+  if (_m.ntf_count >= MODEM_NOTIFY_DEPTH)
+  {
+    rtos_mutex_acquire(&_m.ntf_mtx, false);
+    /* Drop the newest rather than evicting an older one: the queue backs up
+     * only when the link is slow or down, and in that state the earlier
+     * events are the ones with a chance of still being sent. */
+    LWARNING(TRACE_MODEM, "notify: queue full (%u), dropping",
+             (unsigned)MODEM_NOTIFY_DEPTH);
+    _m.stats.ntf_dropped++;
+    return -2;
+  }
+
+  uint8_t slot = (uint8_t)((_m.ntf_head + _m.ntf_count) % MODEM_NOTIFY_DEPTH);
+  memcpy(_m.ntf_q[slot], at_line, len + 1U);
+  _m.ntf_count++;
+  _m.stats.ntf_queued++;
+  rtos_mutex_acquire(&_m.ntf_mtx, false);
+
+  rtos_raise_event(&_m.ntf_evt, MODEM_EVT_NOTIFY_WORK);
+  return 0;
+}
+
+/* Notifier worker: drains the queue one line at a time, blocking on the
+ * modem link so its producers never have to. */
+static void _modem_notify_run(uint32_t args)
+{
+  UNUSED(args);
+
+  /* Same clock-tree dependency as the RX loop — modem_send_at touches
+   * USART2, so don't start before the BSP has switched to PLL1/IC14. */
+  task_wait_event(TX_EVT_MODEM_REQUIRE);
+
+  LINFO(TRACE_MODEM, "Notifier started");
+
+  /* Static: this thread has a 2 KB stack and MODEM_FRAME_MAX is 1 KB. */
+  static char reply[MODEM_FRAME_MAX];
+
+  while (1)
+  {
+    (void)rtos_wait_any_event(&_m.ntf_evt, MODEM_EVT_NOTIFY_WORK, true);
+
+    for (;;)
+    {
+      char line[MODEM_NOTIFY_MAX];
+
+      rtos_mutex_acquire(&_m.ntf_mtx, true);
+      if (_m.ntf_count == 0U)
+      {
+        rtos_mutex_acquire(&_m.ntf_mtx, false);
+        break;
+      }
+      memcpy(line, _m.ntf_q[_m.ntf_head], sizeof(line));
+      _m.ntf_head = (uint8_t)((_m.ntf_head + 1U) % MODEM_NOTIFY_DEPTH);
+      _m.ntf_count--;
+      rtos_mutex_acquire(&_m.ntf_mtx, false);
+
+      reply[0] = '\0';
+      int32_t n = modem_send_at(line, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
+      if ((n >= 0) && (strstr(reply, "OK") != NULL))
+      {
+        _m.stats.ntf_sent++;
+        LINFO(TRACE_MODEM, "notify: sent (%ld B reply)", (long)n);
+      }
+      else
+      {
+        /* Deliberately no retry — see the ntf_unconfirmed note in
+         * modem_task.h. The modem has almost certainly already sent this
+         * one; resending would duplicate the event at the server. */
+        _m.stats.ntf_unconfirmed++;
+        LWARNING(TRACE_MODEM, "notify: no ack rc=%ld reply='%.60s' "
+                 "(likely delivered — ack path is lossy)", (long)n, reply);
+      }
+    }
+  }
+}
+
 void modem_set_urc_callback(t_modem_urc_cb cb, void *user_ctx)
 {
   _m.urc_cb  = cb;
@@ -565,6 +684,17 @@ int32_t modem_task_start(void)
   {
     return -3;
   }
+  /* Async notification queue: own event group + mutex (see the note by
+   * MODEM_EVT_NOTIFY_WORK for why these are not modem_task's). */
+  if (tx_event_flags_create(&_m.ntf_evt, "modem.ntf_evt") != TX_SUCCESS)
+  {
+    return -5;
+  }
+  if (tx_mutex_create(&_m.ntf_mtx, "modem.ntf_mtx", TX_INHERIT) != TX_SUCCESS)
+  {
+    return -6;
+  }
+
   /* Worker thread */
   UINT status = tx_thread_create(
       &_m.thread, "modem.task", _modem_task_run, 0,
@@ -572,5 +702,19 @@ int32_t modem_task_start(void)
       MODEM_TASK_PRIO, MODEM_TASK_PRIO,
       MODEM_TASK_TIME_SLICE, TX_AUTO_START
   );
-  return (status == TX_SUCCESS) ? 0 : -4;
+  if (status != TX_SUCCESS)
+  {
+    return -4;
+  }
+
+  /* Notifier thread. Same priority as the RX loop, so it can only run while
+   * that loop is blocked in bsp_uart_read — which is where it spends its
+   * life — and can never starve it. */
+  status = tx_thread_create(
+      &_m.ntf_thread, "modem.notify", _modem_notify_run, 0,
+      _modem_ntf_stack, sizeof(_modem_ntf_stack),
+      MODEM_NOTIFY_PRIO, MODEM_NOTIFY_PRIO,
+      MODEM_TASK_TIME_SLICE, TX_AUTO_START
+  );
+  return (status == TX_SUCCESS) ? 0 : -7;
 }

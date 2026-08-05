@@ -91,6 +91,22 @@ int32_t shell_task_start(void);
  */
 int32_t shell_stream_set(t_stream *stream);
 
+/**
+ * @brief Emit a SoW §6 notification.
+ *
+ *        Composes the JSON body, writes it to the CDC shell as
+ *        `+SDVRNTF: {...}` and queues it to the modem as an
+ *        AT+SDVRNTFA command. The modem leg is asynchronous, so this
+ *        returns without waiting for the link — safe to call from the NN
+ *        inference loop.
+ *
+ * @param rsn  Reason code (SoW §4.2 bit table: 0x10 people, 0x20 vehicles,
+ *             0x40 photo event, ...).
+ * @param rsd  Reason detail — for a detection, the number of objects.
+ * @param mtn  Motion flag.
+ */
+void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

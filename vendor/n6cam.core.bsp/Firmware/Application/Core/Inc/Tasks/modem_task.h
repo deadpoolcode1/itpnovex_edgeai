@@ -42,6 +42,18 @@ extern "C" {
 /** Maximum line length we'll forward as a URC. */
 #define MODEM_URC_MAX       (512U)
 
+/** Longest AT line modem_notify_async() will accept, and how many may be
+ *  in flight at once. Four is enough to absorb a detection burst without
+ *  making the camera's RAM footprint interesting; a fifth is dropped and
+ *  counted rather than silently overwriting an older one.
+ *
+ *  512 matches the modem's own AT line cap (LE_ATDEFS_COMMAND_MAX_BYTES).
+ *  A §6 notification needs more than a single 128-byte AT parameter once
+ *  `mod`/`bat`/`vol` carry real values, so the body is split across several
+ *  quoted parameters and the quoting overhead lands in this budget. */
+#define MODEM_NOTIFY_MAX    (512U)
+#define MODEM_NOTIFY_DEPTH  (4U)
+
 /** Callback signature for asynchronous modem URCs.
  *  @param  line     Raw line bytes (NUL-terminated, no trailing \r\n).
  *  @param  len      Length of `line` (excluding NUL).
@@ -76,6 +88,22 @@ typedef struct
   uint32_t tx_errors;     /*!< bsp_uart_write() failures */
   uint32_t tx_retries;    /*!< commands re-sent after a response timeout */
   uint32_t uart_errors;   /*!< USART2 ORE/FE/NE count (from the BSP) */
+  uint32_t ntf_queued;      /*!< notifications accepted by modem_notify_async */
+  uint32_t ntf_sent;        /*!< notifications the modem answered OK */
+  /*! Notifications written to the link that no OK came back for.
+   *
+   *  NOT the same as "not delivered", and the difference matters. Measured
+   *  on the bench: of 64 AT+SDVRNTFA commands that reached the modem, 64
+   *  were decoded and 63 produced a UDP datagram (the 64th was a
+   *  deliberately malformed one) — while the camera counted several as
+   *  unconfirmed. The loss is on the *return* path, the same CN805
+   *  direction-latch that eats the occasional reply.
+   *
+   *  This is why the notifier does not retry: the command usually did
+   *  arrive, so a resend would deliver the event to the server twice. Treat
+   *  a non-zero count as "the ack path is lossy", not "events were lost". */
+  uint32_t ntf_unconfirmed;
+  uint32_t ntf_dropped;     /*!< notifications refused: queue full or too long */
 } t_modem_stats;
 
 /**
@@ -130,6 +158,33 @@ int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
 int32_t modem_send_binary(const char *prefix_line,
                           const uint8_t *payload, size_t payload_len,
                           uint32_t timeout_ms);
+
+/**
+ * @brief Queue an AT line to be sent to the modem, without waiting for it.
+ *
+ *        modem_send_at() blocks for up to MODEM_AT_TIMEOUT_MS per attempt.
+ *        That is fine for `mdm <cmd>`, where a human is waiting, and wrong
+ *        for anything on a hot path: calling it inline from the shell's
+ *        notification emitter froze the shell for 10+ seconds, and calling
+ *        it from the NN loop would stall inference behind the modem link.
+ *
+ *        This copies `at_line` into a small queue and returns immediately.
+ *        A dedicated worker thread sends the queued lines one at a time via
+ *        modem_send_at, so they are serialised with each other and with any
+ *        concurrent `mdm` command (all of them go through the tx mutex).
+ *
+ *        The reply is discarded — only the outcome is counted, in the
+ *        ntf_* fields of t_modem_stats. A caller that needs the reply text
+ *        wants modem_send_at, on a thread it is allowed to block.
+ *
+ *        Safe to call from any task context. Not safe from an ISR.
+ *
+ * @param  at_line  NUL-terminated command, no CRLF (e.g. "AT+SDVRNTFA=...").
+ * @return 0 if queued, -1 if `at_line` is NULL/empty/longer than
+ *         MODEM_NOTIFY_MAX-1, -2 if the queue is full. Both failures are
+ *         counted in ntf_dropped.
+ */
+int32_t modem_notify_async(const char *at_line);
 
 /**
  * @brief Register a callback for unsolicited result codes.

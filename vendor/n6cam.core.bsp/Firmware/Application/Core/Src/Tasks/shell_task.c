@@ -238,6 +238,20 @@ static int32_t  _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static __ALIGN_BEGIN uint8_t _frame_test_buf[FRAME_EXPECTED_SIZE] __ALIGN_END IN_PSRAM;
 static bool _frame_loaded = false;
 
+/* True while the shell is part-way through receiving a bulk binary payload
+ * over CDC (a test frame, a tile, a model or firmware image).
+ *
+ * Notifications became asynchronous when the NN task started emitting them:
+ * they are now written by a different task from the one running the shell.
+ * stream_write is locked, so a +SDVRNTF line cannot be cut in half — but it
+ * CAN land between a command and its response. During a bulk transfer that
+ * is not cosmetic: the host is streaming a fixed byte count and reading for
+ * a completion banner, so an unexpected line makes it read the notification
+ * as the banner and abandon the upload mid-payload, which desyncs the shell
+ * for every later command. The detection still reaches the modem — only the
+ * CDC copy is suppressed, and only for the length of the transfer. */
+static volatile bool _shell_binary_rx = false;
+
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
 
@@ -761,27 +775,137 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   return LWSHELL_OK;
 }
 
+/* The AT parameter parser on the modem consumes embedded double quotes, so
+ * the §6 JSON cannot cross AT+SDVRNTFA as-is: `{"ser":1}` arrives as
+ * `{ser:1}` — accepted, and no longer JSON. Substituting one character for
+ * the quote survives intact (measured on the modem; so does the comma, as
+ * long as the parameter is quoted). The modem restores it when the command
+ * carries ENC=1. See Handle_NtfA in the modem app's at_handler.c.
+ *
+ * Backtick is the substitute because it cannot appear in JSON structure.
+ * Every value in the body below is either numeric or a fixed-format
+ * timestamp, so none can contain one. If a free-text field is ever added
+ * here — `mod` is the obvious candidate — it MUST have backticks stripped
+ * first, or one in the input would decode back into a stray quote on the
+ * modem and corrupt the JSON. */
+#define NOTIFY_QUOTE_SUB   '`'
+
+/* atServer rejects any single parameter of 129 bytes or more (measured: 128
+ * accepted, 129 a clean ERROR), so the body is split across as many
+ * parameters as it needs and the modem rejoins them.
+ *
+ * One parameter is NOT enough, which is why this is chunked rather than
+ * checked: the body is 100 bytes today only because `mod` is empty and
+ * `bat`/`vol` are the placeholder 0.0. With real values it is exactly 128
+ * with an empty `mod`, and any `mod` string at all goes over. Chunking means
+ * populating those fields cannot silently stop notifications from being
+ * forwarded. */
+#define NOTIFY_CHUNK_MAX   (128U)
+#define NOTIFY_JSON_MAX    (384U)   /* bounded by the modem's 512-byte line */
+
+/* Compose the SoW §6 notification body and deliver it to both consumers:
+ * the CDC shell, which is what a bench host parses, and the modem, which is
+ * what actually reaches the server.
+ *
+ * The modem leg is queued, never sent inline. modem_send_at blocks for up to
+ * MODEM_AT_TIMEOUT_MS per attempt; an earlier prototype that called it from
+ * here froze the shell for 10+ seconds, and this function is also called
+ * from the NN detection path, where blocking would stall inference. */
 static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 {
   t_datetime dt = { 0 };
   (void)bsp_rtc_get_time(&dt);
   /* 32-bit MCU UID low word as serial */
   uint32_t ser = HAL_GetUIDw0();
-  char buf[256];
-  int n = snprintf(buf, sizeof(buf),
-    "+SDVRNTF: {\"ser\":%lu,\"num\":%lu,\"rsn\":%lu,\"rsd\":%lu,"
+
+  /* The JSON body on its own — the shell line and the AT command need the
+   * same bytes wrapped differently, so build it once. */
+  char json[192];
+  int jn = snprintf(json, sizeof(json),
+    "{\"ser\":%lu,\"num\":%lu,\"rsn\":%lu,\"rsd\":%lu,"
     "\"tim\":\"20%02u%02u%02u%02u%02u%02u\",\"mtn\":%u,"
-    "\"mod\":\"\",\"bat\":0.0,\"vol\":0.0}\r\n",
+    "\"mod\":\"\",\"bat\":0.0,\"vol\":0.0}",
     (unsigned long)ser, (unsigned long)_notify_num,
     (unsigned long)rsn, (unsigned long)rsd,
     (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day,
     (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
     mtn ? 1U : 0U);
-  if ((n > 0) && (_shell.stream != NULL))
+
+  if ((jn > 0) && ((size_t)jn < sizeof(json)))
   {
-    stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "+SDVRNTF: %s\r\n", json);
+    if ((n > 0) && (_shell.stream != NULL) && !_shell_binary_rx)
+    {
+      stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+    }
+
+    if ((size_t)jn > NOTIFY_JSON_MAX)
+    {
+      LERROR(TRACE_SHELL, "notify: body of %d bytes exceeds the %u-byte "
+             "transport limit; not forwarded", jn, (unsigned)NOTIFY_JSON_MAX);
+    }
+    else
+    {
+      /* Substitute inside the body only; the quotes that delimit each AT
+       * parameter are added below and must stay real quotes. SIZE stays the
+       * true body length — the substitution is 1:1, and the modem restores
+       * before it measures anything. */
+      char enc[sizeof(json)];
+      for (int i = 0; i <= jn; i++)
+      {
+        enc[i] = (json[i] == '"') ? NOTIFY_QUOTE_SUB : json[i];
+      }
+
+      /* Split into parameters no larger than the modem's per-parameter cap.
+       * The modem concatenates them back in order (ENC=1). One chunk is the
+       * common case today and is byte-for-byte the single-parameter form. */
+      char at[MODEM_NOTIFY_MAX];
+      int an = snprintf(at, sizeof(at), "AT+SDVRNTFA=%lu,%d",
+                        (unsigned long)_notify_num, jn);
+      bool ok = (an > 0) && ((size_t)an < sizeof(at));
+
+      for (int off = 0; ok && (off < jn); off += (int)NOTIFY_CHUNK_MAX)
+      {
+        int take = jn - off;
+        if (take > (int)NOTIFY_CHUNK_MAX) { take = (int)NOTIFY_CHUNK_MAX; }
+        int wrote = snprintf(&at[an], sizeof(at) - (size_t)an,
+                             ",\"%.*s\"", take, &enc[off]);
+        if ((wrote <= 0) || ((size_t)(an + wrote) >= sizeof(at)))
+        {
+          ok = false;
+          break;
+        }
+        an += wrote;
+      }
+
+      if (ok)
+      {
+        int wrote = snprintf(&at[an], sizeof(at) - (size_t)an, ",1");
+        ok = (wrote > 0) && ((size_t)(an + wrote) < sizeof(at));
+      }
+
+      if (ok)
+      {
+        (void)modem_notify_async(at);
+      }
+      else
+      {
+        LERROR(TRACE_SHELL, "notify: AT line would overflow %u bytes; "
+               "not forwarded", (unsigned)MODEM_NOTIFY_MAX);
+      }
+    }
   }
+
   _notify_num = (_notify_num + 1U) & 0xFFFFU;
+}
+
+/* Public entry point for producers outside this file — today the NN task's
+ * live inference loop, which has a detection to report and no business
+ * knowing how a notification is composed or where it goes. */
+void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+{
+  _notify_emit(rsn, rsd, mtn);
 }
 
 /* Test-frame injection — for validating the NN algorithm against a known
@@ -2105,15 +2229,18 @@ static uint32_t _crc32(const uint8_t *data, size_t len)
 static int32_t _stream_read_exact(const t_stream *stream, uint8_t *buf, size_t size, uint32_t timeout_ms)
 {
   size_t got = 0;
+  _shell_binary_rx = true;
   while (got < size)
   {
     int32_t n = stream_read(stream, buf + got, size - got, timeout_ms);
     if (n <= 0)
     {
+      _shell_binary_rx = false;
       return (int32_t)got;  /* return what we have on timeout/error */
     }
     got += (size_t)n;
   }
+  _shell_binary_rx = false;
   return (int32_t)got;
 }
 
@@ -3179,6 +3306,15 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       (unsigned long)st.tx_frames,(unsigned long)st.tx_errors,
       (unsigned long)st.tx_retries,
       (unsigned long)st.uart_errors, lwshell_eol());
+    /* The notification queue is the camera→server path, and it fails
+     * differently from the link itself: a healthy tx line with dropped or
+     * failed notifications means the events are being lost above the UART,
+     * which no rx/tx counter would show. */
+    CMD_PRINTF(stream,
+      "ntf: queued=%lu sent=%lu unconfirmed=%lu dropped=%lu%s",
+      (unsigned long)st.ntf_queued, (unsigned long)st.ntf_sent,
+      (unsigned long)st.ntf_unconfirmed, (unsigned long)st.ntf_dropped,
+      lwshell_eol());
     /* Report the line rate the peripheral is REALLY running at. If this is
      * not 115200 the link cannot work, however good the wiring is -- and a
      * loopback test would still pass, because both directions would share the
