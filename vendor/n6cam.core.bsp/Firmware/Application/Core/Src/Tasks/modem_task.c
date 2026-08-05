@@ -357,8 +357,11 @@ void modem_set_raw_dump(bool on)
 /* Public API                                                                 */
 /*----------------------------------------------------------------------------*/
 
-int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
-                      uint32_t timeout_ms)
+/* Shared body of modem_send_at / modem_send_at_once. `attempts` is how many
+ * times the command may be put on the wire; see the note by the retry loop
+ * for why that is the caller's decision and not a constant. */
+static int32_t _send_at(const char *cmd, char *reply, size_t reply_cap,
+                        uint32_t timeout_ms, unsigned attempts)
 {
   if (cmd == NULL || reply == NULL || reply_cap < 2U) return -3;
   if (timeout_ms == 0U) timeout_ms = MODEM_AT_TIMEOUT_MS;
@@ -395,11 +398,17 @@ int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
    * _tx_framed(). The preamble is the actual fix for the CN805 translator's
    * direction latch; this covers the residual case where a frame is still
    * lost (a longer idle, a marginal edge, or the modem genuinely busy). A
-   * retry is safe for the commands tunnelled here: `mdm` carries AT queries,
-   * and a duplicate that does arrive is answered idempotently. Each attempt
-   * re-arms the collector so a late reply to attempt 1 cannot be mistaken
-   * for attempt 2's response. */
-  for (unsigned attempt = 0U; attempt < MODEM_AT_ATTEMPTS; attempt++)
+   * retry is safe for a QUERY: `mdm` carries AT queries, and a duplicate that
+   * does arrive is answered idempotently. Each attempt re-arms the collector
+   * so a late reply to attempt 1 cannot be mistaken for attempt 2's response.
+   *
+   * It is NOT safe for a command with a side effect, which is why `attempts`
+   * is a parameter. A notification is the case in point: the ack path is
+   * lossy (see ntf_unconfirmed), so the retry fired routinely, the modem had
+   * received the first copy perfectly well, and the server got every event
+   * TWICE — visible on the bench as two identical datagrams with the same
+   * `num` two seconds apart. */
+  for (unsigned attempt = 0U; attempt < attempts; attempt++)
   {
     /* Arm the response collector. */
     rtos_mutex_acquire(&_m.resp_mtx, true);
@@ -449,6 +458,18 @@ int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
 
   rtos_mutex_acquire(&_m.tx_mtx, false);
   return out;
+}
+
+int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
+                      uint32_t timeout_ms)
+{
+  return _send_at(cmd, reply, reply_cap, timeout_ms, MODEM_AT_ATTEMPTS);
+}
+
+int32_t modem_send_at_once(const char *cmd, char *reply, size_t reply_cap,
+                           uint32_t timeout_ms)
+{
+  return _send_at(cmd, reply, reply_cap, timeout_ms, 1U);
 }
 
 int32_t modem_send_binary(const char *prefix_line,
@@ -572,7 +593,7 @@ static void _modem_notify_run(uint32_t args)
       rtos_mutex_acquire(&_m.ntf_mtx, false);
 
       reply[0] = '\0';
-      int32_t n = modem_send_at(line, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
+      int32_t n = modem_send_at_once(line, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
       if ((n >= 0) && (strstr(reply, "OK") != NULL))
       {
         _m.stats.ntf_sent++;

@@ -136,6 +136,24 @@ int32_t modem_send_at(const char *cmd, char *reply, size_t reply_cap,
                       uint32_t timeout_ms);
 
 /**
+ * @brief As modem_send_at, but puts the command on the wire exactly once.
+ *
+ *        modem_send_at retries on a response timeout, which is right for a
+ *        query and wrong for anything with a side effect. The ack path over
+ *        the CN805 link is lossy, so "no reply" does NOT mean "not received":
+ *        on the bench the retry fired routinely while the modem had processed
+ *        the first copy perfectly well, and every notification reached the
+ *        server twice.
+ *
+ *        Use this for any command that must happen at most once. The caller
+ *        gets -2 on timeout and has to decide what that means; for
+ *        notifications the answer is "assume delivered, count it as
+ *        unconfirmed, do not resend".
+ */
+int32_t modem_send_at_once(const char *cmd, char *reply, size_t reply_cap,
+                           uint32_t timeout_ms);
+
+/**
  * @brief Send a SoW §8.2-style command followed by a binary payload.
  *
  *        Used to ship a photo from the N6 buffer up to the modem over UART
