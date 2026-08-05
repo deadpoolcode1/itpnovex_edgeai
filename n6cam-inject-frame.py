@@ -27,18 +27,67 @@ that produces a 192x192 RGB888 raw file; use --raw <file>.
 """
 import argparse
 import os
+import re
 import struct
 import sys
 import time
 import zlib
 
-# SSD-MobileNetV2/VOC takes 300x300x3 (the NN ancillary buffer size).
-FRAME_W = 300
-FRAME_H = 300
+
+def _write(fd, data: bytes):
+    """Blocking-ish write over a non-blocking CDC fd.
+
+    The port is opened O_NONBLOCK so a stalled kit cannot wedge us forever;
+    that means partial writes and EAGAIN are normal and must be retried. The
+    old code used a plain buffered file object, which surfaced the stall as
+    'OSError: [Errno 5] Input/output error' partway through the payload.
+    """
+    n = 0
+    while n < len(data):
+        try:
+            n += os.write(fd, data[n:])
+        except BlockingIOError:
+            time.sleep(0.005)
+
+
+def _drain(fd, secs: float):
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            os.read(fd, 4096)
+        except BlockingIOError:
+            time.sleep(0.02)
+
+
+def _read_until(fd, needles, timeout: float) -> bytes:
+    end = time.time() + timeout
+    buf = b""
+    while time.time() < end:
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            chunk = b""
+        if chunk:
+            buf += chunk
+            if any(nd in buf for nd in needles):
+                break
+        else:
+            time.sleep(0.02)
+    return buf
+
+# Fallback geometry only. The real size is whatever the running firmware
+# reports from `frame upload` (CAMERA_ANCILLARY_WIDTH/HEIGHT x BPP), which is
+# 256x256x3 = 196608 on the current build. This used to be hardcoded to
+# 300x300x3 = 270000, so every upload was rejected with
+# "ERROR: size=270000, expected 196608" — the kit then ran inference on
+# whatever was already in the buffer, which is what "0 detections on every
+# image" looked like from the outside. Negotiate instead of assuming.
+FRAME_W = 256
+FRAME_H = 256
 FRAME_BYTES = FRAME_W * FRAME_H * 3
 
 
-def load_image_as_rgb888(path: str) -> bytes:
+def load_image_as_rgb888(path: str, w: int = None, h: int = None) -> bytes:
     """Resize + convert to RGB888. Uses Pillow if present."""
     try:
         from PIL import Image  # type: ignore
@@ -49,10 +98,12 @@ def load_image_as_rgb888(path: str) -> bytes:
         )
         sys.exit(1)
 
-    img = Image.open(path).convert("RGB").resize((FRAME_W, FRAME_H), Image.LANCZOS)
+    w = w or FRAME_W
+    h = h or FRAME_H
+    img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
     data = img.tobytes()  # always R,G,B,R,G,B,...
-    if len(data) != FRAME_BYTES:
-        print(f"Bad resize: got {len(data)}, expected {FRAME_BYTES}")
+    if len(data) != w * h * 3:
+        print(f"Bad resize: got {len(data)}, expected {w * h * 3}")
         sys.exit(1)
     return data
 
@@ -64,43 +115,64 @@ def main() -> int:
     ap.add_argument("--raw", help="Use a pre-prepared raw RGB888 192x192 file instead")
     args = ap.parse_args()
 
-    if args.raw:
-        with open(args.raw, "rb") as f:
-            data = f.read()
-        if len(data) != FRAME_BYTES:
-            print(f"Raw file size {len(data)} != expected {FRAME_BYTES}")
-            return 1
-    elif args.image:
-        data = load_image_as_rgb888(args.image)
-    else:
+    if not args.raw and not args.image:
         ap.print_help()
         return 1
-
-    crc = zlib.crc32(data) & 0xFFFFFFFF
-    print(f"Frame: {FRAME_W}x{FRAME_H} RGB888 ({len(data)} bytes, CRC32 0x{crc:08x})")
 
     rc = os.system(f"stty -F {args.tty} 115200 cs8 -cstopb -parenb raw -echo")
     if rc != 0:
         print(f"stty failed on {args.tty}")
         return 1
 
-    with open(args.tty, "r+b", buffering=0) as port:
-        # Trigger the shell command.
-        port.write(b"\nframe upload\n")
-        port.flush()
-        # Give the App a moment to switch into binary RX mode.
-        time.sleep(0.4)
+    fd = os.open(args.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        # A previous aborted upload leaves the kit mid-payload and desyncs the
+        # shell; clear before arming or the header is read as pixel data.
+        _write(fd, b"\nframe clear\n")
+        _drain(fd, 0.4)
 
-        # Header
-        hdr = b"FRMI" + struct.pack("<II", len(data), crc)
-        port.write(hdr)
-        port.flush()
+        _write(fd, b"\nframe upload\n")
+        banner = _read_until(fd, (b"Ready", b"ERROR"), 4.0)
 
-        # Payload — chunked so the device buffer stays ahead of CDC.
-        CHUNK = 4096
-        for i in range(0, len(data), CHUNK):
-            port.write(data[i:i + CHUNK])
-            port.flush()
+        # The kit tells us exactly what it wants -- believe it rather than a
+        # constant in this file, which is how the 300x300/256x256 mismatch went
+        # unnoticed for so long.
+        m = re.search(rb"(\d+)\s+bytes RGB(?:\s*\((\d+)x(\d+)\))?", banner)
+        if not m:
+            print(f"No upload banner from kit: {banner[-200:]!r}")
+            return 1
+        nbytes = int(m.group(1))
+        if m.group(2):
+            w, h = int(m.group(2)), int(m.group(3))
+        else:
+            side = int(round((nbytes / 3) ** 0.5))
+            w = h = side
+
+        if args.raw:
+            with open(args.raw, "rb") as f:
+                data = f.read()
+            if len(data) != nbytes:
+                print(f"Raw file size {len(data)} != kit's expected {nbytes}")
+                return 1
+        else:
+            data = load_image_as_rgb888(args.image, w, h)
+        if len(data) != nbytes:
+            print(f"Geometry mismatch: built {len(data)}, kit wants {nbytes}")
+            return 1
+
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        print(f"Frame: {w}x{h} RGB888 ({len(data)} bytes, CRC32 0x{crc:08x})")
+
+        _write(fd, b"FRMI" + struct.pack("<II", len(data), crc))
+        for i in range(0, len(data), 1024):
+            _write(fd, data[i:i + 1024])
+
+        resp = _read_until(fd, (b"ok", b"ERROR"), 10.0).decode(errors="replace")
+        print(resp.strip().replace("\n", " ")[-200:])
+        if "ERROR" in resp:
+            return 1
+    finally:
+        os.close(fd)
 
     print("Uploaded. Next:  > frame run    (over the same CDC port)")
     return 0

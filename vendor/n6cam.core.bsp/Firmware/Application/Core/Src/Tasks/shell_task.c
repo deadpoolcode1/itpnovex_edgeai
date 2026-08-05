@@ -230,7 +230,7 @@ static int32_t  _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* Test-frame protocol: 'FRMI' magic + size_le(4) + crc32_le(4) + payload */
 #define FRAME_MAGIC                 "FRMI"
 #define FRAME_HDR_SIZE              12U
-#define FRAME_EXPECTED_SIZE         (CAMERA_ANCILLARY_BUFFER_SIZE)   /* NN input size (300*300*3 for SSD) */
+#define FRAME_EXPECTED_SIZE         (CAMERA_ANCILLARY_BUFFER_SIZE)   /* NN input size: CAMERA_ANCILLARY_WIDTH*HEIGHT*BPP = 256*256*3 */
 #define FRAME_RX_TIMEOUT_MS         15000U
 
 /* Test-frame buffer for NN injection. Same layout as the camera ancillary
@@ -787,13 +787,13 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 /* Test-frame injection — for validating the NN algorithm against a known
  * scene without depending on whatever the camera lens currently sees.
  *
- *   frame upload  -> receive FRAME_HDR (FRMI+size+crc) + 192*192*3 RGB bytes
+ *   frame upload  -> receive FRAME_HDR (FRMI+size+crc) + CAMERA_ANCILLARY_BUFFER_SIZE RGB bytes
  *   frame run     -> route NN input to the test buffer; wait for the next
  *                    inference; print detection count + top classes
  *   frame clear   -> revert NN to live camera input
  *   frame query   -> show whether a test frame is loaded
  *
- * Frame format: 192 x 192, RGB888 (R,G,B,R,G,B,...), row-major, top-left
+ * Frame format: CAMERA_ANCILLARY_WIDTH x HEIGHT (256x256), RGB888 (R,G,B,R,G,B,...), row-major, top-left
  * origin. Same layout the camera ancillary pipeline produces, so the NN
  * sees an indistinguishable input.
  */
