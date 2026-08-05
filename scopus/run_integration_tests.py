@@ -262,6 +262,9 @@ def mdm_stats(cam):
     m = re.search(r"usart2 err\(ORE/FE/NE\)=(\d+)", out)
     if m:
         d["usart2_err"] = int(m.group(1))
+    m = re.search(r"link:\s*relinks=(\d+)\s+consec_timeouts=(\d+)", out)
+    if m:
+        d["relinks"], d["consec_timeouts"] = int(m.group(1)), int(m.group(2))
     return d
 
 
@@ -680,19 +683,25 @@ def g_h_ntfa_protocol(s, ctx):
         time.sleep(0.3)
         return reply, (dg.decode(errors="replace") if dg else None)
 
+    # Numerators here start at 9000, clear of both the camera's own counter
+    # (which starts at 0 each boot) and group E's probes. The modem now treats
+    # a repeat of the same numerator AND the same body within 30 s as a retry
+    # and suppresses it — correctly, since that is exactly what a retry looks
+    # like — so a fixture that reuses E1's `AT+SDVRNTFA=1,5,"hello"` verbatim
+    # would be deduplicated and read as a transport failure.
     try:
         # Legacy callers predate ENC entirely and must be unaffected by it.
-        _, got = fire('AT+SDVRNTFA=1,5,"hello"')
+        _, got = fire('AT+SDVRNTFA=9001,5,"hello"')
         s.ok("H1", "legacy form (no ENC) delivers the payload verbatim",
              got == "hello", note=repr(got))
-        _, got = fire('AT+SDVRNTFA=2,5,"hello",0')
+        _, got = fire('AT+SDVRNTFA=9002,5,"hello",0')
         s.ok("H2", "explicit ENC=0 delivers the payload verbatim",
              got == "hello", note=repr(got))
 
         # Today's body: one chunk, and it must arrive as parseable JSON.
         p = _ntfa_body()
         params, _n = _ntfa_encode(p)
-        _, got = fire(f"AT+SDVRNTFA=3,{len(p)},{params},1")
+        _, got = fire(f"AT+SDVRNTFA=9003,{len(p)},{params},1")
         s.ok("H3", f"ENC=1 carries the §6 body byte-exact ({len(p)} B)",
              got == p, failnote=f"got {got!r}")
         s.ok("H4", "the delivered body is valid JSON",
@@ -709,7 +718,7 @@ def g_h_ntfa_protocol(s, ctx):
              len(p) > NTFA_CHUNK, note=f"{len(p)} B over {n} chunks",
              failnote=f"fixture is only {len(p)} B — it is not testing "
                       "the multi-chunk path it claims to")
-        _, got = fire(f"AT+SDVRNTFA=4,{len(p)},{params},1")
+        _, got = fire(f"AT+SDVRNTFA=9004,{len(p)},{params},1")
         s.ok("H6", "a multi-chunk payload is rejoined byte-exact",
              got == p, failnote=f"got {got!r}")
         if got is not None and _is_json(got) and _is_json(p):
@@ -726,22 +735,43 @@ def g_h_ntfa_protocol(s, ctx):
         filler = NTFA_CHUNK - len(_ntfa_body(mod=""))
         p = _ntfa_body(mod="M" * max(0, filler))
         params, n = _ntfa_encode(p)
-        _, got = fire(f"AT+SDVRNTFA=5,{len(p)},{params},1")
+        _, got = fire(f"AT+SDVRNTFA=9005,{len(p)},{params},1")
         s.ok("H8", f"a payload of exactly {len(p)} B (one full chunk) arrives",
              got == p, note=f"{n} chunk(s)", failnote=f"got {got!r}")
 
         # Malformed input must be refused rather than silently reinterpreted.
-        reply, _ = fire('AT+SDVRNTFA=6,5,"hello",9', wait=1.5)
+        reply, _ = fire('AT+SDVRNTFA=9006,5,"hello",9', wait=1.5)
         s.ok("H9", "an out-of-range ENC is rejected", "ERROR" in reply,
              note=_one(reply, 50))
-        reply, _ = fire('AT+SDVRNTFA=7,5,"hello",x', wait=1.5)
+        reply, _ = fire('AT+SDVRNTFA=9007,5,"hello",x', wait=1.5)
         s.ok("H10", "a non-numeric ENC is rejected", "ERROR" in reply,
              note=_one(reply, 50))
 
         # And none of the above left the command in a bad state.
-        _, got = fire('AT+SDVRNTFA=8,5,"hello"')
+        _, got = fire('AT+SDVRNTFA=9008,5,"hello"')
         s.ok("H11", "the command still works after the malformed ones",
              got == "hello", note=repr(got))
+
+        # Idempotency. This is what lets the camera retry a notification whose
+        # acknowledgement was lost — the ack path over the CN805 link drops
+        # replies routinely — without the server seeing the event twice.
+        _, first = fire('AT+SDVRNTFA=9100,4,"idem"')
+        s.ok("H12", "a fresh notification is delivered", first == "idem",
+             note=repr(first))
+        reply, again = fire('AT+SDVRNTFA=9100,4,"idem"', wait=2.5)
+        s.ok("H13", "an identical retry is re-acked but NOT re-sent",
+             again is None and "\r\nOK\r\n" in reply,
+             note="suppressed, acked OK",
+             failnote="the retry produced a second datagram — the server "
+                      "would see this event twice")
+
+        # ...but the numerator alone must not be the key. The camera restarts
+        # its counter at 0 every boot, so the same N legitimately belongs to
+        # different events; suppressing those would silently drop real ones.
+        _, other = fire('AT+SDVRNTFA=9100,5,"other"')
+        s.ok("H14", "the same numerator with a DIFFERENT body is still sent",
+             other == "other", note=repr(other),
+             failnote="a distinct event was swallowed as a duplicate")
     finally:
         watch.close()
 
@@ -752,6 +782,90 @@ def _is_json(text):
         return True
     except Exception:
         return False
+
+
+def g_i_link_recovery(s, ctx):
+    """The link can be recovered from a wedge without rebooting the camera.
+
+    The CN805 FXMA108 translator can latch one way: the camera keeps
+    transmitting with tx_errors at zero while nothing reaches the modem. The
+    real latch has never been reproducible on demand, which is why the
+    recovery could be written but not shown to work — so the firmware carries
+    a fault injector (`mdm test wedge`) that mis-configures the line rate.
+    Frames genuinely stop crossing, and the thing that fixes it is the thing
+    that fixes the real one: a UART re-init.
+
+    That injector earned its keep immediately. The first version of the
+    recovery called bsp_uart_init, which returns OK without doing anything for
+    an already-initialised UART — it counted a relink, reported success, and
+    changed nothing. Only the injected fault exposed it.
+    """
+    s.group("I — CN805 link recovery (§5.4)")
+    cam = ctx["cam"]
+
+    st = mdm_stats(cam)
+    if "relinks" not in st:
+        for t, d in [("I1", "link health counters are exposed"),
+                     ("I2", "a wedged link stops carrying commands"),
+                     ("I3", "the watchdog recovers it automatically"),
+                     ("I4", "`mdm relink` recovers it by hand")]:
+            s.skip(t, d, "firmware predates the link watchdog")
+        return
+
+    s.ok("I1", "link health counters are exposed", True,
+         note=f"relinks={st['relinks']} consec={st.get('consec_timeouts')}")
+    base = st["relinks"]
+
+    cam.send("mdm test wedge 9600", "wedge", 8.0)
+    baud_wedged = cam.send("mdm stats", "usart2:", 8.0)
+    s.ok("I2", "a wedged link stops carrying commands",
+         "actual=9600" in baud_wedged.replace(" ", ""),
+         note="USART2 forced to 9600",
+         failnote="the fault injector did not change the line rate, so "
+                  "nothing below is actually testing recovery")
+
+    # MODEM_RELINK_AFTER in the firmware; enough commands to trip the watchdog.
+    failed = sum(1 for _ in range(3)
+                 if "OK" not in cam.send("mdm AT", "ok", 12.0))
+    after = mdm_stats(cam)
+    s.ok("I3", "the watchdog relinks automatically after repeated timeouts",
+         failed >= 1 and after.get("relinks", 0) > base,
+         note=f"{failed}/3 commands failed, relinks {base} -> "
+              f"{after.get('relinks')}")
+
+    ok = sum(1 for _ in range(3) if "OK" in cam.send("mdm AT", "ok", 12.0))
+    s.ok("I4", "the link carries traffic again after recovery", ok >= 2,
+         note=f"{ok}/3 answered",
+         failnote="recovery reported success but the link is still dead")
+
+    # And the manual path, which is what an engineer reaches for on the bench.
+    cam.send("mdm test wedge 9600", "wedge", 8.0)
+    r = cam.send("mdm relink", "relink", 10.0)
+    ok = sum(1 for _ in range(3) if "OK" in cam.send("mdm AT", "ok", 12.0))
+    s.ok("I5", "`mdm relink` recovers a wedged link by hand",
+         "re-initialised" in r and ok >= 2, note=f"{ok}/3 answered after")
+
+
+def g_j_tunnel_fidelity(s, ctx):
+    """A tunnelled AT command must reach the modem exactly as typed."""
+    s.group("J — `mdm` pass-through fidelity (§4.6)")
+    cam = ctx["cam"]
+
+    # The shell tokeniser used to replace a quote found mid-token with a NUL,
+    # so `mdm AT+SDVRNTFHOST="1.2.3.4"` arrived as `AT+SDVRNTFHOST=` — the
+    # value silently gone. Quoting is not optional on the modem side either:
+    # its parser rejects a bare dotted IP. Judge on the read-back, because the
+    # truncated form is a command the modem is right to reject.
+    for tid, value in (("J1", "192.168.2.3"), ("J2", "10.9.8.7")):
+        cam.send(f'mdm AT+SDVRNTFHOST="{value}"', "ok", 10.0)
+        r = cam.send("mdm AT+SDVRNTFHOST?", "ok", 10.0)
+        s.ok(tid, f'a quoted parameter survives the tunnel ({value})',
+             value in r, note=_one(r, 60),
+             failnote="the value did not arrive — the shell is still eating "
+                      "quoted text")
+
+    # Restore whatever the rest of the suite expects.
+    cam.send(f'mdm AT+SDVRNTFHOST="{HOST_IP}"', "ok", 10.0)
 
 
 def g_g_state_hygiene(s, ctx):
@@ -837,7 +951,8 @@ def main():
 
         for fn in (g_a_prereq, g_b_detection, g_c_camera_notify,
                    g_d_tunnel, g_e_full_chain, g_f_photo_upload,
-                   g_g_state_hygiene, g_h_ntfa_protocol):
+                   g_g_state_hygiene, g_h_ntfa_protocol,
+                   g_i_link_recovery, g_j_tunnel_fidelity):
             try:
                 fn(s, ctx)
             except Exception as e:

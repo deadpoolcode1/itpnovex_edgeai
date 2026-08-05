@@ -46,7 +46,7 @@ GAP count is the honest distance to a working product.
 python3 scopus/run_integration_tests.py     # ~90 s, writes results/integration-<ts>.json
 ```
 
-**Current: 46 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical over three
+**Current: 56 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical over three
 consecutive runs. The SKIP is the physically absent SD card. Point the camera
 at people and the modem sends the event.
 
@@ -73,7 +73,9 @@ Env: `SCOPUS_IMAGES` (default `edgeai/images`), `HOST_IP`, `NTF_PORT`,
 | E full chain | detection → modem → **UDP datagram on the host** |
 | F photo upload | JPEG → SENDBIN → modem ingests it (not discards) |
 | G state hygiene | LiveBin arm/reject/release is repeatable |
-| H NTFA payload transport | the §6 JSON survives the AT channel byte-exact — see below |
+| H NTFA payload transport | the §6 JSON survives the AT channel byte-exact — see below — and a retry is idempotent |
+| I CN805 link recovery | a deliberately wedged link is recovered without rebooting the camera |
+| J `mdm` pass-through | a quoted AT parameter reaches the modem intact |
 
 ### Why group H exists
 

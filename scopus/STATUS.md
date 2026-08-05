@@ -104,8 +104,8 @@ commands missing.
 ### Current state — the headline use case works
 
 - Camera: local `master` build with the notification path wired (see §1).
-- Modem: **1.6.0**, 33 AT commands.
-- `run_integration_tests.py` → **46 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical
+- Modem: **1.7.1**, 33 AT commands.
+- `run_integration_tests.py` → **56 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical
   across three consecutive runs. The one SKIP is the absent SD card.
 - `run_scopus_tests.py` → **44 PASS / 0 FAIL / 5 SKIP**.
 - Host suites (`V20_SDVR/sdvr-app/tests/host`): **219/219** safety,
@@ -124,9 +124,12 @@ by-hand version of that, with `test_server.py` as the receiving end.
 
 1. **Put an SD card in the N6 slot.** It is the only SKIP left, and it unlocks
    the §7 photo→SD pipeline (G4).
-2. **§5.4 CN805 one-way wedge** — still open, still not reproducible on demand.
-   Nothing this session made it worse; the link now carries two producers and
-   still measures `badcrc=0 stray=0`.
+2. **Watch `relinks` in the field.** The CN805 wedge is now recovered in
+   software (§4.1) rather than needing a reboot, but the recovery has only ever
+   been exercised against an injected fault — the real latch still cannot be
+   reproduced on demand. A climbing `relinks` count on a deployed unit is the
+   signal that it is happening for real, and that the hardware fix (a
+   direction-controlled translator) is worth doing.
 3. **HTTPS.** The upload leg is proven over plain HTTP to a PC on the modem
    subnet. `AT+SDVRUPL*="S"` needs the client-cert set imported; T13.1 still
    skips on that.
@@ -263,109 +266,58 @@ one retry on timeout in `modem_send_at` as a backstop.
 
 ## 4. OPEN
 
-### 4.1 CN805 link can wedge one-way and only a camera reboot clears it
-The firmware mitigation from §3 recovers the *alternating* drop but not a hard
-latch. There is no software recovery path today — the modem task keeps counting
-`tx_frames` with `err=0` while nothing reaches the wire, and no watchdog
-notices.
+### 4.1 CN805 wedge — RECOVERED IN SOFTWARE (was the biggest open item)
+The root cause is unchanged and is hardware: the FXMA108 auto-direction
+translator latches, and the firmware cannot stop it happening. What has changed
+is that it no longer needs a camera reboot to clear.
 
-Suggested fix, in order of preference: (a) a link-health watchdog in
-`modem_task` — after K consecutive command timeouts, `bsp_uart_init()` the
-USART2 (re-running GPIO init briefly tri-states TX, which is what the reboot
-does) and retry, plus an `mdm relink` shell command to drive it by hand;
-(b) hardware — a direction-controlled translator with a DIR GPIO instead of the
-auto-sensing FXMA108. Note (a) is unproven: the wedge could not be reproduced
-on demand, so the recovery cannot be tested against the real failure.
+`modem_send_at` counts consecutive command timeouts — the only symptom a wedge
+produces, since tx_frames keeps climbing with tx_errors at zero — and after
+`MODEM_RELINK_AFTER` (3) re-initialises USART2. Re-running the GPIO init
+briefly returns TX to its reset state, which is what lets the translator
+re-sense direction; it is the software half of what the reboot did. `mdm
+relink` drives it by hand, and `mdm stats` reports `link: relinks= consec=`.
+
+**The recovery is proven, which it never could be before.** The real latch has
+never been reproducible on demand, so the firmware carries a fault injector:
+`mdm test wedge [baud]` re-configures USART2 to the wrong line rate. Frames
+genuinely stop crossing the wire, and the thing that fixes it — a UART re-init
+— is exactly what fixes the real one. Suite group I asserts the whole cycle.
+
+That injector paid for itself immediately. The first version of the recovery
+called `bsp_uart_init`, which **returns OK without doing anything** when the
+UART is already up: it counted a relink, reported success, and changed nothing.
+Only the injected fault exposed it. The BSP now has `bsp_uart_reinit`, which
+redoes GPIO + peripheral and leaves the RTOS objects alone.
+
+Still true: a hardware translator with a direction GPIO would remove the
+failure rather than recover from it. This makes the failure survivable.
 
 ### 4.2 The photo is assembled but the upload has nowhere to go
 `UploadFile_FromMemory` runs and fails — no provisioned certs, no data session.
 That is the same prerequisite T13.1 skips on, not a defect in the transfer.
 
-### 4.3 `mdm AT+SDVRNTFHOST="1.2.3.4"` still loses its quotes
-The N6 shell strips quotes when tokenising, so the command reaches the modem
-unquoted and is rejected. `mdm` rejoins `argv[1..]` with spaces in
-`shell_task.c` — it needs the raw line, or per-field re-quoting. Does not affect
-the notification path, which composes its own AT line.
+### 4.3 `mdm` quote loss — FIXED
+Worse than "quotes stripped": lwshell's tokeniser replaces a quote found
+mid-token with a NUL, so `mdm AT+SDVRNTFHOST="1.2.3.4"` reached the modem as
+`AT+SDVRNTFHOST=` — the value gone, and the modem right to reject it. Since the
+modem's own parser also rejects a bare dotted IP, every AT+SDVR* string setter
+was unreachable over the tunnel.
 
-## 5. Gotchas worth keeping
+`lwshell_raw_line()` now returns the untokenised line, and `mdm` forwards it
+verbatim instead of rejoining argv. Suite group J asserts the round-trip.
 
-- `modular-tools.sh build` **used to** pipe CubeIDE through `tail -5`, which hid
-  real link errors — it reported "0 errors" while silently reusing a stale
-  binary for two cycles. Now fixed: output goes to
-  `/tmp/cubeide_ws_n6cam/build-<project>.log`, errors are grepped and fail the
-  build, and each artifact is reported as `rebuilt` or `UNCHANGED`. An
-  UNCHANGED FSBL is normal when only Application sources were touched.
-- E2E `T11.2` is no longer a false failure — `N6Shell.send()` matches past the
-  shell's echo.
-- When testing UDP, bind-filter on source `192.168.2.2`: unrelated LAN traffic
-  on port 9999 otherwise reads as a pass (it did, once).
-- An aborted `frame upload` leaves the kit mid-payload and desyncs the shell —
-  send `frame clear` and drain before retrying. `quiesce_detector()` does this.
-- The integration suite writes JSON to `scopus/results/` (gitignored).
-  `NTF_PORT` defaults to 5005; the bench runs used `NTF_PORT=9999`.
+### 4.4 Lossy acknowledgement path — FIXED by making NTFA idempotent
+A lost ack is indistinguishable from a lost command, which forced a choice
+between dropping events (never retry) and duplicating them at the server
+(always retry). Neither is acceptable.
 
-## 6. Bench tools (`bench-tools/`)
+`AT+SDVRNTFA` now suppresses a repeat within 30 s, so the host can retry
+freely. The key is the numerator **and** a hash of the payload, not the
+numerator alone: N is 16-bit, wraps, and the camera restarts it at 0 every
+boot, so the same N legitimately belongs to different events — keying on N
+alone silently swallowed distinct notifications, which the suite caught within
+one run. The camera's notifier uses `modem_send_at` (with retry) again.
 
-`n6.py` (N6 shell driver), `hdlc_probe.py` (HDLC encode/decode matching the
-firmware's CRC), `burst.py` (N-command success rate + counter deltas),
-`idle_gap.py` (idle-gap characterisation), `who_drops2.py` (which side dropped a
-frame, via the modem log), `soak.py` (mixed-gap soak), `fullpath.py`
-(camera→modem→UDP, hop by hop), `link_map.py`, `trace.py` (trace-UART capture),
-`wire_test.sh` (raw-wire test with the app stopped), `probe.py`,
-`modem_console.py`.
-
-## 7. 2026-08-05, later — the upload leg, and three bugs it exposed
-
-The §8 photo-upload leg had never actually been proven: T13.1 always skipped on
-"needs certs + data session". Running the manual procedure against a plain-HTTP
-server on the bench PC (`test_server.py`) proved it — and found three real
-defects on the way, none of which any existing test could have caught.
-
-### 7.1 The app died on every photo upload
-
-`UploadFile_FromMemory` reaches the config tree and network services over
-Legato IPC, and those sessions belong to the thread that opened them. LiveBin
-was completing on the **HDLC channel's own poll thread** (that is where the
-camera's photo arrives), so the upload ran from a thread with no session —
-which is fatal to the process, not an error return. The app respawned roughly
-two seconds into every upload, silently, with `uploading` as the last log line.
-
-Fixed by marshalling the completed buffer onto the main thread with
-`le_event_QueueFunctionToThread`, the same idiom `IoMgr_SetBusy` and the URC
-sender already use (`LiveBin_SetMainThread`, called from `main.c`). It also
-stops the RX pump blocking for the length of an HTTP POST.
-
-Consequence worth knowing: the SENDBIN ack now means *the modem has the whole
-photo*, not *the server has it*. The server result is a separate `+SDVRSRVR`.
-
-### 7.2 Every notification reached the server twice
-
-`modem_send_at` retries once on a response timeout. That is right for a query
-and wrong for anything with a side effect — and the ack path over the CN805
-link is lossy, so the retry fired routinely while the modem had already
-processed the first copy. The server got two identical datagrams with the same
-`num`, seconds apart.
-
-Retry count is now a per-call decision: `modem_send_at` keeps it,
-`modem_send_at_once` does not, and the notifier uses the latter. A timeout is
-recorded as `ntf_unconfirmed` and **not** resent.
-
-### 7.3 Injecting a frame failed whenever detection was live
-
-The `_shell_binary_rx` guard from §2 covered the payload window but not the gap
-between the command and its banner. The host sends `frame upload` and reads for
-the banner; a notification emitted in that gap *is* what it reads, and it then
-streams the payload into a kit no longer expecting it. Reproducible simply by
-running the injector while `detect start` was in effect — "No upload banner
-from kit: b''".
-
-The claim is now taken before the banner is printed and released on every exit
-path, and `_stream_read_exact` save/restores rather than set/clears so a
-multi-read transaction (header then payload) has no gap in the middle.
-
-### 7.4 Also fixed: photos carried three junk bytes
-
-The STM32 JPEG codec DMAs its output in 32-bit words, so `jpeg_encode` reported
-up to three bytes past the EOI marker — every upload arrived as "96076 bytes"
-for a 96073-byte image. Trimmed to the marker in `jpeg_encode`, so SD files and
-uploads are both byte-exact. Received photos now report `trailing=0`.
+`ntf_unconfirmed` remains as a measure of how lossy the ack path is; it no
+longer implies a lost event.
