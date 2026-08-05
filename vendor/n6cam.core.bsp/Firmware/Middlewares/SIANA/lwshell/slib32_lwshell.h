@@ -179,6 +179,21 @@ const char *lwshell_eol(void);
 void lwshell_echo_set(bool enable);
 
 /**
+ * @brief Get the current command line exactly as it was typed.
+ *
+ *        The tokeniser rewrites the input buffer in place: separators become
+ *        NULs, and a quote found mid-token is ALSO replaced by a NUL (see the
+ *        "Quote not allowed mid-token" branch). So `foo BAR="x.y"` reaches a
+ *        handler as argv[1] == "BAR=" — the value silently truncated, not just
+ *        unquoted. Any handler that must forward the user's text verbatim —
+ *        a pass-through to another command interpreter, for instance — has to
+ *        read it from here instead of rejoining argv.
+ *
+ * @return NUL-terminated copy of the line, valid until the next command.
+ */
+const char *lwshell_raw_line(void);
+
+/**
  * @brief Query current echo state.
  */
 bool lwshell_echo_get(void);

@@ -144,6 +144,7 @@ typedef struct
   size_t              user_size;                          /*!< Number of user commands */
   /* Parser */
   uint8_t             line[SLIB32_LWSHELL_CMD_SIZE + 1U]; /*!< Input line */
+  uint8_t             raw[SLIB32_LWSHELL_CMD_SIZE + 1U];  /*!< Copy of `line` taken BEFORE parsing */
   uint8_t             *argv[SLIB32_LWSHELL_ARG_MAX];      /*!< Arguments */
   uint8_t             *cursor;                            /*!< Cursor position */
   size_t              argc;                               /*!< Number of arguments */
@@ -363,6 +364,12 @@ int32_t lwshell_update(uint32_t timeout)
         {
           LWSHELL_PRINTF(SLIB32_LWSHELL_EOL);
         }
+        /* Snapshot the line before parsing. _lwshell_line_parse tokenises
+         * IN PLACE — it writes NULs over separators and over any quote it
+         * finds mid-token — so by the time a command handler runs, the text
+         * the user actually typed no longer exists. A handler that needs it
+         * verbatim (lwshell_raw_line) reads this copy. */
+        memcpy(_shell.raw, _shell.line, sizeof(_shell.raw));
         _lwshell_line_parse();
         _lwshell_cmd_run();
         if (_shell.echo)
@@ -468,6 +475,11 @@ static void _lwshell_cmd_run(void)
     }
     LWSHELL_PRINTF(SLIB32_LWSHELL_EOL);
   }
+}
+
+const char *lwshell_raw_line(void)
+{
+  return (const char *)_shell.raw;
 }
 
 /**
