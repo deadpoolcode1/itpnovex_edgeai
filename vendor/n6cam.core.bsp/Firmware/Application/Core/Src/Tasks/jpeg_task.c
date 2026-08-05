@@ -225,7 +225,29 @@ uint8_t *jpeg_encode(size_t* size)
 {
   rtos_raise_event(&_jpeg_task.evt, JPEG_EVT_ENCODE);
   rtos_wait_any_event(&_jpeg_task.evt, JPEG_EVT_READY, true);
-  *size = (size_t)(_jpeg_head - _jpeg_buff);
+  size_t n = (size_t)(_jpeg_head - _jpeg_buff);
+
+  /* Trim to the end of the JPEG itself. The hardware codec DMAs its output
+   * in 32-bit words, so the final word can carry up to three bytes past the
+   * EOI marker — every photo this kit produced arrived at the server as
+   * "96076 bytes" for a 96073-byte image, with three trailing zeros. A JPEG
+   * ends at EOI (FFD9) by definition; decoders ignore the tail, but the
+   * bytes are still not the image, and they are what a byte-exact check on
+   * the receiving end trips over.
+   *
+   * Search backwards from the end and only trim what follows the marker. If
+   * no EOI is present the frame is malformed in some other way and the raw
+   * length is kept, so this can never shorten a genuinely truncated image. */
+  for (size_t i = n; i >= 2U; i--)
+  {
+    if ((_jpeg_buff[i - 2U] == 0xFFU) && (_jpeg_buff[i - 1U] == 0xD9U))
+    {
+      n = i;
+      break;
+    }
+  }
+
+  *size = n;
   return _jpeg_buff;
 }
 
