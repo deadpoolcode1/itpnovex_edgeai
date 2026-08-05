@@ -141,6 +141,50 @@ extern void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
 * @{
 *//*--------------------------------------------------------------------------*/
 
+int32_t bsp_uart_reinit(t_uart_id id, uint32_t baud, bool swap)
+{
+  int32_t status;
+
+  /* Validate */
+  if (id >= UART_NUM)
+  {
+    return BSP_ERROR_PARAMETER;
+  }
+  if (!uart[id].ready)
+  {
+    /* Never brought up — a plain init is what is wanted. */
+    return bsp_uart_init(id, baud, swap);
+  }
+
+  /* Stop anything in flight before the peripheral is reconfigured under it. */
+  (void)HAL_UART_AbortReceive(&uart[id].bsp.huart);
+  (void)HAL_UART_AbortTransmit(&uart[id].bsp.huart);
+  (void)HAL_UART_DeInit(&uart[id].bsp.huart);
+
+  /* Redo the hardware half only. The RTOS objects (event flags, mutexes,
+   * stream bindings) are still valid and must NOT be recreated — doing so
+   * would leak them and orphan anyone blocked on them.
+   *
+   * Re-running the GPIO init is the part that matters for the CN805 link:
+   * it briefly returns TX to its reset state, which is what lets the FXMA108
+   * auto-direction translator re-sense the line. That is why a camera reboot
+   * clears the wedge, and this is the same effect without the reboot. */
+  status = _bsp_uart_init_gpio(id);
+  if (status != BSP_OK)
+  {
+    uart[id].ready = false;
+    return status;
+  }
+  status = _bsp_uart_init_peripheral(id, baud, swap);
+  if (status != BSP_OK)
+  {
+    uart[id].ready = false;
+    return status;
+  }
+
+  return BSP_OK;
+}
+
 int32_t bsp_uart_init(t_uart_id id, uint32_t baud, bool swap)
 {
   int32_t status;

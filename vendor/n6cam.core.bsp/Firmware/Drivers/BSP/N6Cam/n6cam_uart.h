@@ -165,6 +165,26 @@ extern t_uart uart[UART_NUM];
 int32_t bsp_uart_init(t_uart_id id, uint32_t baud, bool swap);
 
 /**
+ * @brief Reconfigure an already-initialised UART (GPIO + peripheral).
+ *
+ *        bsp_uart_init() returns BSP_OK immediately when the UART is already
+ *        up, so it cannot be used to change the line rate or to bounce the
+ *        pins — it silently does nothing. Use this when the peripheral must
+ *        genuinely be torn down and brought back, which is what recovers the
+ *        CN805 translator's direction latch on the modem link.
+ *
+ *        RTOS objects created by bsp_uart_init() are left alone; only the
+ *        hardware is redone. Falls back to a full init if the UART was never
+ *        brought up.
+ *
+ * @param  id    UART to reconfigure.
+ * @param  baud  Line rate.
+ * @param  swap  Swap TX/RX pins.
+ * @return BSP_OK on success.
+ */
+int32_t bsp_uart_reinit(t_uart_id id, uint32_t baud, bool swap);
+
+/**
  * @brief Configure UART RX/TX modes
  * @param id      UART ID
  * @param mode_rx RX mode
