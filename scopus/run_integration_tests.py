@@ -213,10 +213,45 @@ def modem_log_since(ssh, marker):
     return out
 
 
+def wait_for_notify_drain(cam, max_secs=20.0):
+    """Block until the camera's async notification queue is empty.
+
+    The camera now has two independent producers on the CN805 link: the shell,
+    when it runs `mdm <cmd>`, and the notifier thread, which sends queued
+    AT+SDVRNTFA commands on its own schedule. Group D measures link hygiene —
+    retries per frame, and whether the first command after an idle gap is
+    answered — and both of those measurements silently assume the shell is the
+    only thing on the wire. A notification landing mid-measurement adds frames
+    and retries that D then attributes to its own commands, and refills the
+    link during the gap D7 is trying to leave idle.
+
+    So drain first, and measure a genuinely quiet link. The ntf_* counters
+    exist precisely so "quiet" is observable rather than assumed:
+    queued == sent + unconfirmed + dropped means nothing is still in flight.
+    """
+    deadline = time.time() + max_secs
+    while time.time() < deadline:
+        st = mdm_stats(cam)
+        q = st.get("ntf_queued")
+        if q is None:
+            return False       # firmware predates the counters — nothing to do
+        if q == st.get("ntf_sent", 0) + st.get("ntf_unconfirmed", 0) \
+                + st.get("ntf_dropped", 0):
+            time.sleep(0.5)    # let the last reply settle off the wire
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def mdm_stats(cam):
     """Parse `mdm stats` into a dict so hops can be measured, not guessed."""
     out = cam.send("mdm stats", "usart2:", 4.0)
     d = {}
+    m = re.search(r"ntf:\s*queued=(\d+)\s+sent=(\d+)\s+unconfirmed=(\d+)\s+"
+                  r"dropped=(\d+)", out)
+    if m:
+        (d["ntf_queued"], d["ntf_sent"],
+         d["ntf_unconfirmed"], d["ntf_dropped"]) = map(int, m.groups())
     for key in ("bytes", "frames", "badcrc", "stray", "err", "timeouts"):
         m = re.search(rf"rx:.*?\b{key}=(\d+)", out, re.S)
         if m:
@@ -387,6 +422,10 @@ def g_d_tunnel(s, ctx):
     s.group("D — camera ↔ modem UART tunnel (§4.6)")
     cam = ctx["cam"]
 
+    # Let the notifier finish anything group C queued, so this group measures
+    # the shell's own traffic rather than two producers sharing the link.
+    drained = wait_for_notify_drain(cam)
+
     # Wake the link before measuring. The CN805 FXMA108 translator latches
     # direction, so the first command after an idle gap legitimately costs one
     # retry — that is the designed mitigation (preamble + retry), not a fault.
@@ -432,10 +471,17 @@ def g_d_tunnel(s, ctx):
     d_tx = max(1, after.get("tx_frames", 0) - before.get("tx_frames", 0))
     s.ok("D6", f"TX retries stay rare in steady state ({d_retry}/{d_tx} frames)",
          d_retry * 4 <= d_tx,
-         failnote=f"{d_retry} retries over {d_tx} frames — link latching again")
+         note="" if drained else "notifier did not drain — see failnote",
+         failnote=f"{d_retry} retries over {d_tx} frames — link latching again"
+                  + ("" if drained else "; the notification queue never "
+                     "drained, so these frames are not all this group's"))
 
     # The documented failure mode was: after an idle gap the first command is
     # eaten. It must still be answered (the retry is allowed to pay for it).
+    # Drain again first: D4's traffic can have queued nothing, but anything the
+    # notifier sends during the sleep below would mean the link was not idle
+    # and this would be testing something other than what it claims.
+    wait_for_notify_drain(cam)
     time.sleep(12.0)
     t0 = time.time()
     woke = "OK" in cam.send("mdm AT", "ok", 10.0)
@@ -528,22 +574,169 @@ def g_f_photo_upload(s, ctx):
     s.ok("F1", "camera captures a JPEG and starts a SENDBIN transfer", sent,
          note=_one(out, 90))
 
-    time.sleep(3.0)
-    log = modem_log_since(ssh, marker)
-    got = "SENDBIN" in log or "LiveBin" in log
-    s.ok("F2", "modem receives the SENDBIN command + binary tail", got,
+    # A ~96 KB JPEG takes ~9 s to cross the 115200-baud link, so this waits for
+    # the transfer to reach a terminal state instead of sleeping a fixed 3 s.
+    # Two reasons: a flat sleep read a half-finished transfer as "arrived but
+    # not ingested", and — since the camera and the host AT channel now share
+    # one LiveBin — leaving a transfer in flight made group G arm on top of it
+    # and fail. Group G tests LiveBin's arm/reject/release logic; it must start
+    # from a quiescent sink, and the honest way to get one is to wait for this
+    # transfer rather than to abort it.
+    log = ""
+    deadline = time.time() + 40.0
+    while time.time() < deadline:
+        log = modem_log_since(ssh, marker)
+        if ("bytes received, uploading" in log or "LiveBin_Abort" in log
+                or "LiveBin_Begin failed" in log):
+            break
+        time.sleep(1.0)
+
+    armed = "SENDBIN" in log or "LiveBin_Begin" in log
+    s.ok("F2", "modem receives the SENDBIN command + binary tail", armed,
          note=_one(log, 100), failnote="nothing about SENDBIN in the modem log")
 
-    if got and "LiveBin_Feed" not in log and "swallow" in log:
+    if not armed:
+        s.skip("F3", "modem ingests the photo instead of discarding it",
+               "no transfer observed to judge")
+    elif "bytes received, uploading" in log:
+        m = re.search(r"LiveBin_Feed: (\d+) bytes received", log)
+        s.ok("F3", "modem ingests the photo instead of discarding it", True,
+             note=f"{m.group(1)} bytes handed to the uploader" if m
+                  else _one(log, 90))
+    elif "not handled in phase 1" in log or "swallow" in log:
         s.gap("F3", "modem ingests the photo instead of discarding it",
               "hdlc_channel.c counts the binary tail and throws it away; "
               "LiveBin_Begin/Feed are never called from the camera path")
-    elif "LiveBin" in log:
-        s.ok("F3", "modem ingests the photo instead of discarding it", True,
-             note=_one(log, 90))
     else:
-        s.skip("F3", "modem ingests the photo instead of discarding it",
-               "no transfer observed to judge")
+        s.ok("F3", "modem ingests the photo instead of discarding it", False,
+             failnote="LiveBin was armed but the transfer never completed: "
+                      + _one(log, 120))
+
+    # Whatever happened above, leave the sink free for group G. A transfer that
+    # completed has already released it; this only catches a stalled one.
+    ctx["mat"].send("AT+SDVRUPLSTOP", 4.0)
+
+
+"""AT+SDVRNTFA payload transport (§5.2 / §6).
+
+The §6 body is JSON, and JSON cannot cross an AT line unaided: atServer's
+parameter parser CONSUMES embedded double quotes, so `{"ser":1}` arrives as
+`{ser:1}` — accepted, silently corrupt, no longer JSON. Hence ENC=1, which
+substitutes backtick for quote and is restored on the modem.
+
+One AT parameter is also capped at 128 bytes, which is not enough: the body is
+only ~100 bytes today because `mod` is empty and `bat`/`vol` are the
+placeholder 0.0. With real values it is exactly 128 with an empty `mod`, and
+any `mod` string goes over. So the payload is split across parameters and the
+modem rejoins them.
+
+This group pins that contract, because every failure mode it guards against
+answers OK on the AT channel — the verdict has to come from the datagram.
+"""
+NTFA_CHUNK = 128
+NTFA_SUB = "`"
+
+
+def _ntfa_body(mod="", bat="0.0", vol="0.0", ser=4194336, num=0):
+    return ('{"ser":%d,"num":%d,"rsn":16,"rsd":3,"tim":"20260805153000",'
+            '"mtn":0,"mod":"%s","bat":%s,"vol":%s}' % (ser, num, mod, bat, vol))
+
+
+def _ntfa_encode(payload):
+    """Exactly what shell_task.c builds: substituted, chunked, ENC=1 last."""
+    enc = payload.replace('"', NTFA_SUB)
+    parts = [enc[i:i + NTFA_CHUNK]
+             for i in range(0, len(enc), NTFA_CHUNK)] or [""]
+    return ",".join('"%s"' % p for p in parts), len(parts)
+
+
+def g_h_ntfa_protocol(s, ctx):
+    s.group("H — AT+SDVRNTFA payload transport (§5.2, §6)")
+    mat = ctx["mat"]
+
+    mat.send(f'AT+SDVRNTFHOST="{HOST_IP}"', 4.0)
+    mat.send(f"AT+SDVRNTFPORT={NTF_PORT}", 4.0)
+    watch = UdpWatch(NTF_PORT)
+
+    def fire(cmd, wait=5.0):
+        watch.drain()
+        reply = mat.send(cmd, 8.0)
+        dg = watch.wait(wait)
+        time.sleep(0.3)
+        return reply, (dg.decode(errors="replace") if dg else None)
+
+    try:
+        # Legacy callers predate ENC entirely and must be unaffected by it.
+        _, got = fire('AT+SDVRNTFA=1,5,"hello"')
+        s.ok("H1", "legacy form (no ENC) delivers the payload verbatim",
+             got == "hello", note=repr(got))
+        _, got = fire('AT+SDVRNTFA=2,5,"hello",0')
+        s.ok("H2", "explicit ENC=0 delivers the payload verbatim",
+             got == "hello", note=repr(got))
+
+        # Today's body: one chunk, and it must arrive as parseable JSON.
+        p = _ntfa_body()
+        params, _n = _ntfa_encode(p)
+        _, got = fire(f"AT+SDVRNTFA=3,{len(p)},{params},1")
+        s.ok("H3", f"ENC=1 carries the §6 body byte-exact ({len(p)} B)",
+             got == p, failnote=f"got {got!r}")
+        s.ok("H4", "the delivered body is valid JSON",
+             got is not None and _is_json(got),
+             failnote="quotes did not survive — this is the bug ENC=1 exists "
+                      "to prevent, and it answers OK on the AT channel")
+
+        # The case a single 128-byte parameter cannot carry. This is what the
+        # product hits the moment mod/bat/vol stop being placeholders.
+        p = _ntfa_body(mod="N6Cam-SIANA-rev4-20260805", bat="12.34",
+                       vol="13.85", ser=4294967295, num=65535)
+        params, n = _ntfa_encode(p)
+        s.ok("H5", "a fully-populated §6 body needs more than one parameter",
+             len(p) > NTFA_CHUNK, note=f"{len(p)} B over {n} chunks",
+             failnote=f"fixture is only {len(p)} B — it is not testing "
+                      "the multi-chunk path it claims to")
+        _, got = fire(f"AT+SDVRNTFA=4,{len(p)},{params},1")
+        s.ok("H6", "a multi-chunk payload is rejoined byte-exact",
+             got == p, failnote=f"got {got!r}")
+        if got is not None and _is_json(got) and _is_json(p):
+            want, o = json.loads(p), json.loads(got)
+            s.ok("H7", "mod/bat/vol survive the chunk boundary",
+                 o.get("mod") == want["mod"] and o.get("bat") == want["bat"]
+                 and o.get("vol") == want["vol"], note=f"mod={o.get('mod')!r}")
+        else:
+            s.ok("H7", "mod/bat/vol survive the chunk boundary", False,
+                 failnote="payload did not arrive as JSON")
+
+        # Exactly one full parameter — the off-by-one that decides whether a
+        # body is split at all.
+        filler = NTFA_CHUNK - len(_ntfa_body(mod=""))
+        p = _ntfa_body(mod="M" * max(0, filler))
+        params, n = _ntfa_encode(p)
+        _, got = fire(f"AT+SDVRNTFA=5,{len(p)},{params},1")
+        s.ok("H8", f"a payload of exactly {len(p)} B (one full chunk) arrives",
+             got == p, note=f"{n} chunk(s)", failnote=f"got {got!r}")
+
+        # Malformed input must be refused rather than silently reinterpreted.
+        reply, _ = fire('AT+SDVRNTFA=6,5,"hello",9', wait=1.5)
+        s.ok("H9", "an out-of-range ENC is rejected", "ERROR" in reply,
+             note=_one(reply, 50))
+        reply, _ = fire('AT+SDVRNTFA=7,5,"hello",x', wait=1.5)
+        s.ok("H10", "a non-numeric ENC is rejected", "ERROR" in reply,
+             note=_one(reply, 50))
+
+        # And none of the above left the command in a bad state.
+        _, got = fire('AT+SDVRNTFA=8,5,"hello"')
+        s.ok("H11", "the command still works after the malformed ones",
+             got == "hello", note=repr(got))
+    finally:
+        watch.close()
+
+
+def _is_json(text):
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
 
 
 def g_g_state_hygiene(s, ctx):
@@ -579,6 +772,21 @@ def _one(text, n=120):
 
 
 # ────────────────────────────── driver ────────────────────────────────
+def quiesce_detector(cam):
+    """Stop live inference and drain whatever it already emitted.
+
+    Called before the first group and again after the last, so neither this
+    run nor the next one has to parse shell traffic while the NN loop is
+    firing notifications underneath it.
+    """
+    try:
+        cam.send("detect stop", "detect", 4.0)
+        cam.send("frame clear", "frame", 4.0)
+    except Exception:
+        pass
+    cam.n6.drain(0.8)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -600,15 +808,31 @@ def main():
         ctx["mat"].prime()
         ctx["ssh"] = ModemSsh(MODEM_IP, os.environ.get("MODEM_PASSWORD", "Ss123"))
 
+        # Start from a stopped detector, and leave one behind.
+        #
+        # This suite promises identical results run to run, and without this it
+        # does not deliver them: groups C and E turn detection on, and once the
+        # camera notifies on a real detection (rather than only on an explicit
+        # `notify trigger`) a detector left running keeps emitting +SDVRNTF at
+        # whatever the lens happens to see. Those lines arrive between a
+        # command and its response and derail the NEXT run from group A onward
+        # — a second run scored 27/36 against the first run's 35/36, on
+        # identical firmware, purely from this.
+        quiesce_detector(ctx["cam"])
+
         for fn in (g_a_prereq, g_b_detection, g_c_camera_notify,
                    g_d_tunnel, g_e_full_chain, g_f_photo_upload,
-                   g_g_state_hygiene):
+                   g_g_state_hygiene, g_h_ntfa_protocol):
             try:
                 fn(s, ctx)
             except Exception as e:
                 s.ok(fn.__name__, f"group {fn.__name__} completed", False,
                      failnote=f"harness exception: {e!r}")
     finally:
+        try:
+            quiesce_detector(ctx["cam"])
+        except Exception:
+            pass
         try:
             ctx["cam"].close()
         except Exception:

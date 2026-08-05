@@ -43,12 +43,54 @@ from FAIL so a missing feature can never be mistaken for a passing one — the
 GAP count is the honest distance to a working product.
 
 ```bash
-python3 scopus/run_integration_tests.py     # ~65 s, writes results/integration-<ts>.json
+python3 scopus/run_integration_tests.py     # ~90 s, writes results/integration-<ts>.json
 ```
 
+**Current: 46 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical over three
+consecutive runs. The SKIP is the physically absent SD card. Point the camera
+at people and the modem sends the event.
+
 Every test restores what it changed, so back-to-back runs give identical
-results — verified over three consecutive runs. Env: `SCOPUS_IMAGES`
-(default `edgeai/images`), `HOST_IP`, `NTF_PORT`, `MODEM_IP`, `SDVR_PORT`.
+results. That is load-bearing rather than decorative: the suite stops live
+inference before the first group and after the last (`quiesce_detector`),
+because a detector left running emits `+SDVRNTF` between a command and its
+response and derails the *next* run from group A onward. Group D additionally
+waits for the camera's notification queue to drain (`wait_for_notify_drain`)
+before measuring link retries, since the notifier is a second producer on the
+same UART and its frames would otherwise be counted as D's own.
+
+Env: `SCOPUS_IMAGES` (default `edgeai/images`), `HOST_IP`, `NTF_PORT`,
+`MODEM_IP`, `SDVR_PORT`.
+
+### Integration groups
+
+| Group | What it proves |
+|---|---|
+| A prerequisites | both devices up, tunnel live |
+| B NN detection | injected images with known people counts detect correctly |
+| C camera notification | §6 JSON shape, RTC-backed timestamp, real detection notifies |
+| D camera↔modem tunnel | round-trip, data integrity, idle-gap recovery |
+| E full chain | detection → modem → **UDP datagram on the host** |
+| F photo upload | JPEG → SENDBIN → modem ingests it (not discards) |
+| G state hygiene | LiveBin arm/reject/release is repeatable |
+| H NTFA payload transport | the §6 JSON survives the AT channel byte-exact — see below |
+
+### Why group H exists
+
+The §6 notification body is JSON, and JSON does not survive an AT command line
+unaided. atServer's parameter parser **consumes embedded double quotes**, so
+`{"ser":1}` arrives at the modem as `{ser:1}` — accepted, answered `OK`, and no
+longer JSON. On top of that, one AT parameter is capped at **128 bytes**
+(measured: 128 accepted, 129 a clean `ERROR`), which a fully-populated §6 body
+exceeds.
+
+So `AT+SDVRNTFA` takes an optional trailing `ENC`; `ENC=1` means "rejoin the
+payload parameters and restore `` ` `` → `"`". The camera splits the body into
+128-byte chunks and the modem reassembles. Full protocol:
+`V20_SDVR/README.md` → *Notifications & Control channel*.
+
+Group H pins that contract and **asserts on the received datagram, never on the
+AT reply** — every failure mode it guards against answers `OK`.
 
 ## Run
 
@@ -96,11 +138,18 @@ the suite never silently passes over an unavailable channel.
 
 ```
 scopus/
-  run_scopus_tests.py   # runner + group definitions
-  lib/devices.py        # N6Shell, ModemAt, ModemSsh (raw termios + sshpass; no pyserial)
-  lib/report.py         # Suite/TestResult + HTML/PDF writer (shared style)
-  results/              # generated reports
+  run_scopus_tests.py        # per-command/per-seam suite (HTML+PDF report)
+  run_integration_tests.py   # whole-product chain, hop by hop (JSON report)
+  STATUS.md                  # RESUME HERE: bench access, build/deploy, what's open
+  bench-tools/               # link probes and soak tools (see STATUS.md §6)
+  lib/devices.py             # N6Shell, ModemAt, ModemSsh (raw termios + sshpass; no pyserial)
+  lib/report.py              # Suite/TestResult + HTML/PDF writer (shared style)
+  results/                   # generated reports (gitignored)
 ```
+
+This is the **only** Scopus directory — it is tracked in the `edgeai` repo on
+`master`, and it drives both devices. A second untracked copy at
+`itpnovex/scopus/` was removed on 2026-08-05; don't recreate it.
 
 ## Bench notes (2026-06-22)
 
