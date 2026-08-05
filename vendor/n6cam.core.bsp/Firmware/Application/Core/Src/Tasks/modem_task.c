@@ -95,6 +95,12 @@ typedef struct
   t_modem_stats         stats;
   bool                  raw_dump;
 
+  /* Link health. `consec_timeouts` counts command timeouts since the last
+   * good response; the watchdog relinks when it reaches MODEM_RELINK_AFTER.
+   * `wedged_baud` is non-zero only while a test wedge is in force. */
+  uint32_t              consec_timeouts;
+  uint32_t              wedged_baud;
+
   /* Asynchronous notification queue (see modem_notify_async). Single-slot
    * ring, producer-agnostic: shell_task's notification emitter and the NN
    * loop both push here rather than blocking on the link themselves. */
@@ -354,6 +360,72 @@ void modem_set_raw_dump(bool on)
 }
 
 /*----------------------------------------------------------------------------*/
+/* Link recovery                                                              */
+/*----------------------------------------------------------------------------*/
+
+/* Bring USART2 down and back up at the correct line rate.
+ *
+ * Recovering the CN805 latch is the point: re-running the peripheral and GPIO
+ * init briefly tri-states TX, which is what lets the auto-direction translator
+ * re-sense which way the line is driven. A camera reboot has always cleared
+ * the wedge; this is the same effect without the reboot.
+ *
+ * The caller must not hold tx_mtx — this takes it, so a relink cannot land in
+ * the middle of somebody's frame. */
+static int32_t _relink_locked(void)
+{
+  /* bsp_uart_reinit, NOT bsp_uart_init: the latter returns OK immediately for
+   * an already-initialised UART, so it would report success and change
+   * nothing. That is not hypothetical — the first version of this used
+   * bsp_uart_init, counted a relink, and left the peripheral untouched. The
+   * fault injector is what caught it. */
+  int32_t status = bsp_uart_reinit(MODEM_UART, MODEM_UART_BAUD, false);
+  if (status != 0)
+  {
+    LERROR(TRACE_MODEM, "relink: USART2 re-init failed: %ld", (long)status);
+    return -1;
+  }
+  bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+
+  /* The decoder may be mid-frame on bytes that will never be completed. */
+  hdlc_decoder_init(&_m.dec, _m.dec_out, sizeof(_m.dec_out));
+
+  _m.wedged_baud     = 0U;
+  _m.consec_timeouts = 0U;
+  _m.stats.relinks++;
+  LWARNING(TRACE_MODEM, "relink: USART2 re-initialised at %u baud (relinks=%lu)",
+           (unsigned)MODEM_UART_BAUD, (unsigned long)_m.stats.relinks);
+  return 0;
+}
+
+int32_t modem_relink(void)
+{
+  rtos_mutex_acquire(&_m.tx_mtx, true);
+  int32_t rc = _relink_locked();
+  rtos_mutex_acquire(&_m.tx_mtx, false);
+  return rc;
+}
+
+int32_t modem_test_wedge(uint32_t wrong_baud)
+{
+  if (wrong_baud == 0U) { wrong_baud = 9600U; }
+
+  rtos_mutex_acquire(&_m.tx_mtx, true);
+  int32_t status = bsp_uart_reinit(MODEM_UART, wrong_baud, false);
+  if (status == 0)
+  {
+    bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+    _m.wedged_baud = wrong_baud;
+  }
+  rtos_mutex_acquire(&_m.tx_mtx, false);
+
+  LWARNING(TRACE_MODEM, "test wedge: USART2 forced to %lu baud — commands "
+           "should now fail and the watchdog relink after %u",
+           (unsigned long)wrong_baud, (unsigned)MODEM_RELINK_AFTER);
+  return status;
+}
+
+/*----------------------------------------------------------------------------*/
 /* Public API                                                                 */
 /*----------------------------------------------------------------------------*/
 
@@ -454,6 +526,34 @@ static int32_t _send_at(const char *cmd, char *reply, size_t reply_cap,
       break;              /* answered (or overflowed) — done */
     }
     _m.stats.tx_retries++;
+  }
+
+  /* Link-health watchdog.
+   *
+   * A wedged CN805 is invisible to every other counter: tx_frames keeps
+   * climbing with tx_errors at zero, because the MCU really does clock the
+   * bytes out — they just never make it past the translator. The only signal
+   * is that nothing ever answers. So count consecutive timeouts, and when the
+   * link has clearly stopped carrying traffic, re-initialise the UART, which
+   * is the software half of what a camera reboot does.
+   *
+   * Done here rather than in the RX loop because this is where "no answer" is
+   * actually known; the RX loop cannot tell an idle link from a dead one. */
+  if (out == -2)
+  {
+    _m.consec_timeouts++;
+    _m.stats.consec_timeouts = _m.consec_timeouts;
+    if (_m.consec_timeouts >= MODEM_RELINK_AFTER)
+    {
+      LWARNING(TRACE_MODEM, "link wedged: %lu consecutive timeouts, relinking",
+               (unsigned long)_m.consec_timeouts);
+      (void)_relink_locked();
+    }
+  }
+  else
+  {
+    _m.consec_timeouts = 0U;
+    _m.stats.consec_timeouts = 0U;
   }
 
   rtos_mutex_acquire(&_m.tx_mtx, false);
@@ -593,7 +693,17 @@ static void _modem_notify_run(uint32_t args)
       rtos_mutex_acquire(&_m.ntf_mtx, false);
 
       reply[0] = '\0';
-      int32_t n = modem_send_at_once(line, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
+      /* Retry is safe again, and it is the right thing to do.
+       *
+       * The ack path is lossy, so a timeout does not distinguish "not
+       * delivered" from "delivered, ack lost". Sending once meant a lost ack
+       * was a lost event; retrying blindly meant the server saw it twice.
+       * Neither is acceptable, so the modem now suppresses a repeat of a
+       * numerator it handled in the last 30 s (see NtfaIsDuplicate in the
+       * modem app) — it re-acks and does not resend. The command is therefore
+       * idempotent, and modem_send_at's retry costs at worst one extra frame
+       * on the wire instead of an extra event at the server. */
+      int32_t n = modem_send_at(line, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
       if ((n >= 0) && (strstr(reply, "OK") != NULL))
       {
         _m.stats.ntf_sent++;
@@ -601,9 +711,8 @@ static void _modem_notify_run(uint32_t args)
       }
       else
       {
-        /* Deliberately no retry — see the ntf_unconfirmed note in
-         * modem_task.h. The modem has almost certainly already sent this
-         * one; resending would duplicate the event at the server. */
+        /* Still unconfirmed after the retry. The event has most likely been
+         * delivered anyway; what this counts is how lossy the ack path is. */
         _m.stats.ntf_unconfirmed++;
         LWARNING(TRACE_MODEM, "notify: no ack rc=%ld reply='%.60s' "
                  "(likely delivered — ack path is lossy)", (long)n, reply);

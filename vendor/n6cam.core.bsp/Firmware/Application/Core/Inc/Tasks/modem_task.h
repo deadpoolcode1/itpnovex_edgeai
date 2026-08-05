@@ -99,11 +99,15 @@ typedef struct
    *  unconfirmed. The loss is on the *return* path, the same CN805
    *  direction-latch that eats the occasional reply.
    *
-   *  This is why the notifier does not retry: the command usually did
-   *  arrive, so a resend would deliver the event to the server twice. Treat
-   *  a non-zero count as "the ack path is lossy", not "events were lost". */
+   *  The notifier DOES retry, but only because the modem now suppresses a
+   *  repeat of a numerator it handled in the last 30 s: AT+SDVRNTFA is
+   *  idempotent in N, so a retry costs one extra frame rather than a
+   *  duplicate event at the server. Treat a non-zero count as "the ack path
+   *  is lossy", not "events were lost". */
   uint32_t ntf_unconfirmed;
   uint32_t ntf_dropped;     /*!< notifications refused: queue full or too long */
+  uint32_t relinks;         /*!< USART2 re-inits performed to recover the link */
+  uint32_t consec_timeouts; /*!< command timeouts since the last good response */
 } t_modem_stats;
 
 /**
@@ -203,6 +207,48 @@ int32_t modem_send_binary(const char *prefix_line,
  *         counted in ntf_dropped.
  */
 int32_t modem_notify_async(const char *at_line);
+
+/** Consecutive command timeouts before the link is assumed wedged and the
+ *  USART is re-initialised. Two is the normal worst case (an idle-gap loss
+ *  plus its retry), so three means the link is not merely sleepy. */
+#define MODEM_RELINK_AFTER  (3U)
+
+/**
+ * @brief Re-initialise USART2 to recover a wedged link.
+ *
+ *        The CN805 FXMA108 is an auto-direction level translator, and it can
+ *        latch one way: the camera keeps transmitting with tx_errors at zero
+ *        while nothing reaches the modem, and no counter notices. The only
+ *        recovery ever observed on the bench was a camera reboot, which works
+ *        because bringing the pin back up briefly tri-states TX and lets the
+ *        translator re-sense direction. This does that part without the
+ *        reboot.
+ *
+ *        Called automatically after MODEM_RELINK_AFTER consecutive command
+ *        timeouts, and by hand via `mdm relink`.
+ *
+ * @return 0 on success, negative if the UART could not be brought back up.
+ */
+int32_t modem_relink(void);
+
+/**
+ * @brief Fault injection — deliberately wedge the link (test hook).
+ *
+ *        The real wedge is a hardware behaviour that has never been
+ *        reproducible on demand, which left the recovery path above
+ *        untestable: it could be written but not shown to work. This models
+ *        the failure faithfully by re-initialising USART2 at the wrong baud
+ *        rate, so frames really do stop crossing the wire in both directions
+ *        — and, crucially, the thing that fixes it is exactly the thing that
+ *        fixes the real one, a UART re-init.
+ *
+ *        Drive it with `mdm test wedge`; the watchdog should then recover the
+ *        link within MODEM_RELINK_AFTER commands.
+ *
+ * @param  wrong_baud  Line rate to mis-configure to (e.g. 9600).
+ * @return 0 on success.
+ */
+int32_t modem_test_wedge(uint32_t wrong_baud);
 
 /**
  * @brief Register a callback for unsolicited result codes.

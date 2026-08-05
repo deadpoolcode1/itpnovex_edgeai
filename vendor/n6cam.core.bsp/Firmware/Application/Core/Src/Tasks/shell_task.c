@@ -335,7 +335,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
   {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
-  {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
+  {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | relink | test wedge [baud] | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
   {.run = _update_cmd             , .name = "update"    , .help = "[app | model] - Receive new firmware/model over CDC and reflash xSPI (default: app)" },
@@ -3337,6 +3337,11 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       (unsigned long)st.ntf_queued, (unsigned long)st.ntf_sent,
       (unsigned long)st.ntf_unconfirmed, (unsigned long)st.ntf_dropped,
       lwshell_eol());
+    /* Link health. A rising relink count on a bench that is otherwise quiet
+     * is the CN805 translator latching; consec>0 means it is happening now. */
+    CMD_PRINTF(stream, "link: relinks=%lu consec_timeouts=%lu%s",
+      (unsigned long)st.relinks, (unsigned long)st.consec_timeouts,
+      lwshell_eol());
     /* Report the line rate the peripheral is REALLY running at. If this is
      * not 115200 the link cannot work, however good the wiring is -- and a
      * loopback test would still pass, because both directions would share the
@@ -3392,6 +3397,28 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
    * validated without a MangOH on the bench. */
   if (strcmp((char*)argv[1], "test") == 0 && argc >= 3U)
   {
+    /* Fault injection: wedge the link on purpose so the recovery path can be
+     * demonstrated. The real CN805 latch has never been reproducible on
+     * demand, which is exactly why the recovery needed a way to be tested at
+     * all. Mis-configuring the line rate is a faithful model: frames really
+     * do stop crossing the wire, and the thing that fixes it — a UART
+     * re-init — is exactly what fixes the real one. */
+    if (strcmp((char*)argv[2], "wedge") == 0)
+    {
+      uint32_t baud = 9600U;
+      if (argc >= 4U)
+      {
+        long b = atol((char*)argv[3]);
+        if (b > 0) { baud = (uint32_t)b; }
+      }
+      (void)modem_test_wedge(baud);
+      CMD_PRINTF(stream, "mdm test wedge: USART2 forced to %lu baud; the next "
+                 "%u commands should fail, then the link auto-relinks%s",
+                 (unsigned long)baud, (unsigned)MODEM_RELINK_AFTER,
+                 lwshell_eol());
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
     if (strcmp((char*)argv[2], "echo") == 0)
     {
       /* Round-trip "AT\r\n" through the HDLC encoder/decoder and report. */
@@ -3437,26 +3464,64 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
     }
-    CMD_PRINTF(stream, "Bad syntax — use 'mdm test echo' or 'mdm test urc <line>'%s",
+    CMD_PRINTF(stream, "Bad syntax — use 'mdm test echo', 'mdm test urc <line>' "
+               "or 'mdm test wedge [baud]'%s",
                lwshell_eol());
     return LWSHELL_OK;
   }
 
-  /* Real pass-through: glue argv[1..] back together with spaces. lwshell
-   * tokenises on whitespace, so a quoted AT command like
-   *   mdm AT+CPIN?
-   *   mdm SDVR+HOST="example.com"
-   * comes in pre-split; we rejoin. */
-  size_t pos = 0U;
-  for (size_t i = 1U; i < argc; i++)
+  /* Force the link-recovery path by hand. Useful when the link is wedged and
+   * you would rather not wait for three commands to time out, and as the
+   * manual half of the watchdog. */
+  if (strcmp((char*)argv[1], "relink") == 0)
   {
-    if (i > 1U && pos < sizeof(cmd) - 1U) cmd[pos++] = ' ';
-    size_t a = strlen((char*)argv[i]);
-    if (pos + a >= sizeof(cmd) - 1U) a = sizeof(cmd) - 1U - pos;
-    memcpy(&cmd[pos], argv[i], a);
-    pos += a;
+    int32_t rc = modem_relink();
+    CMD_PRINTF(stream, "mdm relink: %s%s",
+               (rc == 0) ? "USART2 re-initialised" : "FAILED", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* Real pass-through: forward exactly what the user typed.
+   *
+   * Rejoining argv with spaces cannot work here. lwshell's tokeniser rewrites
+   * the line in place and replaces a quote found mid-token with a NUL, so
+   *   mdm AT+SDVRNTFHOST="1.2.3.4"
+   * arrived as argv[1] == "AT+SDVRNTFHOST=" — the address silently gone, and
+   * the modem answering ERROR to a command it was right to reject. Quoted
+   * parameters are not optional on the modem side either: its own parser
+   * rejects a bare dotted IP, so this affected every AT+SDVR* setter that
+   * takes a string.
+   *
+   * lwshell_raw_line() returns the untokenised copy; skip our own command
+   * word and any spaces after it, and pass the remainder through untouched. */
+  const char *raw = lwshell_raw_line();
+  size_t pos = 0U;
+  if (raw != NULL)
+  {
+    /* Step over leading spaces, then the command word ("mdm"), then the
+     * spaces before its first argument. */
+    while (*raw == ' ') { raw++; }
+    while ((*raw != '\0') && (*raw != ' ')) { raw++; }
+    while (*raw == ' ') { raw++; }
+
+    size_t a = strlen(raw);
+    if (a >= sizeof(cmd)) { a = sizeof(cmd) - 1U; }
+    memcpy(cmd, raw, a);
+    pos = a;
+  }
+  /* Trailing whitespace would become part of the AT command. */
+  while ((pos > 0U) && ((cmd[pos - 1U] == ' ') || (cmd[pos - 1U] == '\t')))
+  {
+    pos--;
   }
   cmd[pos] = '\0';
+
+  if (pos == 0U)
+  {
+    CMD_PRINTF(stream, "mdm: nothing to send%s", lwshell_eol());
+    return LWSHELL_OK;
+  }
 
   int32_t rc = modem_send_at(cmd, reply, sizeof(reply), MODEM_AT_TIMEOUT_MS);
   if (rc < 0)
