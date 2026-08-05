@@ -570,9 +570,24 @@ def g_f_photo_upload(s, ctx):
 
     marker = modem_log_marker(ssh)
     out = cam.send("photo upload", "ok", 25.0)
-    sent = "ok" in out and "error" not in out.lower()
+
+    # "trigger failed (busy / no modem)" means the snapshot pipeline is still
+    # finishing an earlier capture — a transient, not a defect, and it happens
+    # whenever something ran a photo shortly before this suite. Retry once and
+    # say so in the note, so a genuine failure still fails but a queued
+    # pipeline does not read as a broken one.
+    retried = False
+    if "busy" in out.lower():
+        retried = True
+        time.sleep(12.0)
+        marker = modem_log_marker(ssh)
+        out = cam.send("photo upload", "ok", 25.0)
+
+    sent = "ok" in out and "error" not in out.lower() and "busy" not in out.lower()
     s.ok("F1", "camera captures a JPEG and starts a SENDBIN transfer", sent,
-         note=_one(out, 90))
+         note=_one(out, 90) + (" (after one retry — pipeline was busy)"
+                               if retried else ""),
+         failnote="photo upload did not start: " + _one(out, 90))
 
     # A ~96 KB JPEG takes ~9 s to cross the 115200-baud link, so this waits for
     # the transfer to reach a terminal state instead of sleeping a fixed 3 s.

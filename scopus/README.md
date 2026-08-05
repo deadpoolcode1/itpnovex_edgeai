@@ -92,6 +92,30 @@ payload parameters and restore `` ` `` → `"`". The camera splits the body into
 Group H pins that contract and **asserts on the received datagram, never on the
 AT reply** — every failure mode it guards against answers `OK`.
 
+## Manual end-to-end test
+
+`Scopus_Tester_Manual.docx` walks the whole product by hand in seven steps —
+start a server on your PC, point the modem at it, configure the camera to
+detect people, inject an image, and watch the event and the photo arrive. It
+ends with a JSON event and a JPEG file on your PC that came off the device,
+which is the pass condition: a device log line saying it sent them is not.
+
+The manual is **generated** from `make_tester_manual.py` so the procedure stays
+reviewable as a diff. Edit the script and re-run it; do not hand-edit the docx:
+
+```bash
+python3 scopus/make_tester_manual.py
+```
+
+The server it uses is `test_server.py`, which listens for both things the
+product sends — notifications on UDP and photos on HTTP — in one process with
+one log, so neither can be missed because the wrong listener was running:
+
+```bash
+python3 scopus/test_server.py --http-port 8080 --udp-port 9999 \
+        --dir ~/scopus-received --from-modem 192.168.2.2
+```
+
 ## Run
 
 Run on the host the hardware is attached to (the bench/remote PC):
@@ -140,6 +164,10 @@ the suite never silently passes over an unavailable channel.
 scopus/
   run_scopus_tests.py        # per-command/per-seam suite (HTML+PDF report)
   run_integration_tests.py   # whole-product chain, hop by hop (JSON report)
+  test_server.py             # the "server" end: receives notifications (UDP)
+                             #   and photo uploads (HTTP), on your PC
+  Scopus_Tester_Manual.docx  # step-by-step MANUAL E2E test (generated)
+  make_tester_manual.py      # regenerates the .docx — edit this, not the docx
   STATUS.md                  # RESUME HERE: bench access, build/deploy, what's open
   bench-tools/               # link probes and soak tools (see STATUS.md §6)
   lib/devices.py             # N6Shell, ModemAt, ModemSsh (raw termios + sshpass; no pyserial)
