@@ -158,14 +158,29 @@ def main():
                     help="where received files and logs are written")
     ap.add_argument("--from-modem", default=None, metavar="IP",
                     help="only accept datagrams from this address")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start with an empty directory, keeping what an "
+                         "earlier run left in <dir>-old-<timestamp>")
     args = ap.parse_args()
 
     global OUT_DIR
-    OUT_DIR = pathlib.Path(args.dir).resolve()
+    OUT_DIR = pathlib.Path(args.dir).expanduser().resolve()
+
+    # A manual test is judged partly by "what is in the directory afterwards",
+    # and last week's photos sitting next to today's is how a test gets called
+    # a pass on evidence it did not produce. Move them aside rather than
+    # deleting: the previous run's files are the previous run's evidence.
+    moved = None
+    if args.fresh and OUT_DIR.is_dir() and any(OUT_DIR.iterdir()):
+        moved = OUT_DIR.with_name(
+            f"{OUT_DIR.name}-old-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+        OUT_DIR.rename(moved)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"{C['b']}Scopus test server{C['0']}")
     print(f"  receiving into {OUT_DIR}")
+    if moved:
+        print(f"  (an earlier run's files were moved to {moved})")
 
     threading.Thread(target=udp_listener,
                      args=(args.udp_port, args.from_modem),

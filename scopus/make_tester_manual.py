@@ -7,9 +7,15 @@ reviewable diff instead of a binary blob nobody can read. Re-run after editing:
 
     python3 scopus/make_tester_manual.py
 
-Every step in here was executed against the real bench before it was written
-down; the "Expected" text is what the hardware actually produced, not what it
-ought to produce.
+It is written for a tester who is testing the product, not administering Linux:
+every command is one complete line that can be copied as it stands, and every
+"Expected" block is what the bench actually printed when this procedure was
+walked line by line — not what it ought to print.
+
+The commands all start with `cd ~/work/itpnovex/edgeai &&` on purpose. It is
+redundant once you are in that directory, and it means a tester who opened a
+new window, or lost their place, can start from any line in the document and
+have it work.
 """
 import datetime
 import pathlib
@@ -27,16 +33,34 @@ OUT = pathlib.Path(__file__).resolve().parent / "Scopus_Tester_Manual.docx"
 MONO = "Consolas"
 GREY = RGBColor(0x44, 0x44, 0x44)
 RED = RGBColor(0xB0, 0x00, 0x00)
+GREEN = RGBColor(0x1E, 0x6B, 0x2E)
+BLUE = RGBColor(0x1F, 0x3D, 0x7A)
+
+REPO = "~/work/itpnovex/edgeai"
+CD = f"cd {REPO} && "
 
 
-def code(doc, text):
+def code(doc, text, size=9):
     """A command / output block."""
     p = doc.add_paragraph()
     p.paragraph_format.left_indent = Inches(0.3)
     p.paragraph_format.space_after = Pt(4)
     r = p.add_run(text)
     r.font.name = MONO
+    r.font.size = Pt(size)
+    return p
+
+
+def cmd(doc, text):
+    """A line the tester types. Bold so it stands out from expected output."""
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Inches(0.3)
+    p.paragraph_format.space_after = Pt(4)
+    r = p.add_run(text)
+    r.font.name = MONO
     r.font.size = Pt(9)
+    r.font.bold = True
+    r.font.color.rgb = BLUE
     return p
 
 
@@ -50,6 +74,28 @@ def note(doc, text, warn=False):
     return p
 
 
+def expected(doc, text="Expected:"):
+    p = doc.add_paragraph()
+    r = p.add_run(text)
+    r.font.size = Pt(10)
+    r.bold = True
+    r.font.color.rgb = GREEN
+    p.paragraph_format.space_after = Pt(2)
+    return p
+
+
+def table(doc, headers, rows, widths=None):
+    t = doc.add_table(rows=1, cols=len(headers))
+    t.style = "Light Grid Accent 1"
+    for i, h in enumerate(headers):
+        t.rows[0].cells[i].text = h
+    for row in rows:
+        cells = t.add_row().cells
+        for i, v in enumerate(row):
+            cells[i].text = v
+    return t
+
+
 def build():
     doc = Document()
     st = doc.styles["Normal"]
@@ -58,316 +104,644 @@ def build():
 
     doc.add_heading("Scopus — Tester Manual", 0)
     p = doc.add_paragraph()
-    p.add_run("End-to-end manual test: camera detects people → modem sends the "
-              "event → your PC receives it.").bold = True
+    p.add_run("End-to-end acceptance test: the camera sees people → the modem "
+              "sends the event → this PC receives it.").bold = True
     doc.add_paragraph(
         f"Generated {datetime.date.today().isoformat()} from "
-        f"scopus/make_tester_manual.py. Every step below was executed against "
-        f"the bench hardware; the expected output is what the devices actually "
-        f"produced.")
+        f"scopus/make_tester_manual.py. Every command below was run, in this "
+        f"order, on the bench PC this document is written for, and each "
+        f"“Expected” block is the output that came back. The one "
+        f"exception is Step 9, which needs a person standing in front of the "
+        f"camera; its example is a real live detection recorded on the same "
+        f"bench.")
 
-    # ── What you are testing ───────────────────────────────────────────
-    doc.add_heading("1. What this test proves", level=1)
+    # ── How to use this document ───────────────────────────────────────
+    doc.add_heading("1. How to use this document", level=1)
     doc.add_paragraph(
-        "The Scopus system is two devices: an N6Cam (camera + neural network) "
-        "and a WP76 modem, joined by an internal UART. Each half can look "
-        "perfectly healthy while the product does nothing, because nothing "
-        "joins them. This procedure follows one real event all the way out:")
+        "Work through it from top to bottom. Each step gives you one command "
+        "to type and shows what should come back. If what you see does not "
+        "match, stop and look up the symptom in section 14 — carrying on "
+        "after a failed step produces confusing results later.")
+    for a in [
+        "Lines in bold blue are what you type. Copy the whole line, including "
+        "the part before &&.",
+        "Everything else in the boxes is what the computer prints back. It "
+        "will not match character for character — times, counters and the "
+        "picture change — but the shape and the key values must match.",
+        "You need two Terminal windows. Open one with Ctrl+Alt+T, and a "
+        "second the same way. This document calls them Window A and Window B.",
+        "Nothing here needs a password, and nothing here changes the "
+        "product's software.",
+    ]:
+        doc.add_paragraph(a, style="List Bullet")
+
+    doc.add_paragraph()
+    doc.add_paragraph("What the two windows are for:")
+    table(doc, ["Window", "What it does", "When"],
+          [["A", "Runs the receiving server — this is 'the customer's server' "
+                 "that the product sends events and photos to. It prints "
+                 "everything that arrives.",
+            "Started in Step 3, then left alone until the end"],
+           ["B", "Everything else: the checks and the commands to the camera "
+                 "and the modem.",
+            "Used for every other step"]])
+
+    doc.add_paragraph()
+    doc.add_paragraph(
+        "Roughly 20 minutes end to end, most of it waiting for the photo to "
+        "cross the internal cable between the two boards.")
+
+    # ── What this proves ───────────────────────────────────────────────
+    doc.add_heading("2. What this test proves", level=1)
+    doc.add_paragraph(
+        "Scopus is two devices in one box: an N6Cam (camera + neural network) "
+        "and a WP76 modem, joined by an internal serial cable. Each half can "
+        "look perfectly healthy while the product does nothing, because "
+        "nothing joins them. This procedure follows real events all the way "
+        "out to this PC:")
     code(doc,
-         "  inject an image with 3 people\n"
-         "      -> camera runs inference and detects them\n"
-         "          -> camera notifies the modem over the internal UART\n"
-         "              -> modem sends a UDP datagram to your PC\n"
+         "  people in front of the camera\n"
+         "      -> camera's neural network detects them\n"
+         "          -> camera tells the modem over the internal cable\n"
+         "              -> modem sends a UDP message to this PC\n"
+         "\n"
          "  photo capture\n"
          "      -> camera sends the JPEG to the modem\n"
-         "          -> modem uploads it to your PC over HTTP")
+         "          -> modem uploads it to this PC over HTTP")
     doc.add_paragraph(
-        "You will end the test with a JSON event and a JPEG file on your PC "
-        "that came off the device. That is the pass condition — not a device "
-        "log line saying it sent them.")
+        "The test passes on what arrives on this PC — a JSON event and a JPEG "
+        "file you can open. A log line on the device saying it sent them is "
+        "not a pass; that only proves the device spoke, not that anything "
+        "heard it.")
+    doc.add_paragraph("The steps prove three separate things, which is why "
+                      "there are three of them:")
+    table(doc, ["Step", "Proves"],
+          [["7 — known picture",
+            "the neural network counts people correctly (the picture has a "
+            "known number in it, so the answer is checkable)"],
+           ["8 — test event",
+            "an event gets from the camera, through the modem, onto this PC, "
+            "and arrives as valid data"],
+           ["9 — real people",
+            "the two above working together on a real detection: the product "
+            "doing its actual job"]])
 
     # ── Equipment ──────────────────────────────────────────────────────
-    doc.add_heading("2. What you need", level=1)
-    t = doc.add_table(rows=1, cols=2)
-    t.style = "Light Grid Accent 1"
-    t.rows[0].cells[0].text = "Item"
-    t.rows[0].cells[1].text = "Detail"
-    for a, b in [
-        ("PC", "Linux, on the same Ethernet subnet as the modem "
-               "(the bench PC is 192.168.2.3)"),
-        ("N6Cam", "USB to the PC. Shell appears as the '-if02' CDC port"),
-        ("WP76 modem", "USB (AT on /dev/ttyUSB0) + Ethernet to the PC "
-                       "(192.168.2.2)"),
-        ("Internal link", "N6Cam UART wired to the modem — this is the link "
-                          "under test"),
-        ("Repo", "edgeai checked out; run everything from its root"),
-    ]:
-        row = t.add_row().cells
-        row[0].text = a
-        row[1].text = b
-
-    doc.add_paragraph()
-    doc.add_paragraph("Find the camera's port — it changes after a reflash, so "
-                      "always resolve the by-id link rather than assuming "
-                      "/dev/ttyACM1:")
-    code(doc, "$ readlink -f /dev/serial/by-id/"
-              "usb-STMicroelectronics_N6Cam_DEADBEEF-if02\n"
-              "/dev/ttyACM2")
-    code(doc, "$ export CAM=$(readlink -f /dev/serial/by-id/"
-              "usb-STMicroelectronics_N6Cam_DEADBEEF-if02)")
+    doc.add_heading("3. What is already set up", level=1)
+    doc.add_paragraph(
+        "This is all in place on the bench PC. You do not have to do "
+        "anything with it; it is here so you can recognise the parts by name "
+        "when a step mentions them.")
+    table(doc, ["Item", "Detail"],
+          [["This PC", "The bench PC. It plays the part of the customer's "
+                       "server. Its address on the modem's network is "
+                       "192.168.2.3"],
+           ["N6Cam", "The camera board. Connected to this PC by USB"],
+           ["WP76 modem", "The modem board. Connected to this PC by USB (for "
+                          "commands) and Ethernet (192.168.2.2, for the data "
+                          "it sends)"],
+           ["Internal cable", "Camera to modem. This is the link the product "
+                              "depends on and the one this test exercises"],
+           ["Software", f"Already installed at {REPO}"]])
 
     # ── Step 1 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 1 — Start the server on your PC", level=1)
+    doc.add_heading("Step 1 — Close anything else using the devices",
+                    level=1)
     doc.add_paragraph(
-        "This is the 'server' the product uploads to. It listens for both "
-        "things the device sends: notifications (UDP) and photos (HTTP). "
-        "Leave it running in its own terminal for the whole test.")
-    code(doc, "$ python3 scopus/test_server.py \\\n"
-              "      --http-port 8080 --udp-port 9999 \\\n"
-              "      --dir ~/scopus-received --from-modem 192.168.2.2")
-    doc.add_paragraph("Expected:")
-    code(doc, "Scopus test server\n"
-              "  receiving into /home/user/scopus-received\n"
-              "[17:39:05] listening      UDP  0.0.0.0:9999  (notifications)\n"
-              "[17:39:05] listening      HTTP 0.0.0.0:8080 (photo uploads)")
-    note(doc, "--from-modem makes the server ignore anything not from the "
-              "modem. Unrelated traffic on the notification port has been "
-              "mistaken for a passing test before.")
+        "If another program has the camera's or the modem's serial port open, "
+        "it takes the replies this test is waiting for, and every step below "
+        "fails with “no answer” while the hardware is perfectly "
+        "healthy. This has cost real time on this bench.")
+    doc.add_paragraph("Close, if any of them are open:")
+    for a in ["The Serial Monitor panel in VS Code (this is the usual "
+              "culprit — closing the panel is enough, but closing VS Code is "
+              "surer)",
+              "Any terminal window running picocom, minicom, tio or screen",
+              "A test server left running from an earlier test"]:
+        doc.add_paragraph(a, style="List Bullet")
+    note(doc, "Step 2 checks this for you and names the program if it finds "
+              "one, so you do not have to guess.")
 
     # ── Step 2 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 2 — Point the modem at your PC", level=1)
-    doc.add_paragraph(
-        "Connect to the modem's AT channel (FTDI host UART, /dev/ttyUSB0 at "
-        "115200 8N1). Any terminal will do; the commands matter, not the tool.")
-    code(doc, "$ python3 -c \"\n"
-              "import sys; sys.path.insert(0,'scopus/lib')\n"
-              "from devices import ModemAt\n"
-              "at = ModemAt(); at.prime()\n"
-              "for c in ['AT+SDVRNTFHOST=\\\"192.168.2.3\\\"',\n"
-              "          'AT+SDVRNTFPORT=9999',\n"
-              "          'AT+SDVRHOSTIP=\\\"192.168.2.3\\\"',\n"
-              "          'AT+SDVRPORT=8080',\n"
-              "          'AT+SDVRSRVRPATH=\\\"/upload\\\"']:\n"
-              "    print(c, '->', at.send(c, 4.0).strip())\n"
-              "print(at.send('AT+SDVRSRVGET', 4.0))\"")
-    doc.add_paragraph("What each one sets:")
-    t = doc.add_table(rows=1, cols=2)
-    t.style = "Light Grid Accent 1"
-    t.rows[0].cells[0].text = "Command"
-    t.rows[0].cells[1].text = "Meaning"
-    for a, b in [
-        ('AT+SDVRNTFHOST="192.168.2.3"', "where notifications go (your PC)"),
-        ("AT+SDVRNTFPORT=9999", "notification UDP port"),
-        ('AT+SDVRHOSTIP="192.168.2.3"', "where photos go (your PC)"),
-        ("AT+SDVRPORT=8080", "photo upload HTTP port"),
-        ('AT+SDVRSRVRPATH="/upload"', "URL path for the upload POST"),
-    ]:
-        row = t.add_row().cells
-        row[0].text = a
-        row[1].text = b
-    doc.add_paragraph()
-    doc.add_paragraph("Expected — every command answers OK, and the read-back "
-                      "shows what you set:")
-    code(doc, '+SDVRSRVGET:"192.168.2.3","",8080,"/upload",http\n\nOK')
-    note(doc, 'Quote the IP. The modem\'s AT parser rejects a bare dotted '
-              'address: AT+SDVRHOSTIP=192.168.2.3 fails, '
-              'AT+SDVRHOSTIP="192.168.2.3" works.', warn=True)
+    doc.add_heading("Step 2 — Check the bench is ready", level=1)
+    doc.add_paragraph("In Window B:")
+    cmd(doc, f"{CD}python3 scopus/preflight.py")
+    expected(doc)
+    code(doc,
+         "Scopus bench pre-flight\n\n"
+         "  [PASS] N6Cam shell port  —  /dev/ttyACM2\n"
+         "  [PASS] Modem AT port  —  /dev/ttyUSB0\n"
+         "  [PASS] N6Cam port is free  —  nobody else has it open\n"
+         "  [PASS] Modem port is free  —  nobody else has it open\n"
+         "  [PASS] This PC is on the modem's network  —  this PC is 192.168.2.3\n"
+         "  [PASS] Modem answers on the network  —  192.168.2.2\n"
+         "  [PASS] Server ports are free  —  TCP 8080, UDP 9999\n"
+         "  [PASS] Modem SDVR app answers  —  version 1.7.1\n"
+         "  [PASS] Modem firmware is new enough  —  1.7.1 >= 1.7.0\n"
+         "  [PASS] Camera shell answers  —  uptime replied\n"
+         "  [PASS] Camera can reach the modem  —  internal cable carries commands\n"
+         "  [PASS] Test image present  —  /home/user/work/itpnovex/edgeai/images/3_people.jpg\n\n"
+         "READY — the bench is fit to test on. Go to Step 3 of the manual.")
+    note(doc, "Every line must say PASS. If one says FAIL, the yellow text "
+              "underneath it says what to do; do that and run the command "
+              "again. Do not start the test with a FAIL showing — the step "
+              "that fails later will look like a product fault and will not "
+              "be one.", warn=True)
+    note(doc, "'/dev/ttyACM2' may read ttyACM1 on your run. That is normal — "
+              "the camera moves between the two — and nothing in this "
+              "document depends on which one it is.")
 
     # ── Step 3 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 3 — Configure the camera to detect people", level=1)
-    doc.add_paragraph("Open the camera shell on $CAM and send:")
-    code(doc, "mdm AT\n"
-              "detect profile 0x01 0x03\n"
-              "notify enable 0xff\n"
-              "detect start")
-    t = doc.add_table(rows=1, cols=2)
-    t.style = "Light Grid Accent 1"
-    t.rows[0].cells[0].text = "Command"
-    t.rows[0].cells[1].text = "Meaning"
-    for a, b in [
-        ("mdm AT", "wakes and proves the camera→modem link before you rely "
-                   "on it"),
-        ("detect profile 0x01 0x03", "detect people (0x01); on detection both "
-                                     "save to SD and report (0x03). Bit 1 is "
-                                     "what makes it notify."),
-        ("notify enable 0xff", "enable all notification reasons"),
-        ("detect start", "start inference"),
-    ]:
-        row = t.add_row().cells
-        row[0].text = a
-        row[1].text = b
-    doc.add_paragraph()
-    doc.add_paragraph("Expected:")
-    code(doc, "mdm AT\nOK\nmdm AT ok\n\n"
-              "detect profile: det_msk=0x01 action_msk=0x03\n"
-              "notify enable: 0x000000ff\n"
-              "detect: started")
-    note(doc, "If 'mdm AT' does not answer OK, stop here — the camera cannot "
-              "reach the modem and nothing downstream can work. Check the "
-              "internal UART wiring before continuing.", warn=True)
+    doc.add_heading("Step 3 — Start the receiving server (Window A)", level=1)
+    doc.add_paragraph(
+        "This is the server the product uploads to. It listens for both "
+        "things the device sends — events (UDP) and photos (HTTP) — and "
+        "saves everything it receives so you can look at it afterwards.")
+    doc.add_paragraph("In Window A:")
+    cmd(doc, f"{CD}python3 scopus/test_server.py --http-port 8080 "
+             f"--udp-port 9999 --dir ~/scopus-received --from-modem "
+             f"192.168.2.2 --fresh")
+    expected(doc)
+    code(doc,
+         "Scopus test server\n"
+         "  receiving into /home/user/scopus-received\n"
+         "  (an earlier run's files were moved to "
+         "/home/user/scopus-received-old-20260806-151456)\n"
+         "[15:14:56] listening      UDP  0.0.0.0:9999  (notifications)\n"
+         "[15:14:56] listening      HTTP 0.0.0.0:8080 (photo uploads)\n"
+         "  Ctrl-C to stop. Point the modem here with:\n"
+         '    AT+SDVRNTFHOST="<this PC ip>"   AT+SDVRNTFPORT=9999\n'
+         '    AT+SDVRHOSTIP="<this PC ip>"    AT+SDVRPORT=8080   '
+         'AT+SDVRSRVRPATH="/upload"')
+    doc.add_paragraph(
+        "Leave this window running and visible for the rest of the test — "
+        "several steps are judged by what appears here. Do not type in it. "
+        "You will stop it with Ctrl-C at the very end.")
+    doc.add_paragraph("What the options mean:")
+    table(doc, ["Option", "Meaning"],
+          [["--http-port 8080", "port the photos are uploaded to"],
+           ["--udp-port 9999", "port the events arrive on"],
+           ["--dir ~/scopus-received", "folder everything received is saved "
+                                       "in"],
+           ["--from-modem 192.168.2.2", "ignore anything that did not come "
+                                        "from the modem. Unrelated traffic on "
+                                        "this port has been mistaken for a "
+                                        "passing test before"],
+           ["--fresh", "start with an empty folder, so what is in it at the "
+                       "end is this test's evidence and nothing else. An "
+                       "earlier run's files are moved aside, not deleted"]])
 
     # ── Step 4 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 4 — Inject a picture of people", level=1)
+    doc.add_heading("Step 4 — Point the modem at this PC (Window B)", level=1)
     doc.add_paragraph(
-        "Rather than pointing the lens at real people, push a known image "
-        "into the camera's inference buffer. The neural network cannot tell "
-        "the difference, and the people count is known in advance, so the "
-        "result is checkable.")
-    code(doc, "$ python3 n6cam-inject-frame.py images/3_people.jpg $CAM")
-    doc.add_paragraph("Expected:")
-    code(doc, "Frame: 256x256 RGB888 (196608 bytes, CRC32 0x13a92fb1)\n"
-              "frame upload: ok (196608 bytes, CRC 0x13a92fb1)\n"
-              "Uploaded. Next:  > frame run")
+        "The modem has to be told where to send things. This one command "
+        "works out this PC's address on the modem's network, sets the five "
+        "settings that need to agree with each other, and reads them back.")
+    cmd(doc, f"{CD}python3 scopus/at.py --point-here")
+    expected(doc)
+    code(doc,
+         "[modem /dev/ttyUSB0]\n"
+         "Pointing the modem at this PC (192.168.2.3)\n\n"
+         '  AT+SDVRNTFHOST="192.168.2.3"\n'
+         "      OK\n"
+         "  AT+SDVRNTFPORT=9999\n"
+         "      OK\n"
+         '  AT+SDVRHOSTIP="192.168.2.3"\n'
+         "      OK\n"
+         "  AT+SDVRPORT=8080\n"
+         "      OK\n"
+         '  AT+SDVRSRVRPATH="/upload"\n'
+         "      OK\n\n"
+         "Read back what the modem now has:\n"
+         "  AT+SDVRNTFHOST?\n"
+         '      +SDVRNTFHOST:"192.168.2.3"\n'
+         "      OK\n"
+         "  AT+SDVRNTFPORT?\n"
+         "      +SDVRNTFPORT:9999\n"
+         "      OK\n"
+         "  AT+SDVRSRVGET\n"
+         '      +SDVRSRVGET:"192.168.2.3","",8080,"/upload",http\n'
+         "      OK\n\n"
+         "OK — notifications to 192.168.2.3:9999, photos to "
+         "http://192.168.2.3:8080/upload")
+    doc.add_paragraph("The five settings, in case you need to recognise them:")
+    table(doc, ["Setting", "Meaning"],
+          [['AT+SDVRNTFHOST="192.168.2.3"', "where events go (this PC)"],
+           ["AT+SDVRNTFPORT=9999", "port events go to"],
+           ['AT+SDVRHOSTIP="192.168.2.3"', "where photos go (this PC)"],
+           ["AT+SDVRPORT=8080", "port photos go to"],
+           ['AT+SDVRSRVRPATH="/upload"', "the address on the server the photo "
+                                         "is posted to"]])
+    doc.add_paragraph()
+    note(doc, "The last line must say OK. The command judges itself on the "
+              "read-back rather than on the five OKs, because a setting that "
+              "answers OK and stores nothing is exactly the fault this step "
+              "exists to catch.")
 
     # ── Step 5 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 5 — Run inference and watch the event leave", level=1)
-    doc.add_paragraph("In the camera shell:")
-    code(doc, "frame run")
-    doc.add_paragraph("Expected on the camera — three people, and the "
-                      "notification it raised:")
-    code(doc, "frame run: 3 detection(s), NN 89.1ms\n"
-              "  [0] class=0 conf=0.78 bbox=(0.73,0.71,0.18,0.44)\n"
-              "  [1] class=0 conf=0.71 bbox=(0.51,0.64,0.15,0.60)\n"
-              "  [2] class=0 conf=0.84 bbox=(0.36,0.73,0.14,0.41)\n"
-              '+SDVRNTF: {"ser":4194336,"num":1,"rsn":16,"rsd":3,...}')
-    doc.add_paragraph("Expected in the server terminal, within a second or two:")
-    code(doc, "[17:44:06] NOTIFICATION   from 192.168.2.2  "
-              "ser=4194336 num=1 rsn=16 rsd=3\n"
-              "[17:44:06]                  valid JSON, 9 fields: "
-              '{"ser":4194336,"num":1,"rsn":16,\n'
-              '                             "rsd":3,"tim":"20000101000116",'
-              '"mtn":0,"mod":"","bat":0.0,"vol":0.0}')
-    doc.add_paragraph("Check three things, in this order:")
-    for a in ["rsn=16 — reason 'people detected'.",
-              "rsd=3 — three of them, matching the image and the camera's "
-              "own count.",
-              "'valid JSON' — the payload parsed. This is not cosmetic: the "
-              "notification body is JSON, and JSON does not survive an AT "
-              "command line unaided, so a broken transport shows up here as "
-              "a datagram that arrives but will not parse."]:
-        doc.add_paragraph(a, style="List Bullet")
-    note(doc, "PASS for this step = a datagram on the PC with rsn=16, rsd=3, "
-              "and valid JSON. The camera printing +SDVRNTF is NOT enough — "
-              "that only proves the camera spoke, not that anything heard it.")
+    doc.add_heading("Step 5 — Tell the camera to look for people", level=1)
+    doc.add_paragraph("Two commands, in Window B:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "detect profile 0x01 0x03"')
+    expected(doc)
+    code(doc, "[camera /dev/ttyACM2] > detect profile 0x01 0x03\n"
+              "detect profile: det_msk=0x01 action_msk=0x03\n"
+              "detect profile ok")
+    doc.add_paragraph()
+    cmd(doc, f'{CD}python3 scopus/cam.py "notify enable 0xff"')
+    expected(doc)
+    code(doc, "[camera /dev/ttyACM2] > notify enable 0xff\n"
+              "notify enable: 0x000000ff\n"
+              "notify enable ok")
+    doc.add_paragraph()
+    table(doc, ["Command", "Meaning"],
+          [["detect profile 0x01 0x03",
+            "look for people (0x01); when you find some, both save a picture "
+            "to the SD card and report it (0x03). The 'report' half is what "
+            "makes an event reach this PC — with it off the camera detects "
+            "silently"],
+           ["notify enable 0xff", "allow every kind of event to be reported"]])
+    doc.add_paragraph()
+    note(doc, "These two settings go back to their defaults if the camera "
+              "restarts. If a later step stops producing events, come back "
+              "and run these two again — see section 15.")
 
     # ── Step 6 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 6 — Capture a photo and upload it", level=1)
-    doc.add_paragraph("In the camera shell:")
-    code(doc, "photo upload")
-    doc.add_paragraph("Expected on the camera:")
-    code(doc, "photo upload: capturing -> SDVR+SENDBIN ref=2 "
-              "name=4194336_01012000_000123.rdy\n"
-              '+SDVRNTF: {"ser":4194336,"num":2,"rsn":64,"rsd":2,...}')
+    doc.add_heading("Step 6 — Check the two boards are talking", level=1)
     doc.add_paragraph(
-        "The JPEG is ~95 KB and crosses the internal UART at 115200 baud, so "
-        "allow about 10 seconds, then another second or two for the upload.")
-    doc.add_paragraph("Expected in the server terminal:")
-    code(doc, "[17:44:27] UPLOAD         from 192.168.2.2  94831 bytes  "
-              "-> 174427_photo\n"
-              "[17:44:27]                  JPEG, complete   path=/upload\n"
-              "[17:44:27]                  X-Filename: photo\n"
-              "[17:44:27]                  X-Filesize: 94831\n"
-              "[17:44:27]                  X-Timestamp: 01012000000123\n"
-              "[17:44:27]                  X-Ref: 2")
-    note(doc, "'JPEG, complete' means the file starts with the JPEG "
-              "start-of-image marker and contains the end-of-image marker — "
-              "i.e. the whole picture arrived, not a truncated transfer that "
-              "still POSTed happily.")
+        "This sends a command from the camera, across the internal cable, to "
+        "the modem, and brings the modem's answer back. Everything after this "
+        "depends on that cable.")
+    cmd(doc, f'{CD}python3 scopus/cam.py "mdm AT"')
+    expected(doc)
+    code(doc, "[camera /dev/ttyACM2] > mdm AT\n"
+              "OK\n"
+              "mdm AT ok")
+    note(doc, "If this does not answer OK, stop here. The camera cannot reach "
+              "the modem, and no step after this one can pass. Report it — "
+              "and see section 14, which has the one thing worth trying "
+              "first.", warn=True)
 
     # ── Step 7 ─────────────────────────────────────────────────────────
-    doc.add_heading("Step 7 — Verify what landed on the PC", level=1)
-    code(doc, "$ ls -la ~/scopus-received/\n"
-              "-rw-rw-r-- 1 user user 94831 174427_photo\n"
-              "-rw-rw-r-- 1 user user   372 notifications.log\n\n"
-              "$ file ~/scopus-received/174427_photo\n"
-              "JPEG image data, baseline, precision 8, 800x600, components 3\n\n"
-              "$ cat ~/scopus-received/notifications.log")
-    doc.add_paragraph("Open the JPEG in an image viewer. It is the scene the "
-                      "camera is pointing at — the real lens image, not the "
-                      "injected test frame, which only drives inference.")
+    doc.add_heading("Step 7 — Check the neural network counts correctly",
+                    level=1)
+    doc.add_paragraph(
+        "Rather than pointing the lens at real people — where nobody knows "
+        "what the right answer was — this pushes a picture with a known "
+        "number of people in it into the camera's neural network, and checks "
+        "the number that comes back. It takes about a minute.")
+    cmd(doc, f"{CD}python3 scopus/inference_test.py")
+    expected(doc)
+    code(doc,
+         "Camera on /dev/ttyACM2 — expecting 3 people in 3_people.jpg\n\n"
+         "Attempt 1 of 4:\n"
+         "  [1/4] stopping live detection\n"
+         "  [2/4] injecting images/3_people.jpg\n"
+         "        Camera port: /dev/ttyACM2\n"
+         "        Frame: 256x256 RGB888 (196608 bytes, CRC32 0x13a92fb1)\n"
+         "        frame upload: ok (196608 bytes, CRC 0x13a92fb1) frame upload ok\n"
+         "        Uploaded. Next:  > frame run    (over the same CDC port)\n"
+         "  [3/4] starting detection\n"
+         "  [4/4] running inference on it\n"
+         "        frame run: 3 detection(s), NN 89.1ms\n"
+         "        [0] class=0 conf=0.78 bbox=(0.73,0.71,0.18,0.44)\n"
+         "        [1] class=0 conf=0.71 bbox=(0.51,0.64,0.15,0.60)\n"
+         "        [2] class=0 conf=0.84 bbox=(0.36,0.73,0.14,0.41)\n"
+         "        frame run ok\n\n"
+         "PASSED — 3 people detected in 89.1 ms, which matches the picture.")
+    doc.add_paragraph("What to check:")
+    for a in ["The last line says PASSED.",
+              "Three detections, one per person in the picture.",
+              "class=0 on every line — class 0 is 'person'. A different "
+              "class number means it found something, but not a person.",
+              "NN 89.1ms — how long the network took. Anything in the "
+              "80–100 ms range is normal."]:
+        doc.add_paragraph(a, style="List Bullet")
+    note(doc, "“Attempt 2 of 4” appearing is not a failure. The "
+              "camera drops its console reply if it happens to be sending an "
+              "event at that moment, so the test simply does it again. Only "
+              "the final PASSED / FAILED line decides the step.")
+    doc.add_paragraph(
+        "There are other pictures to try, if you want more than one data "
+        "point:")
+    cmd(doc, f"{CD}python3 scopus/inference_test.py --image "
+             f"images/7_people.jpg --expect 7")
+    note(doc, "images/ has 1_person, 2_people, 3_people, 5_people, 7_people "
+              "and some crowd scenes. The count on a crowd is approximate by "
+              "nature — use the small ones for a pass/fail judgement.")
 
-    # ── Pass/fail ──────────────────────────────────────────────────────
-    doc.add_heading("8. Pass criteria", level=1)
-    t = doc.add_table(rows=1, cols=3)
-    t.style = "Light Grid Accent 1"
-    hdr = t.rows[0].cells
-    hdr[0].text = "#"
-    hdr[1].text = "Must be true"
-    hdr[2].text = "Where you see it"
-    for a, b, c in [
-        ("1", "Modem answers AT+SDVRSRVGET with the endpoints you set",
-         "modem AT channel"),
-        ("2", "'mdm AT' returns OK", "camera shell"),
-        ("3", "Inference reports 3 detections on 3_people.jpg", "camera shell"),
-        ("4", "A datagram arrives with rsn=16 and rsd=3", "server terminal"),
-        ("5", "That datagram is valid JSON with all 9 SoW §6 fields",
-         "server terminal"),
-        ("6", "Each event arrives EXACTLY ONCE — no duplicates",
-         "notifications.log"),
-        ("7", "A photo arrives and is reported 'JPEG, complete'",
-         "server terminal"),
-        ("8", "The saved file opens as a JPEG", "file / image viewer"),
-    ]:
-        row = t.add_row().cells
-        row[0].text = a
-        row[1].text = b
-        row[2].text = c
+    # ── Step 8 ─────────────────────────────────────────────────────────
+    doc.add_heading("Step 8 — Check an event reaches this PC", level=1)
+    doc.add_paragraph(
+        "Step 7 proved the camera can count. This proves an event travels the "
+        "whole way: camera → internal cable → modem → network → this PC. It "
+        "asks the camera to report a detection of 3 people directly, so the "
+        "expected numbers are known.")
+    doc.add_paragraph("In Window B:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "detect simulate 3"')
+    expected(doc, "Expected in Window B:")
+    code(doc, "[camera /dev/ttyACM2] > detect simulate 3\n"
+              "detect simulate: 3 object(s)\n"
+              '+SDVRNTF: {"ser":4194336,"num":4,"rsn":16,"rsd":3,'
+              '"tim":"20000101002639","mtn":0,\n'
+              '           "mod":"","bat":0.0,"vol":0.0}\n'
+              "detect simulate ok\n"
+              "+SDVRNTF: END,4")
+    expected(doc, "Expected in Window A, within a few seconds:")
+    code(doc,
+         "[15:15:57] NOTIFICATION   from 192.168.2.2  ser=4194336 num=4 "
+         "rsn=16 rsd=3\n"
+         "[15:15:57]                  valid JSON, 9 fields: "
+         '{"ser":4194336,"num":4,"rsn":16,\n'
+         '                             "rsd":3,"tim":"20000101002639","mtn":0,'
+         '"mod":"","bat":0.0,\n'
+         '                             "vol":0.0}')
+    doc.add_paragraph("Check three things in Window A, in this order:")
+    for a in ["rsn=16 — the reason: 'people detected'.",
+              "rsd=3 — how many: three, which is what you asked for.",
+              "'valid JSON' — the message arrived intact. This is not "
+              "cosmetic. The event is JSON, JSON does not survive the "
+              "modem's command channel unaided, and a broken transport shows "
+              "up exactly here: a message that arrives but will not read."]:
+        doc.add_paragraph(a, style="List Bullet")
+    note(doc, "The PASS for this step is in Window A. The camera printing "
+              "+SDVRNTF in Window B is not enough — that only proves the "
+              "camera spoke, not that anything heard it.")
+    note(doc, 'tim="20000101..." means the camera\'s clock is at its factory '
+              'default, which happens after it restarts. It does not affect '
+              'this test; the event is still real.')
+
+    # ── Step 9 ─────────────────────────────────────────────────────────
+    doc.add_heading("Step 9 — The real thing: detect actual people", level=1)
+    doc.add_paragraph(
+        "This is the product doing its job, with nothing injected or "
+        "simulated. Detection is already running from Step 7.")
+    doc.add_paragraph("Do this:")
+    for a in ["Make sure nobody is in front of the camera, and wait about "
+              "ten seconds. The camera reports the moment people appear "
+              "where there were none, so it has to see an empty scene first.",
+              "Walk into the camera's view and stay there for a few seconds.",
+              "Watch Window A."]:
+        doc.add_paragraph(a, style="List Number")
+    expected(doc, "Expected in Window A, within a second or two of stepping "
+                  "in (this is a real live detection from this bench — three "
+                  "people in view):")
+    code(doc,
+         "[14:53:06] NOTIFICATION   from 192.168.2.2  ser=4194336 num=0 "
+         "rsn=16 rsd=3\n"
+         "[14:53:06]                  valid JSON, 9 fields: "
+         '{"ser":4194336,"num":0,"rsn":16,\n'
+         '                             "rsd":3,"tim":"20000101000348","mtn":0,'
+         '"mod":"","bat":0.0,\n'
+         '                             "vol":0.0}')
+    doc.add_paragraph(
+        "rsd is the number of people the camera actually sees — 1 for you "
+        "alone, 2 if a colleague joins you, 3 in the example above. rsn is "
+        "16 again: people detected. Write down how many people were in view "
+        "and what rsd said; that comparison is the result of this step.")
+    note(doc, "Only the arrival of people is reported, not their continued "
+              "presence — standing there does not produce a message every "
+              "second, by design. To get another one, step out of view, wait "
+              "for the scene to be empty for a few seconds, and step back in.")
+    note(doc, "If nothing arrives: the camera has to see an empty scene "
+              "before it can see people arrive. If the room already had "
+              "people in view when Step 7 finished, step everyone out of "
+              "view, wait ten seconds, then walk back in.")
+
+    # ── Step 10 ────────────────────────────────────────────────────────
+    doc.add_heading("Step 10 — Capture a photo and upload it", level=1)
+    doc.add_paragraph(
+        "This exercises the other half of the product: a real JPEG from the "
+        "lens, across the internal cable, through the modem, onto this PC.")
+    cmd(doc, f'{CD}python3 scopus/cam.py "photo upload"')
+    expected(doc, "Expected in Window B:")
+    code(doc,
+         "[camera /dev/ttyACM2] > photo upload\n"
+         "photo upload: capturing -> SDVR+SENDBIN ref=2 "
+         "name=4194336_01012000_002844.rdy\n"
+         '+SDVRNTF: {"ser":4194336,"num":5,"rsn":64,"rsd":2,'
+         '"tim":"20000101002844","mtn":0,\n'
+         '           "mod":"","bat":0.0,"vol":0.0}\n'
+         "photo upload ok\n"
+         "+SDVRNTF: END,5\n"
+         "+SDVRSRVR: OK")
+    doc.add_paragraph(
+        "The photo is about 95 KB and crosses the internal cable at 115200 "
+        "baud, so give it about 10 seconds, and a second or two more for the "
+        "upload itself.")
+    expected(doc, "Expected in Window A:")
+    code(doc,
+         "[15:18:02] NOTIFICATION   from 192.168.2.2  ser=4194336 num=5 "
+         "rsn=64 rsd=2\n"
+         "[15:18:02]                  valid JSON, 9 fields: {...}\n"
+         "[15:18:13] UPLOAD         from 192.168.2.2  93305 bytes  -> "
+         "151813_photo\n"
+         "[15:18:13]                  JPEG, complete   path=/upload\n"
+         "[15:18:13]                  X-Filename: photo\n"
+         "[15:18:13]                  X-Filesize: 93305\n"
+         "[15:18:13]                  X-Timestamp: 01012000002844\n"
+         "[15:18:13]                  X-Ref: 2")
+    note(doc, "'JPEG, complete' is the part that matters. It means the file "
+              "begins with the JPEG start marker and contains the end marker "
+              "— the whole picture arrived. A transfer cut short still "
+              "uploads happily and would say TRUNCATED here.")
+    note(doc, "The rsn=64 event just above is the camera reporting the "
+              "capture itself; it is a different reason code from the rsn=16 "
+              "'people detected' events.")
+
+    # ── Step 11 ────────────────────────────────────────────────────────
+    doc.add_heading("Step 11 — Look at what actually landed on this PC",
+                    level=1)
+    doc.add_paragraph("In Window B:")
+    cmd(doc, "ls -la ~/scopus-received/")
+    expected(doc)
+    code(doc, "total 104\n"
+              "-rw-rw-r-- 1 user user 93305 Aug  6 15:18 151813_photo\n"
+              "-rw-rw-r-- 1 user user   248 Aug  6 15:18 notifications.log")
     doc.add_paragraph()
-    doc.add_paragraph("On Ctrl-C the server prints a summary:")
+    cmd(doc, "file ~/scopus-received/*_photo")
+    expected(doc)
+    code(doc, "/home/user/scopus-received/151813_photo: JPEG image data, "
+              "baseline, precision 8, 800x600, components 3")
+    doc.add_paragraph()
+    cmd(doc, "cat ~/scopus-received/notifications.log")
+    expected(doc)
+    code(doc,
+         '[15:15:57] 192.168.2.2 {"ser":4194336,"num":4,"rsn":16,"rsd":3,'
+         '"tim":"20000101002639",\n'
+         '                        "mtn":0,"mod":"","bat":0.0,"vol":0.0}\n'
+         '[15:18:02] 192.168.2.2 {"ser":4194336,"num":5,"rsn":64,"rsd":2,'
+         '"tim":"20000101002844",\n'
+         '                        "mtn":0,"mod":"","bat":0.0,"vol":0.0}')
+    note(doc, "One line per event: the rsn=16 one is Step 8's people "
+              "detection, the rsn=64 one is Step 10's photo capture. Any "
+              "events from Step 9 appear here too.")
+    doc.add_paragraph()
+    doc.add_paragraph("Now open the photo and look at it:")
+    cmd(doc, "xdg-open ~/scopus-received/*_photo")
+    doc.add_paragraph(
+        "It is the scene the camera is pointing at — the real view through "
+        "the lens. It is not the test picture from Step 7; that one only "
+        "drives the neural network and never becomes a photo.")
+    doc.add_paragraph()
+    doc.add_paragraph("Check every event arrived exactly once:")
+    cmd(doc, "cut -d' ' -f3- ~/scopus-received/notifications.log | sort | "
+             "uniq -d")
+    expected(doc)
+    code(doc, "(no output at all)")
+    note(doc, "Any line printed here is the same event delivered twice, "
+              "which is a fault worth reporting. Nothing printed is the pass.")
+
+    # ── Step 12 ────────────────────────────────────────────────────────
+    doc.add_heading("Step 12 — Finish", level=1)
+    doc.add_paragraph("Go to Window A and press Ctrl-C.")
+    expected(doc)
     code(doc, "Summary\n"
-              "  notifications: 3 received, 3 valid JSON\n"
-              "  uploads:       2 received, 2 complete JPEGs")
+              "  notifications: 2 received, 2 valid JSON\n"
+              "  uploads:       1 received, 1 complete JPEGs\n"
+              "  files in /home/user/scopus-received")
+    doc.add_paragraph(
+        "The two counts on each line must match: every event that arrived "
+        "was readable, and every photo that arrived was complete. Record "
+        "these numbers, and keep the ~/scopus-received folder — it is the "
+        "evidence for this run.")
+
+    # ── Pass criteria ──────────────────────────────────────────────────
+    doc.add_heading("13. Pass criteria", level=1)
+    doc.add_paragraph("The test passes only if all of these are true:")
+    table(doc, ["#", "Must be true", "Where you saw it"],
+          [["1", "Every pre-flight check says PASS", "Step 2"],
+           ["2", "The modem reads back the endpoints it was given", "Step 4"],
+           ["3", "'mdm AT' answers OK — the two boards talk", "Step 6"],
+           ["4", "The neural network counts 3 people in the 3-person picture",
+            "Step 7"],
+           ["5", "An event arrives on this PC with rsn=16 and rsd=3",
+            "Step 8, Window A"],
+           ["6", "That event is reported 'valid JSON, 9 fields'",
+            "Step 8, Window A"],
+           ["7", "Real people walking into view produce an event with the "
+                 "right count", "Step 9, Window A"],
+           ["8", "A photo arrives and is reported 'JPEG, complete'",
+            "Step 10, Window A"],
+           ["9", "The saved file opens as a picture of the room", "Step 11"],
+           ["10", "No event was delivered twice", "Step 11"],
+           ["11", "The closing summary shows all events valid and all "
+                  "uploads complete", "Step 12"]])
 
     # ── Troubleshooting ────────────────────────────────────────────────
-    doc.add_heading("9. If something fails", level=1)
-    t = doc.add_table(rows=1, cols=2)
-    t.style = "Light Grid Accent 1"
-    t.rows[0].cells[0].text = "Symptom"
-    t.rows[0].cells[1].text = "Meaning / what to do"
-    for a, b in [
-        ("stty: /dev/ttyACMx: No such file or directory",
-         "The camera re-enumerated (it does this after a firmware update). "
-         "Wait ~30 s and re-resolve $CAM from the by-id link."),
-        ("'mdm AT' does not answer",
-         "The camera→modem UART is down. Everything downstream depends on it; "
-         "fix this first. 'mdm stats' shows whether bytes are reaching the "
-         "camera at all."),
-        ("No upload banner from kit",
-         "Something wrote to the camera shell between the command and its "
-         "reply. Send 'frame clear', wait a moment, retry."),
-        ("Notification arrives but is NOT valid JSON",
-         "The AT transport is mangling the payload. Check the modem reports "
-         "1.6.0 or later (AT+SDVRVER) — earlier builds could not carry JSON."),
-        ("Nothing arrives at the server at all",
-         "Check the server is actually running and bound (ss -tlnp | grep "
-         "8080), and that AT+SDVRNTFHOST matches this PC's address on the "
-         "modem subnet."),
-        ("'photo upload: trigger failed (busy / no modem)'",
-         "A previous capture is still in flight. Wait ~15 s and retry."),
-        ("Photo arrives but is 'TRUNCATED'",
-         "The transfer was cut short. Check 'mdm stats' on the camera for "
-         "badcrc/stray — a clean link reports zero for both."),
-        ("Counter 'ntf: ... unconfirmed=N' is non-zero",
-         "The modem did not acknowledge in time. It does NOT mean the event "
-         "was lost — the acknowledgement path is lossy while the command "
-         "itself usually arrives. Judge by what reached the server."),
-    ]:
-        row = t.add_row().cells
-        row[0].text = a
-        row[1].text = b
+    doc.add_heading("14. If something fails", level=1)
+    table(doc, ["What you see", "What it means and what to do"],
+          [["Any command says 'no answer'",
+            "The camera drops its console reply if it is sending an event at "
+            "that moment. Run the same command again — it is the reply that "
+            "was lost, not the command. If three tries in a row say this, "
+            "treat it as a real failure and report it."],
+           ["'ERROR: the modem's AT port was not found', or the modem "
+            "answers nothing at all",
+            "Almost always another program holding the port — the VS Code "
+            "Serial Monitor is the usual one. Close it and run "
+            "scopus/preflight.py, which names the program if it is still "
+            "there."],
+           ["A step worked earlier and now produces no events",
+            "The camera has probably restarted, which puts its settings back "
+            "to their defaults. Run Step 5's two commands again, then carry "
+            "on. Section 15 explains how to tell."],
+           ["'mdm AT' does not answer OK",
+            "The internal cable between camera and modem is not carrying "
+            "traffic. Try it once more, and if it still fails run:  "
+            f"{CD}python3 scopus/cam.py \"mdm relink\"  and then 'mdm AT' "
+            "again. If that does not fix it, stop and report it — nothing "
+            "downstream can work."],
+           ["Nothing arrives in Window A at all",
+            "Check Window A is still running (it stops if you press Ctrl-C "
+            "in it), and run Step 4 again — the modem has to be pointed at "
+            "this PC."],
+           ["An event arrives but is NOT valid JSON",
+            "The message was mangled in transport. Report it with the raw "
+            "line Window A prints; this is a real fault."],
+           ["'photo upload: trigger failed (busy / no modem)'",
+            "A previous capture is still in flight. Wait about 15 seconds "
+            "and run it again."],
+           ["A photo arrives but says TRUNCATED",
+            "The transfer was cut short. Report it, and include the output "
+            f"of:  {CD}python3 scopus/cam.py \"mdm stats\""],
+           ["The pre-flight says the camera port was not found",
+            "The camera re-enumerates after a restart and takes about 30 "
+            "seconds to come back. Wait, then run the pre-flight again."]])
+
+    # ── Known behaviour ────────────────────────────────────────────────
+    doc.add_heading("15. Known behaviour — not your fault", level=1)
+    doc.add_paragraph(
+        "These are known and under investigation. They are written down so "
+        "you can recognise them rather than chase them, and so that seeing "
+        "one is worth a note in your report rather than a stopped test.")
+    table(doc, ["Behaviour", "How to recognise it", "What to do"],
+          [["A command's reply goes missing",
+            "'no answer to this command', usually right after an event was "
+            "sent. The command itself did run.",
+            "Run it again. Note how often it happens."],
+           ["The camera restarts on its own",
+            f"Commands stop answering for about 30 seconds; afterwards the "
+            f"camera's settings are back to their defaults. Confirm with:  "
+            f"{CD}python3 scopus/cam.py uptime  — a number under a minute "
+            f"means it has just restarted.",
+            "Redo Step 5, then carry on from where you were. Note the time "
+            "it happened; this one is worth reporting every time."],
+           ["An event is slow to arrive",
+            "Up to about 10 seconds between the camera reporting and Window "
+            "A showing it.",
+            "Normal. The camera retries if the modem does not acknowledge."]])
+    doc.add_paragraph()
+    doc.add_paragraph("If you want to record the state of the link for a "
+                      "report:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "mdm stats"')
+    expected(doc)
+    code(doc, "rx: bytes=158 frames=10 badcrc=0 stray=1 err=4 timeouts=861\n"
+              "tx: frames=102 err=0 retries=3   usart2 err(ORE/FE/NE)=4\n"
+              "ntf: queued=3 sent=3 unconfirmed=0 dropped=0\n"
+              "link: relinks=3 consec_timeouts=0")
+    table(doc, ["Counter", "What it tells you"],
+          [["ntf: queued / sent", "events the camera raised, and events it "
+                                  "got to the modem. These should track each "
+                                  "other."],
+           ["ntf: dropped", "events thrown away. Should be 0 — report it if "
+                            "not."],
+           ["ntf: unconfirmed", "the modem did not acknowledge in time. It "
+                                "does NOT mean the event was lost — judge by "
+                                "what reached Window A."],
+           ["link: relinks", "times the camera had to reset the internal "
+                             "cable. A number that climbs during a test is "
+                             "worth reporting."],
+           ["rx: badcrc / stray", "corruption on the internal cable. A clean "
+                                  "link reports 0 badcrc."]])
+
+    # ── Reporting ──────────────────────────────────────────────────────
+    doc.add_heading("16. What to put in your report", level=1)
+    for a in ["Pass or fail for each of the eleven criteria in section 13.",
+              "The closing summary from Step 12 (the two counts).",
+              "For any failure: which step, the exact command you ran, and "
+              "everything both windows printed. Copy the text — a "
+              "description of it is rarely enough to work out what happened.",
+              "How many times you saw anything from section 15, and roughly "
+              "when.",
+              "The output of the mdm stats command above, taken at the end "
+              "of the run.",
+              "Keep the ~/scopus-received folder; it holds every event and "
+              "photo the test received."]:
+        doc.add_paragraph(a, style="List Bullet")
 
     # ── Automated equivalent ───────────────────────────────────────────
-    doc.add_heading("10. The automated equivalent", level=1)
+    doc.add_heading("17. The automated version", level=1)
     doc.add_paragraph(
-        "This manual walks the same chain the automated suite asserts. Run it "
-        "to check everything at once, including cases that are tedious by "
-        "hand:")
-    code(doc, "$ python3 scopus/run_integration_tests.py\n"
-              "  TOTAL: 47   PASS: 46   FAIL: 0   GAP: 0   SKIP: 1")
-    doc.add_paragraph(
-        "The one skip is the SD card slot being empty. Use the manual "
-        "procedure when you want to see the product work with your own eyes, "
-        "or when the suite fails and you need to find out which hop broke.")
+        "The same chain is checked automatically, in far more detail, by the "
+        "integration suite. It is not a replacement for this manual — this "
+        "one exists to see the product work with your own eyes, and to find "
+        "out which hop broke when the suite goes red — but it is the faster "
+        "way to check everything at once. Stop the server in Window A first, "
+        "since the suite starts its own.")
+    cmd(doc, f"{CD}python3 scopus/run_integration_tests.py")
+    expected(doc)
+    code(doc, "  TOTAL: 57   PASS: 56   FAIL: 0   GAP: 0   SKIP: 1")
+    doc.add_paragraph("The one skip is the SD card slot being empty.")
 
     doc.save(OUT)
     print(f"wrote {OUT}")

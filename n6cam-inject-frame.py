@@ -108,16 +108,38 @@ def load_image_as_rgb888(path: str, w: int = None, h: int = None) -> bytes:
     return data
 
 
+def discover_tty() -> str:
+    """The CDC shell port, resolved from its by-id link.
+
+    The kit enumerates as ttyACM1 or ttyACM2 depending on what else is plugged
+    in and on whether it has been reflashed since boot, so a default of
+    /dev/ttyACM1 is right about half the time — and when it is wrong it fails
+    as "stty failed", which reads like a broken kit rather than a moved port.
+    """
+    import glob
+    for link in sorted(glob.glob(
+            "/dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02")):
+        real = os.path.realpath(link)
+        if os.path.exists(real):
+            return real
+    return "/dev/ttyACM1"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="N6Cam NN test-frame uploader")
     ap.add_argument("image", nargs="?", help="Image file (PNG/JPEG/etc.)")
-    ap.add_argument("tty", nargs="?", default="/dev/ttyACM1", help="CDC tty (default /dev/ttyACM1)")
+    ap.add_argument("tty", nargs="?", default=None,
+                    help="CDC tty (default: resolved from /dev/serial/by-id)")
     ap.add_argument("--raw", help="Use a pre-prepared raw RGB888 192x192 file instead")
     args = ap.parse_args()
 
     if not args.raw and not args.image:
         ap.print_help()
         return 1
+
+    if not args.tty:
+        args.tty = discover_tty()
+        print(f"Camera port: {args.tty}")
 
     rc = os.system(f"stty -F {args.tty} 115200 cs8 -cstopb -parenb raw -echo")
     if rc != 0:
