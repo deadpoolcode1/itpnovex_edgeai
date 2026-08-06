@@ -56,7 +56,10 @@
  * Nor may the notifier's work be folded into _modem_task_run: that loop is
  * the thing that *receives* the response modem_send_at waits for, so a
  * modem_send_at call made from it could never complete. */
-#define MODEM_NOTIFY_TASK_STACK (2U * 1024U)
+/* 4 KB, not 2. The notifier calls the full modem_send_at path, which reaches
+ * HAL's UART code; at 2 KB it was inside a few hundred bytes of its limit
+ * before anything went wrong, which is not a margin. */
+#define MODEM_NOTIFY_TASK_STACK (4U * 1024U)
 #define MODEM_NOTIFY_PRIO       APP_PRIO_USER_INTERFACE
 #define MODEM_EVT_NOTIFY_WORK   BIT(0U)         /* something is in the queue */
 
@@ -97,9 +100,13 @@ typedef struct
 
   /* Link health. `consec_timeouts` counts command timeouts since the last
    * good response; the watchdog relinks when it reaches MODEM_RELINK_AFTER.
-   * `wedged_baud` is non-zero only while a test wedge is in force. */
+   * `wedged_baud` is non-zero only while a test wedge is in force.
+   *
+   * `relink_pending` is a request, not the act: whoever notices the link is
+   * wedged sets it, and _modem_task_run does the work. See _send_at. */
   uint32_t              consec_timeouts;
   uint32_t              wedged_baud;
+  volatile bool         relink_pending;
 
   /* Asynchronous notification queue (see modem_notify_async). Single-slot
    * ring, producer-agnostic: shell_task's notification emitter and the NN
@@ -392,6 +399,11 @@ static int32_t _relink_locked(void)
 
   _m.wedged_baud     = 0U;
   _m.consec_timeouts = 0U;
+  /* Report it too, not just track it. Only _send_at copied this across, so
+   * `mdm stats` kept showing the count that triggered the relink — a link
+   * that had just been recovered read as still wedged, which is the opposite
+   * of what the number means. The tester manual asks for these counters. */
+  _m.stats.consec_timeouts = 0U;
   _m.stats.relinks++;
   LWARNING(TRACE_MODEM, "relink: USART2 re-initialised at %u baud (relinks=%lu)",
            (unsigned)MODEM_UART_BAUD, (unsigned long)_m.stats.relinks);
@@ -441,13 +453,20 @@ static int32_t _send_at(const char *cmd, char *reply, size_t reply_cap,
   size_t cmd_len = strlen(cmd);
   if (cmd_len + 2U > MODEM_FRAME_MAX) return -3;
 
-  /* Build payload "<cmd>\r\n" */
-  uint8_t payload[MODEM_FRAME_MAX];
+  rtos_mutex_acquire(&_m.tx_mtx, true);
+
+  /* Build payload "<cmd>\r\n".
+   *
+   * Static, and filled after tx_mtx is taken rather than before: a kilobyte
+   * of stack here is a kilobyte on the caller's thread, and the smallest
+   * caller is `modem.notify` at 2 KB. tx_mtx serialises every user of this
+   * buffer for as long as it is in use, which is what makes sharing it safe
+   * — moving the fill inside the lock is the whole of that guarantee, so it
+   * must stay there. */
+  static uint8_t payload[MODEM_FRAME_MAX];
   memcpy(payload, cmd, cmd_len);
   payload[cmd_len]      = _crlf[0];
   payload[cmd_len + 1U] = _crlf[1];
-
-  rtos_mutex_acquire(&_m.tx_mtx, true);
 
   /* Derive ticks from TX_TIMER_TICKS_PER_SECOND rather than hard-coding a
    * divisor. This used to divide by 10 for a 100 Hz tick, but the app builds
@@ -545,9 +564,32 @@ static int32_t _send_at(const char *cmd, char *reply, size_t reply_cap,
     _m.stats.consec_timeouts = _m.consec_timeouts;
     if (_m.consec_timeouts >= MODEM_RELINK_AFTER)
     {
-      LWARNING(TRACE_MODEM, "link wedged: %lu consecutive timeouts, relinking",
-               (unsigned long)_m.consec_timeouts);
-      (void)_relink_locked();
+      /* Ask for a relink; do not perform it here.
+       *
+       * Doing it inline reset the camera, reproducibly: `mdm test wedge` then
+       * three notifications, and the trace stops mid-way through the line
+       * below with the next boot reporting `Watchdog boot`. Two reasons, both
+       * fixed by handing the work to the modem task:
+       *
+       *   - Stack. This runs on whichever thread happened to time out, and
+       *     for a notification that is `modem.notify` — 2 KB, of which
+       *     _send_at's payload and the notifier's line buffer already held
+       *     1.5 KB before HAL's UART de-init/re-init frames and a trace call
+       *     went on top. (Those two buffers are static now as well, but the
+       *     thread should not be near its limit for a recovery path to be
+       *     safe.)
+       *   - Re-entrancy on the UART. _modem_task_run is blocked inside
+       *     bsp_uart_read on this very peripheral while we de-init it under
+       *     it. The modem task is the one context where no read is in
+       *     flight.
+       *
+       * The cost is that recovery happens on the modem task's next pass —
+       * within its 1 s read timeout — instead of before this call returns.
+       * The caller has already failed by this point, so it changes nothing
+       * it can observe. */
+      LWARNING(TRACE_MODEM, "link wedged: %lu consecutive timeouts, "
+               "requesting relink", (unsigned long)_m.consec_timeouts);
+      _m.relink_pending = true;
     }
   }
   else
@@ -679,7 +721,9 @@ static void _modem_notify_run(uint32_t args)
 
     for (;;)
     {
-      char line[MODEM_NOTIFY_MAX];
+      /* Static for the same reason as `reply` above: 512 bytes is a quarter
+       * of this thread's stack, and it is live across the whole send. */
+      static char line[MODEM_NOTIFY_MAX];
 
       rtos_mutex_acquire(&_m.ntf_mtx, true);
       if (_m.ntf_count == 0U)
@@ -771,6 +815,24 @@ static void _modem_task_run(uint32_t args)
   uint8_t rx[MODEM_RX_CHUNK];
   while (1)
   {
+    /* Service a relink request before going back to sleep on the UART.
+     *
+     * This is the only context that can: every other caller of the link is
+     * blocked in bsp_uart_read here while it de-inits the peripheral. See
+     * the note in _send_at for what doing it inline cost.
+     *
+     * Try for the lock rather than waiting on it. Blocking here would stop
+     * this loop feeding the decoder, and this loop is what receives the
+     * response the lock's current holder is waiting for — so waiting would
+     * time that command out, set the flag again, and turn one wedge into a
+     * standing one. If the link is busy, the relink can wait a second. */
+    if (_m.relink_pending && (tx_mutex_get(&_m.tx_mtx, TX_NO_WAIT) == TX_SUCCESS))
+    {
+      _m.relink_pending = false;
+      (void)_relink_locked();
+      rtos_mutex_acquire(&_m.tx_mtx, false);
+    }
+
     int32_t n = bsp_uart_read(MODEM_UART, rx, sizeof(rx), 1000U /* ms */);
     if (n > 0)
     {

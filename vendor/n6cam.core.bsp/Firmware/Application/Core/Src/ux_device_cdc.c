@@ -213,8 +213,6 @@ static int32_t _cdc_write(const uint8_t *buff, size_t size, uint32_t timeout)
   int32_t sent;
   int32_t status;
 
-  UNUSED(timeout);
-
   /* Wait until ready (fail fast) */
   status = _cdc_wait_available(0);
   if (status != UX_SUCCESS)
@@ -225,6 +223,25 @@ static int32_t _cdc_write(const uint8_t *buff, size_t size, uint32_t timeout)
   /* Acquire */
   rtos_mutex_acquire(&_cdc_mtx_tx, true);
 
+  /* Honour the caller's timeout, as the read path already does.
+   *
+   * Without this the timeout argument was ignored and a write blocked until
+   * the host drained the endpoint — forever, if nothing had the port open.
+   * That is not a theoretical state on this product: the shell emits
+   * notifications by itself, so a detection with no terminal attached parked
+   * a writer inside USBX holding _cdc_mtx_tx, and every later write — the
+   * command echo, the command's own output — queued behind it. On the bench
+   * it looked as though the camera had ignored a command; it had run it and
+   * had nowhere to say so. Output resumed the moment something read the
+   * port, which is what made it look intermittent.
+   *
+   * A device console must not depend on somebody listening. Dropping a line
+   * nobody is there to read is the correct trade against stalling the shell
+   * that produced it. */
+  ux_device_class_cdc_acm_ioctl(_cdc_ctx,
+                                UX_SLAVE_CLASS_CDC_ACM_IOCTL_SET_WRITE_TIMEOUT,
+                                (VOID*)timeout);
+
 #if !defined(UX_DEVICE_CLASS_CDC_ACM_TRANSMISSION_DISABLE)
   /* Set transmission_status to UX_FALSE for the first time */
   _cdc_ctx->ux_slave_class_cdc_acm_transmission_status = UX_FALSE;
@@ -232,7 +249,10 @@ static int32_t _cdc_write(const uint8_t *buff, size_t size, uint32_t timeout)
 
   /* Transmit chunk */
   status = ux_device_class_cdc_acm_write(_cdc_ctx, (UCHAR*)buff, (ULONG)size, (ULONG*)&sent);
-  if ((status == UX_CONFIGURATION_HANDLE_UNKNOWN) || (status == UX_TRANSFER_NO_ANSWER))
+  if ((status == UX_CONFIGURATION_HANDLE_UNKNOWN) ||
+      (status == UX_TRANSFER_NO_ANSWER)           ||
+      (status == UX_TRANSFER_BUS_RESET)           ||
+      (status == TX_NO_INSTANCE))   /* the IOCTL timeout above, expired */
   {
     sent = 0;
   }

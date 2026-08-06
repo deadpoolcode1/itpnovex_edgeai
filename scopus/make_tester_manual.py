@@ -416,10 +416,11 @@ def build():
               "NN 89.1ms — how long the network took. Anything in the "
               "80–100 ms range is normal."]:
         doc.add_paragraph(a, style="List Bullet")
-    note(doc, "“Attempt 2 of 4” appearing is not a failure. The "
-              "camera drops its console reply if it happens to be sending an "
-              "event at that moment, so the test simply does it again. Only "
-              "the final PASSED / FAILED line decides the step.")
+    note(doc, "It should say Attempt 1 of 4 and stop there. A second "
+              "attempt is not a failure in itself — only the final PASSED / "
+              "FAILED line decides the step — but it used to be caused by a "
+              "firmware fault fixed on 6 August 2026, so mention it in your "
+              "report if you see one.")
     doc.add_paragraph(
         "There are other pictures to try, if you want more than one data "
         "point:")
@@ -631,10 +632,10 @@ def build():
     doc.add_heading("14. If something fails", level=1)
     table(doc, ["What you see", "What it means and what to do"],
           [["Any command says 'no answer'",
-            "The camera drops its console reply if it is sending an event at "
-            "that moment. Run the same command again — it is the reply that "
-            "was lost, not the command. If three tries in a row say this, "
-            "treat it as a real failure and report it."],
+            "Run the same command again — if it was the reply that was lost "
+            "rather than the command, the second one answers. This was a "
+            "firmware fault fixed on 6 August 2026, so unlike the other rows "
+            "here it is worth reporting even when the retry works."],
            ["'ERROR: the modem's AT port was not found', or the modem "
             "answers nothing at all",
             "Almost always another program holding the port — the VS Code "
@@ -644,7 +645,8 @@ def build():
            ["A step worked earlier and now produces no events",
             "The camera has probably restarted, which puts its settings back "
             "to their defaults. Run Step 5's two commands again, then carry "
-            "on. Section 15 explains how to tell."],
+            "on — and report it. Section 15 explains how to tell, and why an "
+            "unprompted restart is now a fault rather than a quirk."],
            ["'mdm AT' does not answer OK",
             "The internal cable between camera and modem is not carrying "
             "traffic. Try it once more, and if it still fails run:  "
@@ -671,25 +673,31 @@ def build():
     # ── Known behaviour ────────────────────────────────────────────────
     doc.add_heading("15. Known behaviour — not your fault", level=1)
     doc.add_paragraph(
-        "These are known and under investigation. They are written down so "
-        "you can recognise them rather than chase them, and so that seeing "
-        "one is worth a note in your report rather than a stopped test.")
+        "The first entry below is normal and needs no action. The other two "
+        "were firmware faults, fixed on 6 August 2026 — they are listed "
+        "because you may have been told to expect them, and because seeing "
+        "either one now means something has regressed and should be reported "
+        "rather than worked around.")
     table(doc, ["Behaviour", "How to recognise it", "What to do"],
-          [["A command's reply goes missing",
+          [["An event is slow to arrive",
+            "Up to about 10 seconds between the camera reporting and Window "
+            "A showing it.",
+            "Normal — the camera retries if the modem does not acknowledge. "
+            "No action."],
+           ["A command's reply goes missing",
             "'no answer to this command', usually right after an event was "
             "sent. The command itself did run.",
-            "Run it again. Note how often it happens."],
+            "FIXED — the camera used to stall its own console whenever "
+            "nothing was reading the port. Run the command again so you are "
+            "not blocked, but report it: it should no longer happen."],
            ["The camera restarts on its own",
             f"Commands stop answering for about 30 seconds; afterwards the "
             f"camera's settings are back to their defaults. Confirm with:  "
             f"{CD}python3 scopus/cam.py uptime  — a number under a minute "
             f"means it has just restarted.",
-            "Redo Step 5, then carry on from where you were. Note the time "
-            "it happened; this one is worth reporting every time."],
-           ["An event is slow to arrive",
-            "Up to about 10 seconds between the camera reporting and Window "
-            "A showing it.",
-            "Normal. The camera retries if the modem does not acknowledge."]])
+            "FIXED — the camera used to reset while recovering the internal "
+            "cable. Redo Step 5 and carry on, and report it with the time it "
+            "happened. This one matters."]])
     doc.add_paragraph()
     doc.add_paragraph("If you want to record the state of the link for a "
                       "report:")

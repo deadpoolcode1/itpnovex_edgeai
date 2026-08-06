@@ -827,11 +827,22 @@ def g_i_link_recovery(s, ctx):
     # MODEM_RELINK_AFTER in the firmware; enough commands to trip the watchdog.
     failed = sum(1 for _ in range(3)
                  if "OK" not in cam.send("mdm AT", "ok", 12.0))
-    after = mdm_stats(cam)
+
+    # The recovery is deliberately asynchronous: the thread that notices the
+    # wedge only asks for a relink, and the modem task performs it on its next
+    # pass — up to its 1 s read timeout later. Doing it inline reset the
+    # camera (it ran on a 2 KB notifier stack, and re-initialised the UART
+    # underneath the task blocked on it), so "did it relink at all" is now
+    # "did it relink promptly". Poll rather than read once.
+    deadline, after = time.time() + 6.0, mdm_stats(cam)
+    while after.get("relinks", 0) <= base and time.time() < deadline:
+        time.sleep(0.5)
+        after = mdm_stats(cam)
     s.ok("I3", "the watchdog relinks automatically after repeated timeouts",
          failed >= 1 and after.get("relinks", 0) > base,
          note=f"{failed}/3 commands failed, relinks {base} -> "
-              f"{after.get('relinks')}")
+              f"{after.get('relinks')}",
+         failnote="the link never relinked within 6 s of going quiet")
 
     ok = sum(1 for _ in range(3) if "OK" in cam.send("mdm AT", "ok", 12.0))
     s.ok("I4", "the link carries traffic again after recovery", ok >= 2,

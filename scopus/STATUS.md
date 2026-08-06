@@ -138,21 +138,14 @@ line is a single copy-paste command against fixed paths on the bench
 Three product problems surfaced that no automated run had caught, because the
 suite drives the shell far faster than a person does:
 
-1. **The camera watchdog-resets when the automatic link recovery fires.**
-   `modem_send_at` relinks after 3 consecutive ack timeouts (§4.1). The trace
-   ends mid-way through printing `link wedged: … relinking` and the next boot
-   says `SYSTEM : Watchdog boot` / `SHELL : Boot 1/3`. Observed 3 times in an
-   hour, always ~4 s after a detection whose ack never came. `mdm relink` by
-   hand is safe (3/3), so it is the notifier-thread path — `_relink_locked()`
-   called from `modem_send_at` with `tx_mtx` held — not `bsp_uart_reinit`
-   itself. A reset loses `detect profile`/`notify enable`, so the by-hand test
-   silently stops producing events afterwards.
-2. **A command's console reply is dropped while a notification is in flight.**
-   Not reordered — absent: no echo, no output, nothing for 25 s, while the
-   command itself runs (the event still reaches the server). It made `frame
-   run` fail ~50% of the time by hand. Waiting for the shell to answer
-   `uptime` again before sending the next command took `inference_test.py`
-   from three attempts to one, which is the workaround the helpers use.
+1. **The camera watchdog-reset when the automatic link recovery fired.**
+   FIXED — see §5. `mdm test wedge 9600` + three notifications reproduced it
+   every time; the trace ended mid-way through `link wedged: … relinking` and
+   the next boot said `Watchdog boot` / `Boot 1/3`.
+2. **A command's console reply was dropped while a notification was in
+   flight.** FIXED — see §5. Not reordered but absent: no echo, no output,
+   nothing for 25 s, while the command itself ran. It made `frame run` fail
+   ~50% of the time by hand.
 3. **An injected frame only notifies if the live scene was empty.**
    `nn_task.c` fires on a 0→N box-count edge, and the live loop keeps
    `_nn_prev_boxes` at whatever the lens sees, so `frame run` on a 3-person
@@ -165,24 +158,17 @@ suite drives the shell far faster than a person does:
 
 1. **Put an SD card in the N6 slot.** It is the only SKIP left, and it unlocks
    the §7 photo→SD pipeline (G4).
-2. **Fix the watchdog reset in the automatic relink — this is now the top
-   item.** See the tester-manual section above: the recovery added for the
-   CN805 wedge takes the camera down instead of recovering it when it fires
-   from the notifier thread. It only shows up when the ack path stalls three
-   times in a row, which is why the suite has never hit it, and it is the
-   worst thing a field unit could do. `mdm relink` from the shell is the same
-   work and is safe, so the difference is the calling context, not
-   `bsp_uart_reinit`.
+2. **HTTPS.** The upload leg is proven over plain HTTP to a PC on the modem
+   subnet. `AT+SDVRUPL*="S"` needs the client-cert set imported; T13.1 still
+   skips on that. (The watchdog reset that stood at the top of this list was
+   fixed on 2026-08-06 — see §5.)
 3. **Watch `relinks` in the field.** The CN805 wedge is now recovered in
    software (§4.1) rather than needing a reboot, but the recovery has only ever
    been exercised against an injected fault — the real latch still cannot be
    reproduced on demand. A climbing `relinks` count on a deployed unit is the
    signal that it is happening for real, and that the hardware fix (a
    direction-controlled translator) is worth doing.
-4. **HTTPS.** The upload leg is proven over plain HTTP to a PC on the modem
-   subnet. `AT+SDVRUPL*="S"` needs the client-cert set imported; T13.1 still
-   skips on that.
-5. `mod`/`bat`/`vol` in the §6 body are still placeholders (`""`, `0.0`,
+4. `mod`/`bat`/`vol` in the §6 body are still placeholders (`""`, `0.0`,
    `0.0`). The transport now carries them at full size (see §1), but nothing
    populates them — `bat`/`vol` need a real sensor source before they mean
    anything.
@@ -370,3 +356,75 @@ one run. The camera's notifier uses `modem_send_at` (with retry) again.
 
 `ntf_unconfirmed` remains as a measure of how lossy the ack path is; it no
 longer implies a lost event.
+
+## 5. Fixed on 2026-08-06 — the watchdog reset, and the lost console reply
+
+Both were found by walking the tester manual by hand, and both were invisible
+to the suite because it drives the shell faster than a person does and always
+has a reader attached to the CDC port.
+
+### 5.1 The camera reset whenever the link recovery fired
+
+**Reproduction** (deterministic, 3/3 before the fix):
+`mdm test wedge 9600`, then three `detect simulate 3`. The third notification
+takes `consec_timeouts` to `MODEM_RELINK_AFTER`, and the board resets: uptime
+went 2747984 → 11509 ms, the trace stopped part-way through printing the
+`link wedged` line, and the next boot reported `SYSTEM : Watchdog boot`.
+
+**Why it only happened automatically.** `mdm relink` does the same work and
+never reset the board (3/3). The difference is which thread runs it:
+
+- `_relink_locked()` was called from inside `_send_at`, i.e. on whichever
+  thread happened to time out. For a notification that is `modem.notify` —
+  a **2 KB** stack that was already holding `_send_at`'s 1 KB `payload` and
+  the notifier's 512-byte `line` when HAL's UART de-init/re-init frames and a
+  trace call went on top of it. The truncated log line is what that looks
+  like from outside.
+- It also re-initialised USART2 while `_modem_task_run` was blocked inside
+  `bsp_uart_read` on that same peripheral.
+
+**Fix.** The thread that notices a wedge now only *asks* for recovery
+(`_m.relink_pending`); `_modem_task_run` performs it at the top of its loop,
+which is the one context with no read in flight and a stack that can take it.
+It uses `tx_mutex_get(TX_NO_WAIT)` — blocking for `tx_mtx` there would stop
+the loop that receives the response the current holder is waiting for, and
+would turn one wedge into a permanent one. `payload` and `line` are static
+now as well (both are covered for their whole lifetime by `tx_mtx` and by
+single-thread ownership respectively), and the notifier stack is 4 KB.
+
+Recovery is therefore **asynchronous**: it happens on the modem task's next
+pass, within its 1 s read timeout — measured at 555 ms. Group I3 polls for it
+rather than reading the counter once, which is also a stronger assertion than
+before ("it relinks promptly", not "it relinked by the time we looked").
+
+Verified after the fix: uptime climbs straight through the same reproduction,
+`relinks` increments, USART2 returns to 115200, and `mdm AT` answers again.
+
+### 5.2 A command's reply vanished while a notification was in flight
+
+`_cdc_write()` took a `timeout` argument and ignored it (`UNUSED(timeout)`),
+so a write blocked until the host drained the endpoint — **forever** if
+nothing had the port open. The camera emits notifications on its own, so a
+detection with no terminal attached parked a writer inside USBX holding
+`_cdc_mtx_tx`, and every later write queued behind it: the echo, the command's
+own output, everything. It looked like the camera ignoring a command when it
+had run it and had nowhere to say so, and it cleared the instant anything read
+the port — which is what made it look intermittent rather than structural.
+
+The fix honours the caller's timeout via
+`UX_SLAVE_CLASS_CDC_ACM_IOCTL_SET_WRITE_TIMEOUT`, exactly as `_cdc_read()`
+already did for reads, and treats the expiry (`TX_NO_INSTANCE`) as "wrote
+nothing" instead of falling through to `Error_Handler()`. Callers already pass
+sensible values: 1000 ms for shell output and echo (`SLIB32_STREAM_PRINT_TIMEOUT`),
+100 ms for notifications. A console must not depend on somebody listening;
+dropping a line nobody is there to read beats stalling the shell that produced
+it.
+
+Measured: `detect stop` → inject → `detect start` → `frame run` returned the
+full result **4/4** first time, against roughly one in three before.
+
+### 5.3 `mdm stats` contradicted itself after a relink
+
+`_relink_locked()` cleared `_m.consec_timeouts` but not its copy in `stats`,
+so a link that had just been recovered still reported the count that triggered
+the recovery. The tester manual asks for these counters, so it now clears both.
