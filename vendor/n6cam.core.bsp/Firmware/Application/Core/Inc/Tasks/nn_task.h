@@ -176,9 +176,32 @@ void nn_task_simulate_detection(uint32_t boxes);
  *
  *        Cache-flush of the supplied buffer is the caller's responsibility.
  *
+ *        The override EXPIRES. It lapses NN_TEST_FRAME_TTL_S seconds after
+ *        the last call, and every call restarts that clock, so a sequence of
+ *        'frame run' / tile sweeps holds it for as long as the sequence
+ *        lasts and no longer. This is deliberate: an override that outlives
+ *        the test that set it leaves the product inferring on a photograph
+ *        while appearing to watch the room, and nothing downstream — not the
+ *        live view, not the detection notifications — can tell the
+ *        difference. A test frame is a test frame; it should not survive the
+ *        test.
+ *
  * @param frame Buffer pointer, or NULL to revert to live camera.
  */
 void nn_task_set_test_frame(uint8_t *frame);
+
+/**
+ * @brief Whether a test frame is currently driving the NN.
+ *        True means the boxes being reported and drawn describe an injected
+ *        picture, NOT what the lens sees. Callers that show detections to a
+ *        human, or report them as real events, must say so or suppress them.
+ */
+bool nn_task_test_frame_active(void);
+
+/**
+ * @brief Seconds left before the test-frame override lapses, 0 if none.
+ */
+uint32_t nn_task_test_frame_remaining_s(void);
 
 /**
  * @brief Return the most recent post-processed detection count (for

@@ -440,20 +440,27 @@ def build():
               "camera)'. Do not skip this line: it is the one that gives the "
               "camera its own lens back."]:
         doc.add_paragraph(a, style="List Bullet")
-    note(doc, "Why that last line matters. The picture this step pushes in "
-              "stays in the camera until it is explicitly cleared — it does "
-              "not wear off, and restarting detection does not shift it. "
-              "While it is loaded the camera keeps looking at that same still "
-              "picture instead of through its lens, so Step 9 cannot pass, "
-              "and the live view draws the picture's people on top of the "
-              "real video, which looks like the detection has gone wrong. "
-              "The step above clears it for you. If for any reason it did "
-              "not say 'cleared', do it by hand before going on:", warn=True)
+    note(doc, "Why that last line matters. While the picture is loaded the "
+              "camera looks at it instead of through its lens, so Step 9 "
+              "cannot pass, and the live view draws the picture's people on "
+              "top of the real video, which looks like the detection has "
+              "gone wrong. The step above clears it for you. If for any "
+              "reason it did not say 'cleared', do it by hand before going "
+              "on:", warn=True)
     cmd(doc, f'{CD}python3 scopus/cam.py "frame clear"')
     expected(doc)
     code(doc, "[camera /dev/ttyACM2] > frame clear\n"
               "frame: cleared (NN back to live camera)\n"
               "frame clear ok")
+    note(doc, "The camera guards this itself as well, from the firmware of 9 "
+              "August 2026 onwards. A loaded picture lapses on its own about "
+              "two minutes after the last time it was used, and while it is "
+              "loaded the live view says TEST PICTURE - NOT THE LENS with the "
+              "seconds remaining, and the camera sends no detection events — "
+              "a photograph is not allowed to be reported as people in the "
+              "room. So the worst a forgotten picture can now cost you is a "
+              "two-minute wait. Clear it anyway; knowing why the safety net "
+              "is there is not a reason to land in it.")
     note(doc, "It should say Attempt 1 of 4 and stop there. A second "
               "attempt is not a failure in itself — only the final PASSED / "
               "FAILED line decides the step — but it used to be caused by a "
@@ -562,8 +569,10 @@ def build():
         "'empty' is what you need — no picture loaded, so the camera is on "
         "its lens. 'NN running' means detection is on. If it says "
         "'frame: loaded' instead, the Step 7 picture is still in there and no "
-        "amount of walking about will produce an event. Clear it and check "
-        "again:")
+        "amount of walking about will produce an event; the reply tells you "
+        "how many seconds until it lapses by itself, and the live view will "
+        "be showing TEST PICTURE - NOT THE LENS. Clear it and check again "
+        "rather than waiting:")
     cmd(doc, f'{CD}python3 scopus/cam.py "frame clear"')
     note(doc, "If it says 'NN stopped' rather than 'NN running', detection is "
               "off: run  " + CD + "python3 scopus/cam.py \"detect start\"  "

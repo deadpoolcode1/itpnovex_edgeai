@@ -638,11 +638,29 @@ static void _display_add_detections(void)
   }
 
   /* Draw detections number */
+  uint32_t ypos = BORDER_PADDING + (_show_header_left? FONT_TITLE.height: 0U);
   draw_printf_hw(
     &_draw, &FONT_INFO,
-    BORDER_PADDING, BORDER_PADDING + (_show_header_left? FONT_TITLE.height: 0U), HEADER_LEFT_WIDTH,
+    BORDER_PADDING, ypos, HEADER_LEFT_WIDTH,
     "Objects: %2d ", selected_count
   );
+
+  /* Say when these boxes are not the live scene.
+   *
+   * Without this the overlay is a liar: an injected test frame's detections
+   * are drawn over the live video, so the boxes sit on doorways and walls
+   * and the picture looks like a camera whose detection has gone wrong. It
+   * cost three days once. Whoever is looking at the screen is exactly the
+   * person who needs to be told. */
+  if (nn_task_test_frame_active())
+  {
+    draw_printf_hw(
+      &_draw, &FONT_INFO,
+      BORDER_PADDING, ypos + FONT_INFO.height, HEADER_LEFT_WIDTH,
+      "TEST PICTURE - NOT THE LENS (%lus)",
+      (unsigned long)nn_task_test_frame_remaining_s()
+    );
+  }
 }
 
 /**

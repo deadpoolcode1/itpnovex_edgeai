@@ -928,10 +928,25 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 
   if (strcmp(sub, "query") == 0)
   {
-    CMD_PRINTF(stream, "frame: %s (NN %s)%s",
-               _frame_loaded ? "loaded" : "empty",
-               nn_task_detect_get() ? "running" : "stopped",
-               lwshell_eol());
+    /* Report the override, not _frame_loaded. They diverge once the
+     * override lapses on its own, and the one that matters to the caller
+     * is the one the NN is actually reading. */
+    bool active = nn_task_test_frame_active();
+    if (active)
+    {
+      CMD_PRINTF(stream, "frame: loaded (NN %s) — inference is running on the "
+                         "test picture, NOT the lens; lapses in %lus%s",
+                 nn_task_detect_get() ? "running" : "stopped",
+                 (unsigned long)nn_task_test_frame_remaining_s(),
+                 lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "frame: empty (NN %s)%s",
+                 nn_task_detect_get() ? "running" : "stopped",
+                 lwshell_eol());
+    }
+    _frame_loaded = active;
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }

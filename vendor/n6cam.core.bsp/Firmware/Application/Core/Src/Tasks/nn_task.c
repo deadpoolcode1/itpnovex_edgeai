@@ -211,10 +211,56 @@ void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
 /* Test-frame override: when non-NULL, the NN loop reads inference input
  * from this buffer instead of the camera's ancillary buffer. Useful for
  * bench-testing the algorithm against a known scene without depending on
- * camera focus. Caller is responsible for cache coherence. */
-static uint8_t * volatile _nn_test_frame_override = NULL;
+ * camera focus. Caller is responsible for cache coherence.
+ *
+ * It expires. `frame upload` arms this buffer immediately (so that a
+ * following `detect start` cannot feed the NN an ATON-hostile live frame
+ * mid-test), and nothing in the shell obliges anyone to clear it again —
+ * which meant an injection test could, and did, leave the product running
+ * inference on a still photograph for three days. The live view kept
+ * drawing that picture's boxes over the real video, and because detection
+ * notifications fire on the 0->N box edge and the picture's count never
+ * fell back to zero, no real person walking into view could raise an event
+ * again. Neither symptom looks like a fault; both look like a camera that
+ * has stopped seeing people.
+ *
+ * So the override carries a deadline that every set() restarts. A test
+ * holds it for as long as the test runs; an abandoned test gets the lens
+ * back on its own. */
+#define NN_TEST_FRAME_TTL_S       120U
+#define NN_TEST_FRAME_TTL_TICKS   (NN_TEST_FRAME_TTL_S * TX_TIMER_TICKS_PER_SECOND)
 
-void nn_task_set_test_frame(uint8_t *frame) { _nn_test_frame_override = frame; }
+static uint8_t * volatile _nn_test_frame_override = NULL;
+static volatile uint32_t  _nn_test_frame_deadline = 0U;
+
+/* Signed compare, so the comparison stays correct across tick wrap. */
+static bool _nn_test_frame_expired(void)
+{
+  return (int32_t)(tx_time_get() - _nn_test_frame_deadline) >= 0;
+}
+
+void nn_task_set_test_frame(uint8_t *frame)
+{
+  _nn_test_frame_deadline = tx_time_get() + NN_TEST_FRAME_TTL_TICKS;
+  _nn_test_frame_override = frame;
+}
+
+bool nn_task_test_frame_active(void)
+{
+  return (_nn_test_frame_override != NULL) && !_nn_test_frame_expired();
+}
+
+uint32_t nn_task_test_frame_remaining_s(void)
+{
+  if (!nn_task_test_frame_active())
+  {
+    return 0U;
+  }
+  int32_t left = (int32_t)(_nn_test_frame_deadline - tx_time_get());
+  return (left <= 0) ? 0U
+                     : ((uint32_t)left / TX_TIMER_TICKS_PER_SECOND) + 1U;
+}
+
 uint32_t nn_task_get_box_count(void)        { return (uint32_t)_pp_box_count; }
 
 /* Debug: snapshot of the model's most recent output tensor. The NN loop
@@ -329,6 +375,15 @@ static void _nn_task_run(uint32_t args)
      * scene (W6 algorithm validation when camera optics are subpar). */
     {
       uint8_t *override = _nn_test_frame_override;
+      if ((override != NULL) && _nn_test_frame_expired())
+      {
+        /* Hand the lens back, once, and say so loudly enough that anyone
+         * reading the console understands why the picture stopped. */
+        _nn_test_frame_override = NULL;
+        override = NULL;
+        LWARNING(TRACE_NN, "test frame expired after %u s — NN back on the "
+                           "live camera", (unsigned)NN_TEST_FRAME_TTL_S);
+      }
       _nn_frame = (override != NULL) ? override
                                      : camera_get_buffer(camera.ancillary.id);
     }
@@ -361,7 +416,22 @@ static void _nn_task_run(uint32_t args)
        * per the action_msk profile. Edge-only so we don't spam SD
        * with one JPEG per frame at 22 Hz. */
       uint32_t cur_boxes = (uint32_t)_pp_box_count;
-      if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U))
+      /* Never let an injected picture masquerade as a real detection. The
+       * side effects here are the product's outward claims — a JPEG filed
+       * as evidence and a notification telling the customer's server that
+       * people are present. Both must describe the lens. `frame run` still
+       * reports its count on the console, which is what an injection test
+       * actually reads, and `detect simulate` is still the explicit way to
+       * exercise this path on purpose. */
+      if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U)
+          && (_nn_test_frame_override != NULL))
+      {
+        LWARNING(TRACE_NN, "%lu detection(s) from the injected test frame — "
+                           "not reported (use 'detect simulate' to test the "
+                           "notification path)", (unsigned long)cur_boxes);
+      }
+      else if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U)
+               && (_nn_action_mask != 0U))
       {
         /* bit0 = save to SD: build SoW §7 filename + trigger snapshot */
         if (_nn_action_mask & 0x01U)
