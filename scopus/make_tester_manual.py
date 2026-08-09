@@ -50,6 +50,20 @@ CD = f"cd {REPO} && "
 # Without it the document still builds, with a placeholder the tester will
 # obviously have to replace — which is better than a wrong key that looks right.
 
+# The machine this document is written for: the one the camera and the modem
+# are physically plugged into. Naming it matters — "the bench PC" is ambiguous
+# the moment there is more than one, and a tester who runs these commands on
+# the wrong machine gets "no such device" for reasons no troubleshooting table
+# can explain.
+BENCH_HOST = "T7ARYZ0009769Z2"
+BENCH_ADDR = "100.115.215.6"
+BENCH_SSH_PORT = 4322
+BENCH_USER = "user"
+
+# The APN this bench's SIM uses. A placeholder here would be a step the tester
+# cannot complete, and the wrong APN is indistinguishable from a dead SIM.
+BENCH_APN = "m2m.jtglobal.com"
+
 RELAY_IP = "165.22.181.245"
 RELAY_HTTP_PORT = 80
 RELAY_PATH = "/scopus/upload"
@@ -185,6 +199,25 @@ def build():
         "Roughly 20 minutes end to end, most of it waiting for the photo to "
         "cross the internal cable between the two boards.")
 
+    doc.add_paragraph()
+    doc.add_paragraph("There are two ways to run this test:").bold = True
+    table(doc, ["Mode", "How the product sends", "Where to look"],
+          [["Cable", "Over the USB cable to this PC, which plays the part of "
+                     "the customer's server. Nothing leaves the room.",
+            "Steps 1 to 12, in order — this is the default"],
+           ["Cellular", "Over the mobile network to a server on the internet, "
+                        "which this PC then reads. This is what a deployed "
+                        "unit does.",
+            "Section 18. It replaces Steps 3 and 4; everything else is "
+            "identical"]])
+    doc.add_paragraph(
+        "Run the cable mode first, even if cellular is what you were asked "
+        "to test. It uses the same camera, the same modem and the same "
+        "internal cable, so if it fails, cellular was never going to work "
+        "and you have already found out where — which is the one thing the "
+        "cellular mode cannot tell you, because a fault in the product and a "
+        "fault in the mobile network look identical from the far end.")
+
     # ── What this proves ───────────────────────────────────────────────
     doc.add_heading("2. What this test proves", level=1)
     doc.add_paragraph(
@@ -227,16 +260,32 @@ def build():
         "anything with it; it is here so you can recognise the parts by name "
         "when a step mentions them.")
     table(doc, ["Item", "Detail"],
-          [["This PC", "The bench PC. It plays the part of the customer's "
-                       "server. Its address on the modem's network is "
-                       "192.168.2.3"],
+          [["This PC", f"{BENCH_HOST} — the PC the two boards are plugged "
+                       f"into, and the one every command in this document is "
+                       f"typed on. It plays the part of the customer's "
+                       f"server. Its address on the modem's network is "
+                       f"192.168.2.3"],
            ["N6Cam", "The camera board. Connected to this PC by USB"],
            ["WP76 modem", "The modem board. Connected to this PC by USB (for "
                           "commands) and Ethernet (192.168.2.2, for the data "
                           "it sends)"],
            ["Internal cable", "Camera to modem. This is the link the product "
                               "depends on and the one this test exercises"],
-           ["Software", f"Already installed at {REPO}"]])
+           ["Software", f"Already installed at {REPO}"],
+           ["Relay", f"For the cellular test only (section 18): a server at "
+                     f"{RELAY_IP} that receives what the modem sends over the "
+                     f"mobile network. Already running; nothing to start"]])
+    doc.add_paragraph()
+    doc.add_paragraph(
+        "Every command in this document is typed on that PC. Sit at it if "
+        "you can. If you are working from your own machine instead, open a "
+        "terminal there and connect first — everything afterwards is "
+        "identical:")
+    cmd(doc, f"ssh -p {BENCH_SSH_PORT} {BENCH_USER}@{BENCH_ADDR}")
+    note(doc, f"The login password is the same as the machine's name, "
+              f"{BENCH_HOST}. If the connection times out, you are not on a "
+              f"network that can see this PC — that is a network problem to "
+              f"raise, not a test failure.")
 
     # ── Step 1 ─────────────────────────────────────────────────────────
     doc.add_heading("Step 1 — Close anything else using the devices",
@@ -757,6 +806,12 @@ def build():
            ["10", "No event was delivered twice", "Step 11"],
            ["11", "The closing summary shows all events valid and all "
                   "uploads complete", "Step 12"]])
+    note(doc, "Running the cellular mode (section 18)? The same eleven apply "
+              "unchanged, with one substitution: criterion 2 becomes “all "
+              "four flags of AT+SDVRNET? are 1”, which is Step C1 rather "
+              "than Step 4. Say in your report which mode each result came "
+              "from — “the event arrived” means something different over the "
+              "cable than it does over the mobile network.")
 
     # ── Troubleshooting ────────────────────────────────────────────────
     doc.add_heading("14. If something fails", level=1)
@@ -944,6 +999,45 @@ def build():
     note(doc, "The relay is already installed and running as a service. "
               "Nothing in this section starts or stops it.")
 
+    doc.add_heading("Step C0 — Check the modem can use cellular at all",
+                    level=2)
+    doc.add_paragraph(
+        "Two minutes here saves an hour of blaming the product. Run these "
+        "three, in Window B, before anything else.")
+    note(doc, "These four use --raw, which asks the modem's own AT parser "
+              "instead of the product's command channel. Questions about the "
+              "SIM and the radio have to go there: sent the ordinary way the "
+              "reply comes back as unreadable rubbish, which looks like a "
+              "broken modem and is not one. --raw needs the USB cable, even "
+              "though what you are testing is cellular.")
+    doc.add_paragraph("Is the SIM being read?")
+    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT+CPIN?"')
+    expected(doc)
+    code(doc, "[modem /dev/ttyAT]\n      AT+CPIN?\n      +CPIN: READY\n      OK")
+    note(doc, "“+CME ERROR: SIM failure” does NOT mean the holder is "
+              "empty. On this bench the SIM was present the whole time and "
+              "the modem was reading the wrong slot — this one line was the "
+              "difference between “no SIM” and a working LTE connection. "
+              "Check the slot before touching the hardware:", warn=True)
+    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT!UIMS?"')
+    doc.add_paragraph(
+        "If that answers 0 and there is a card in the holder, switch it to "
+        "the other slot and ask AT+CPIN? again. These two are the fix that "
+        "made this bench work:")
+    cmd(doc, f'{CD}python3 scopus/at.py --raw \'AT!ENTERCND="A710"\'')
+    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT!UIMS=1"')
+
+    doc.add_paragraph()
+    doc.add_paragraph("Is there coverage?")
+    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT+COPS?"')
+    expected(doc)
+    code(doc, '[modem /dev/ttyAT]\n      AT+COPS?\n'
+              '      +COPS: 0,0,"<operator name>",7\n      OK')
+    doc.add_paragraph(
+        "A named operator is what you want. An empty name, or an answer of "
+        "just +COPS: 0, means the modem has not found a network — move the "
+        "bench or its antenna before going on.")
+
     doc.add_heading("Step C1 — Point the modem at the relay", level=2)
     doc.add_paragraph(
         "This replaces Step 4. It sets the same five endpoints, but at the "
@@ -952,7 +1046,11 @@ def build():
         "route out before reporting success.")
     cmd(doc, f"{CD}python3 scopus/at.py --point-cloud {RELAY_IP} "
              f"--http-port {RELAY_HTTP_PORT} --udp-port {RELAY_UDP_PORT} "
-             f"--path {RELAY_PATH} --apn <your-apn>")
+             f"--path {RELAY_PATH} --apn {BENCH_APN}")
+    note(doc, f"{BENCH_APN} is the APN for the SIM in this bench. A different "
+              f"SIM needs a different one, and the wrong APN looks exactly "
+              f"like a dead SIM — so if you were given one, use it here "
+              f"rather than assuming this line still applies.")
     expected(doc)
     code(doc, f'  AT+SDVRNTFHOST="{RELAY_IP}"\n'
               "      OK\n"
@@ -1021,12 +1119,9 @@ def build():
     table(doc, ["What you see", "What it means and what to do"],
           [["Step C1: 2nd number is 0 (not registered)",
             "Either there is no coverage where the bench is, or the modem is "
-            "reading the wrong SIM slot. Check the slot first — it costs one "
-            f"command:  {CD}python3 scopus/at.py \"AT!UIMS?\"  . If it "
-            "answers 0 and there is a SIM in the external holder, try "
-            f"{CD}python3 scopus/at.py \"AT!UIMS=1\"  and run Step C1 again. "
-            "This bench needed exactly that: the SIM was there the whole "
-            "time and the modem was looking at the other slot."],
+            "reading the wrong SIM slot. Both are covered by Step C0 — go "
+            "back and run it; it takes two minutes and answers this "
+            "question directly."],
            ["Step C1: 3rd number is 0 (no data session)",
             "The APN is the first suspect — pass the right one with --apn. "
             "If several APNs all give the same result, the SIM's data "
@@ -1038,6 +1133,14 @@ def build():
             "Two known causes: a SIM whose data service is not actually "
             "active (it registers, gets an address, and carries nothing), "
             "and the relay's UDP port being closed by the server's firewall."],
+           ["Any --raw command says it cannot reach the modem",
+            "That path goes over the USB Ethernet link, not the serial one, "
+            "so it fails when the modem has dropped off USB — which also "
+            "makes the ordinary commands answer with unreadable characters. "
+            "Check both cables at the modem board, then re-run Step 2. If "
+            "the modem does not reappear within a minute, it needs someone "
+            "to re-seat it; nothing in this document can be run until it "
+            "does."],
            ["Photos arrive but events do not",
             "These use different ports and different protocols — photos go "
             f"over TCP {RELAY_HTTP_PORT}, events over UDP {RELAY_UDP_PORT}. "

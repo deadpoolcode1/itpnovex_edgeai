@@ -4,6 +4,7 @@
     python3 scopus/at.py "AT+SDVRVER"
     python3 scopus/at.py --point-here             # aim the modem at this PC
     python3 scopus/at.py --point-cloud 1.2.3.4    # aim it at a public relay
+    python3 scopus/at.py --raw "AT+CPIN?"         # ask the modem itself
 
 --point-here is the whole of "Step 2" in the tester manual: it works out which
 of this PC's addresses is on the modem's subnet and sets the five endpoints
@@ -27,9 +28,39 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
-from devices import ModemAt                                  # noqa: E402
+from devices import ModemAt, ModemSsh                        # noqa: E402
 
 MODEM_IP = "192.168.2.2"
+
+
+def raw_at(cmd, timeout=8.0):
+    """Send a command to the modem's OWN AT parser, not to the SDVR channel.
+
+    The FTDI port this script normally uses reaches the SDVR application, which
+    bridges anything it does not recognise through to the modem. That bridge is
+    fine for +SDVR* work and unusable for the SIM and radio commands: the reply
+    comes back at the wrong line settings and arrives as binary rubbish, which
+    reads like a broken modem and is not one.
+
+    /dev/ttyAT on the modem itself is the modem's real AT port, so questions
+    about the SIM, the slot and the operator are asked there. It costs an SSH
+    hop, which is why it is not the default.
+    """
+    ssh = ModemSsh()
+    if not ssh.reachable():
+        print(f"ERROR: no SSH to the modem at {MODEM_IP} — this path needs "
+              f"the USB Ethernet link, even when testing over cellular.",
+              file=sys.stderr)
+        return None
+    esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    rc, out, err = ssh.run(
+        f'printf "{esc}\\r" | microcom -t {int(timeout * 1000)} /dev/ttyAT',
+        timeout=timeout + 10)
+    if rc != 0 and not out:
+        print(f"ERROR: {err.strip() or 'the modem did not answer'}",
+              file=sys.stderr)
+        return None
+    return out
 
 
 def this_pc_ip(modem_ip=MODEM_IP):
@@ -202,6 +233,10 @@ def main() -> int:
                     choices=["none", "pap", "chap"])
     ap.add_argument("--apn-user", default="")
     ap.add_argument("--apn-pass", default="")
+    ap.add_argument("--raw", action="store_true",
+                    help="send the command to the modem's own AT parser "
+                         "(SIM, slot and radio questions) instead of the "
+                         "SDVR channel")
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--udp-port", type=int, default=9999)
     ap.add_argument("--path", default="/upload")
@@ -210,6 +245,21 @@ def main() -> int:
 
     if not args.command and not args.point_here and not args.point_cloud:
         ap.error("give an AT command, or --point-here / --point-cloud")
+
+    # --raw does not touch the FTDI port at all, so it is handled before the
+    # port is opened: the SIM questions must still be answerable when
+    # something else is holding that port.
+    if args.raw:
+        if not args.command:
+            ap.error("--raw needs a command")
+        out = raw_at(" ".join(args.command), args.timeout)
+        if out is None:
+            return 2
+        print(f"[modem /dev/ttyAT]")
+        for line in out.replace("\r", "").splitlines():
+            if line.strip():
+                print(f"      {line.strip()}")
+        return 0 if "ERROR" not in out else 1
     if args.point_here and args.point_cloud:
         ap.error("--point-here and --point-cloud aim at different servers; "
                  "pick one")

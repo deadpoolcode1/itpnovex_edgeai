@@ -45,6 +45,26 @@ and the pull base is `http://165.22.181.245/scopus`.
    verified (a datagram sent from the droplet to its own public address is
    received and parsed).
 
+### Ask SIM/radio questions with `at.py --raw`, not the SDVR channel
+
+`AT+CPIN?`, `AT!UIMS?`, `AT+COPS?` sent over the FTDI port come back as
+**binary rubbish** — the SDVR app bridges unrecognised commands to the modem
+and the reply returns at the wrong line settings. It reads like a dead modem
+and is not one. `at.py --raw` sends them to `/dev/ttyAT` on the modem over
+SSH instead. That path needs the USB Ethernet link even when the thing under
+test is cellular.
+
+### The bench modem dropped off USB at the end of 2026-08-09
+
+`lsusb` shows no Sierra device, there are no `usb-Sierra_Wireless_*` by-id
+nodes, and `cdc_ether … unregister` is in dmesg — with the FTDI adapter
+re-attaching on a *different* USB port (3-6 → 3-5), which is a re-plug
+signature rather than anything software did. The N6Cam and the ST-Link are
+still there. **The modem needs re-seating by someone at the bench**; until
+then the SDVR channel answers garbage and `192.168.2.2` does not ping. It was
+healthy for the whole session up to that point, including the 1.8.0 install
+and every verification above.
+
 ### The SIM was in slot 2 all along
 
 `AT+CPIN?` answered `+CME ERROR: SIM failure` and `!GSTATUS` said `NO IMSI`,
