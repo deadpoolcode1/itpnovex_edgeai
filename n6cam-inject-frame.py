@@ -59,6 +59,31 @@ def _drain(fd, secs: float):
             time.sleep(0.02)
 
 
+def _drain_quiet(fd, quiet: float = 0.5, cap: float = 8.0):
+    """Read until the port has said nothing for `quiet` seconds.
+
+    Draining for a fixed short time is not enough: whatever the shell was
+    doing when we opened the port keeps arriving afterwards, and those bytes
+    are still in the buffer when we look for the upload banner. The banner
+    read then fails on a buffer full of the *previous* command's reply, the
+    upload is abandoned, and the retry hits the same state — which is how
+    four attempts in a row can fail with the kit perfectly healthy.
+    """
+    end = time.time() + cap
+    last = time.time()
+    while time.time() < end:
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            chunk = b""
+        if chunk:
+            last = time.time()
+        elif time.time() - last >= quiet:
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def _read_until(fd, needles, timeout: float) -> bytes:
     end = time.time() + timeout
     buf = b""
@@ -150,11 +175,25 @@ def main() -> int:
     try:
         # A previous aborted upload leaves the kit mid-payload and desyncs the
         # shell; clear before arming or the header is read as pixel data.
+        _drain_quiet(fd)
         _write(fd, b"\nframe clear\n")
-        _drain(fd, 0.4)
+        _drain_quiet(fd)
 
-        _write(fd, b"\nframe upload\n")
-        banner = _read_until(fd, (b"Ready", b"ERROR"), 4.0)
+        # Ask twice if need be. The kit answers within milliseconds when it is
+        # idle, so a missing banner means it was busy rather than broken, and
+        # re-arming is harmless — 'frame upload' with no payload behind it
+        # times out on the kit and leaves the shell where it started.
+        # 'ERROR: bad magic' here is the good case of the bad case: it means
+        # the kit was already armed from an attempt whose banner we missed,
+        # read this command as the header, rejected it, and disarmed. It is
+        # now idle and the next arm works — so keep going rather than fail.
+        banner = b""
+        for _ in range(3):
+            _write(fd, b"\nframe upload\n")
+            banner = _read_until(fd, (b"Ready", b"ERROR"), 8.0)
+            if b"Ready" in banner:
+                break
+            _drain_quiet(fd)
 
         # The kit tells us exactly what it wants -- believe it rather than a
         # constant in this file, which is how the 300x300/256x256 mismatch went

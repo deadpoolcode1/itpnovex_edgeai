@@ -93,6 +93,22 @@ def table(doc, headers, rows, widths=None):
         cells = t.add_row().cells
         for i, v in enumerate(row):
             cells[i].text = v
+    if widths:
+        # Three things have to agree or the widths are ignored: autofit off,
+        # every cell's own width, and w:tblGrid — which is the one that
+        # actually governs under a fixed layout, and which python-docx leaves
+        # at equal columns however many cell widths you set.
+        t.autofit = False
+        for r in t.rows:
+            for i, w in enumerate(widths):
+                r.cells[i].width = Inches(w)
+        grid = t._tbl.find(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+            "tblGrid")
+        if grid is not None:
+            for col, w in zip(grid, widths):
+                col.set("{http://schemas.openxmlformats.org/wordprocessingml/"
+                        "2006/main}w", str(int(w * 1440)))
     return t
 
 
@@ -388,34 +404,56 @@ def build():
         "Rather than pointing the lens at real people — where nobody knows "
         "what the right answer was — this pushes a picture with a known "
         "number of people in it into the camera's neural network, and checks "
-        "the number that comes back. It takes about a minute.")
+        "the number that comes back. It then puts the camera back on its own "
+        "lens, which is what Step 9 needs. It takes about a minute.")
     cmd(doc, f"{CD}python3 scopus/inference_test.py")
     expected(doc)
     code(doc,
          "Camera on /dev/ttyACM2 — expecting 3 people in 3_people.jpg\n\n"
          "Attempt 1 of 4:\n"
-         "  [1/4] stopping live detection\n"
-         "  [2/4] injecting images/3_people.jpg\n"
+         "  [1/5] stopping live detection\n"
+         "  [2/5] injecting images/3_people.jpg\n"
          "        Camera port: /dev/ttyACM2\n"
          "        Frame: 256x256 RGB888 (196608 bytes, CRC32 0x13a92fb1)\n"
-         "        frame upload: ok (196608 bytes, CRC 0x13a92fb1) frame upload ok\n"
+         "        frame upload: ok (196608 bytes, CRC 0x13a92fb1) frame upload ok  >\n"
          "        Uploaded. Next:  > frame run    (over the same CDC port)\n"
-         "  [3/4] starting detection\n"
-         "  [4/4] running inference on it\n"
-         "        frame run: 3 detection(s), NN 89.1ms\n"
+         "  [3/5] starting detection\n"
+         "  [4/5] running inference on it\n"
+         "        frame run: 3 detection(s), NN 87.9ms\n"
          "        [0] class=0 conf=0.78 bbox=(0.73,0.71,0.18,0.44)\n"
          "        [1] class=0 conf=0.71 bbox=(0.51,0.64,0.15,0.60)\n"
          "        [2] class=0 conf=0.84 bbox=(0.36,0.73,0.14,0.41)\n"
-         "        frame run ok\n\n"
-         "PASSED — 3 people detected in 89.1 ms, which matches the picture.")
+         "        frame run ok\n"
+         "  [5/5] returning the camera to the live lens\n"
+         "        frame: cleared (NN back to live camera)\n"
+         "        frame clear ok\n\n"
+         "PASSED — 3 people detected in 87.9 ms, which matches the picture. "
+         "The camera is\nback on its live lens.")
     doc.add_paragraph("What to check:")
     for a in ["The last line says PASSED.",
               "Three detections, one per person in the picture.",
               "class=0 on every line — class 0 is 'person'. A different "
               "class number means it found something, but not a person.",
-              "NN 89.1ms — how long the network took. Anything in the "
-              "80–100 ms range is normal."]:
+              "NN 87.9ms — how long the network took. Anything in the "
+              "80–100 ms range is normal.",
+              "Step [5/5] is there and says 'frame: cleared (NN back to live "
+              "camera)'. Do not skip this line: it is the one that gives the "
+              "camera its own lens back."]:
         doc.add_paragraph(a, style="List Bullet")
+    note(doc, "Why that last line matters. The picture this step pushes in "
+              "stays in the camera until it is explicitly cleared — it does "
+              "not wear off, and restarting detection does not shift it. "
+              "While it is loaded the camera keeps looking at that same still "
+              "picture instead of through its lens, so Step 9 cannot pass, "
+              "and the live view draws the picture's people on top of the "
+              "real video, which looks like the detection has gone wrong. "
+              "The step above clears it for you. If for any reason it did "
+              "not say 'cleared', do it by hand before going on:", warn=True)
+    cmd(doc, f'{CD}python3 scopus/cam.py "frame clear"')
+    expected(doc)
+    code(doc, "[camera /dev/ttyACM2] > frame clear\n"
+              "frame: cleared (NN back to live camera)\n"
+              "frame clear ok")
     note(doc, "It should say Attempt 1 of 4 and stop there. A second "
               "attempt is not a failure in itself — only the final PASSED / "
               "FAILED line decides the step — but it used to be caused by a "
@@ -425,10 +463,42 @@ def build():
         "There are other pictures to try, if you want more than one data "
         "point:")
     cmd(doc, f"{CD}python3 scopus/inference_test.py --image "
-             f"images/7_people.jpg --expect 7")
-    note(doc, "images/ has 1_person, 2_people, 3_people, 5_people, 7_people "
-              "and some crowd scenes. The count on a crowd is approximate by "
-              "nature — use the small ones for a pass/fail judgement.")
+             f"images/2_people.jpg --expect 2")
+    doc.add_paragraph(
+        "Before you try the rest, read this table. It is what these pictures "
+        "actually return on this build, measured on the bench — not what they "
+        "ought to return. Two of them do not match their own name, for "
+        "reasons that are understood, and a tester who runs them without "
+        "knowing that will report a fault that is not there:")
+    table(doc, ["Picture", "People in it", "Camera reports", "Why"],
+          [["1_person.jpg", "1", "1", "—"],
+           ["2_people.jpg", "2", "2", "—"],
+           ["3_people.jpg", "3", "3",
+            "the picture this step uses; the pass/fail one"],
+           ["7_people.jpg", "7", "6 — every time",
+            "one of the seven stands behind the others and is mostly hidden. "
+            "The network reports what it can see, and it cannot see a whole "
+            "person there. Expected; not a fault."],
+           ["5_people.jpg", "5", "1 — every time",
+            "a wide riverside view where the people are far away and only a "
+            "few pixels tall. The network sees the whole scene shrunk to "
+            "256x256, and at that size they are not there to be found. A "
+            "known limit on distant figures, not a fault in this build."]],
+          widths=[1.15, 0.85, 1.05, 3.15])
+    note(doc, "So do not judge the step on 7_people or 5_people. Step 7 "
+              "passes or fails on the 3-person picture, which is what the "
+              "command at the top of this step runs. The other two are here "
+              "to show you the edges of what the camera can do, and their "
+              "numbers are recorded above so that seeing them does not cost "
+              "you a false fault report. If either one gives a different "
+              "number from the table, that is worth reporting.", warn=True)
+    note(doc, "images/ also has some crowd scenes. The count on a crowd is "
+              "approximate by nature — nobody agrees on the true number "
+              "either — so use them for a look, never for a judgement.")
+    note(doc, "Each extra picture you try loads itself into the camera and "
+              "clears itself again the same way, so the last thing any of "
+              "these runs does is hand the lens back. Whichever one you "
+              "finish on, check its [5/5] line before moving on.")
 
     # ── Step 8 ─────────────────────────────────────────────────────────
     doc.add_heading("Step 8 — Check an event reaches this PC", level=1)
@@ -476,7 +546,31 @@ def build():
     doc.add_paragraph(
         "This is the product doing its job, with nothing injected or "
         "simulated. Detection is already running from Step 7.")
-    doc.add_paragraph("Do this:")
+    doc.add_paragraph(
+        "First, one check. This step only works if the camera is looking "
+        "through its own lens, and Step 7 is the one thing in this procedure "
+        "that takes the lens away from it. Step 7 gives it back on its way "
+        "out, so this should already be true — but it costs five seconds to "
+        "be sure, and it is the difference between testing the product and "
+        "testing a photograph. In Window B:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "frame query"')
+    expected(doc)
+    code(doc, "[camera /dev/ttyACM2] > frame query\n"
+              "frame: empty (NN running)\n"
+              "frame query ok")
+    doc.add_paragraph(
+        "'empty' is what you need — no picture loaded, so the camera is on "
+        "its lens. 'NN running' means detection is on. If it says "
+        "'frame: loaded' instead, the Step 7 picture is still in there and no "
+        "amount of walking about will produce an event. Clear it and check "
+        "again:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "frame clear"')
+    note(doc, "If it says 'NN stopped' rather than 'NN running', detection is "
+              "off: run  " + CD + "python3 scopus/cam.py \"detect start\"  "
+              "and then redo Step 5, which sets what the camera does when it "
+              "detects something.")
+    doc.add_paragraph()
+    doc.add_paragraph("Now the step itself. Do this:")
     for a in ["Make sure nobody is in front of the camera, and wait about "
               "ten seconds. The camera reports the moment people appear "
               "where there were none, so it has to see an empty scene first.",
@@ -503,10 +597,17 @@ def build():
               "presence — standing there does not produce a message every "
               "second, by design. To get another one, step out of view, wait "
               "for the scene to be empty for a few seconds, and step back in.")
-    note(doc, "If nothing arrives: the camera has to see an empty scene "
-              "before it can see people arrive. If the room already had "
-              "people in view when Step 7 finished, step everyone out of "
-              "view, wait ten seconds, then walk back in.")
+    note(doc, "If nothing arrives, work through these three in order. One: "
+              "run 'frame query' again — if it says 'loaded', the Step 7 "
+              "picture is back in the way and nothing else you try can work. "
+              "Two: the camera has to see an empty scene before it can see "
+              "people arrive, so if the room already had people in view, step "
+              "everyone out, wait ten seconds, then walk back in. Three: if "
+              "the live view keeps drawing boxes on an empty room — on a door "
+              "frame or a plant, say — the camera believes people are already "
+              "there and is waiting for them to leave. Report that with a "
+              "photo of the screen; it is a real finding and not something "
+              "you can work around.")
 
     # ── Step 10 ────────────────────────────────────────────────────────
     doc.add_heading("Step 10 — Capture a photo and upload it", level=1)
@@ -620,7 +721,9 @@ def build():
            ["6", "That event is reported 'valid JSON, 9 fields'",
             "Step 8, Window A"],
            ["7", "Real people walking into view produce an event with the "
-                 "right count", "Step 9, Window A"],
+                 "right count — with 'frame query' saying 'empty', so the "
+                 "camera was on its lens and not on the Step 7 picture",
+            "Step 9, Window A"],
            ["8", "A photo arrives and is reported 'JPEG, complete'",
             "Step 10, Window A"],
            ["9", "The saved file opens as a picture of the room", "Step 11"],
@@ -631,7 +734,24 @@ def build():
     # ── Troubleshooting ────────────────────────────────────────────────
     doc.add_heading("14. If something fails", level=1)
     table(doc, ["What you see", "What it means and what to do"],
-          [["Any command says 'no answer'",
+          [["Step 9: people really are in front of the camera, the live view "
+            "even draws boxes, but Window A stays silent",
+            "The Step 7 picture is almost certainly still loaded, so the "
+            "camera is looking at that photograph and not through its lens — "
+            "the boxes you see are the photograph's people painted over the "
+            "live video, which is why they sit on doors and walls. Check "
+            f"with:  {CD}python3 scopus/cam.py \"frame query\"  — if it says "
+            f"'loaded', run:  {CD}python3 scopus/cam.py \"frame clear\"  and "
+            "redo Step 9. Step 7 clears it for you, so if you find it loaded "
+            "here, say so in your report."],
+           ["Step 7 says 'the picture did not load', on every attempt",
+            "The camera's console and the uploader are out of step — usually "
+            "something else was talking to the camera at the same moment. Run "
+            "the step once more; it re-syncs on its own. If all four attempts "
+            "fail again, check the camera did not restart underneath you:  "
+            f"{CD}python3 scopus/cam.py uptime  — a number under a minute "
+            "means it did, and that is worth reporting."],
+           ["Any command says 'no answer'",
             "Run the same command again — if it was the reply that was lost "
             "rather than the command, the second one answers. This was a "
             "firmware fault fixed on 6 August 2026, so unlike the other rows "
@@ -673,11 +793,11 @@ def build():
     # ── Known behaviour ────────────────────────────────────────────────
     doc.add_heading("15. Known behaviour — not your fault", level=1)
     doc.add_paragraph(
-        "The first entry below is normal and needs no action. The other two "
-        "were firmware faults, fixed on 6 August 2026 — they are listed "
-        "because you may have been told to expect them, and because seeing "
-        "either one now means something has regressed and should be reported "
-        "rather than worked around.")
+        "The first entry below is normal and needs no action. The second was "
+        "a firmware fault, fixed on 6 August 2026 — it is listed because you "
+        "may have been told to expect it, and because seeing it now means "
+        "something has regressed and should be reported rather than worked "
+        "around. The third is still open, and is the one to watch.")
     table(doc, ["Behaviour", "How to recognise it", "What to do"],
           [["An event is slow to arrive",
             "Up to about 10 seconds between the camera reporting and Window "
@@ -691,13 +811,25 @@ def build():
             "nothing was reading the port. Run the command again so you are "
             "not blocked, but report it: it should no longer happen."],
            ["The camera restarts on its own",
-            f"Commands stop answering for about 30 seconds; afterwards the "
-            f"camera's settings are back to their defaults. Confirm with:  "
+            f"Commands stop answering for about 30 seconds; afterwards "
+            f"detection is off and the camera's settings are back to their "
+            f"defaults. Confirm with:  "
             f"{CD}python3 scopus/cam.py uptime  — a number under a minute "
             f"means it has just restarted.",
-            "FIXED — the camera used to reset while recovering the internal "
-            "cable. Redo Step 5 and carry on, and report it with the time it "
-            "happened. This one matters."]])
+            "OPEN — the cause behind the internal cable was fixed, but one "
+            "restart was seen on 9 August 2026 during a Step 7 injection and "
+            "could not be reproduced afterwards. So this is not closed. Run "
+            "'uptime' the moment anything stops answering, redo Step 5 and "
+            "carry on, and report it with the time to the second — that "
+            "timestamp is what makes it findable. This one matters."]])
+    doc.add_paragraph()
+    note(doc, "If a restart does happen, the useful evidence is on the "
+              "camera's own console at the moment it goes: it prints a line "
+              "beginning FAILURE and naming the part that failed, then "
+              "restarts about a third of a second later. Nothing captures "
+              "that unless a window is watching the camera port at the time. "
+              "If you are asked to chase a repeat of this, that is the "
+              "recording to make.")
     doc.add_paragraph()
     doc.add_paragraph("If you want to record the state of the link for a "
                       "report:")
