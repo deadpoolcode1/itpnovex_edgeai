@@ -1,6 +1,112 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-06. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-09. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-09 — cellular backhaul
+
+The product can now be tested the way it is deployed: the modem sends over its
+own cellular connection to a server on the internet, and the tester's PC — which
+has no public address and is behind whatever router it is behind — watches what
+arrives by *pulling* from that server. Neither end accepts an inbound
+connection, so the procedure works from any network with nothing to configure
+on a router.
+
+| Piece | Where | What |
+|---|---|---|
+| `scopus/cloud_relay.py` | droplet `165.22.181.245` (`sds8200.duckdns.org`) | UDP notification sink + HTTP photo sink + pull API. systemd unit `scopus-relay`, ports 39999/udp and 38080/tcp, data under `~/scopus-relay/data` |
+| `scopus/relay_pull.py` | the tester's PC | long-polls the relay, writes `scopus-received/` and prints the same lines `test_server.py` does |
+| `scopus/at.py --point-cloud <ip>` | the bench | sets the five endpoints at the relay, sets the APN, `AT+SDVRNET=1`, waits for a **route** |
+| `AT+SDVRNET` (app 1.8.0) | the modem | the cellular backhaul, as a thing you can switch on and look at |
+
+**Reach the relay on port 80, not 38080.** A DigitalOcean cloud firewall in
+front of that droplet passes inbound TCP 22/80/443 and nothing else — verified
+with `tcpdump` on the droplet seeing *zero* packets on 38080 while the host's
+own iptables is `ACCEPT`. Caddy therefore proxies `http://165.22.181.245/scopus/*`
+to the relay (an IP-keyed site block, deliberately separate from the
+`sds8200.duckdns.org` block so the hostname's automatic-HTTPS and ACME handling
+are untouched). The upload endpoint is `http://165.22.181.245:80/scopus/upload`
+and the pull base is `http://165.22.181.245/scopus`.
+
+### Two things are blocked and both need someone else
+
+1. **The SIM's data service carries nothing.** The modem registers on LTE
+   (`HOTMOBILE` roaming, signal 5), gets an IP and a gateway on every APN
+   tried — `novx`, `internet`, `sierra.iot`, `jtm2m`, `m2m.jtglobal.com` — and
+   then `TX packets: 268, RX packets: 0`. No DNS, no TCP to 8.8.8.8:53, no
+   ping to its own gateway. The eSIM is a JT Global profile (IMSI
+   `234500040066501`, ICCID `89332500000003665094`). This is a
+   subscription/provisioning matter with the SIM's operator, not a device
+   fault: everything up to and including "packets leave the radio" works.
+2. **UDP cannot reach the relay** until the droplet's cloud firewall gains an
+   inbound rule for **UDP 39999**. Photos ride TCP 80 and are unaffected; this
+   blocks only the notification leg. The relay's UDP listener itself is
+   verified (a datagram sent from the droplet to its own public address is
+   received and parsed).
+
+### The SIM was in slot 2 all along
+
+`AT+CPIN?` answered `+CME ERROR: SIM failure` and `!GSTATUS` said `NO IMSI`,
+which reads exactly like an empty holder. The modem was selecting slot 1
+(`AT!UIMS: 0`). `AT!ENTERCND="A710"` then `AT!UIMS=1` and a `AT+CFUN=0/1`
+cycle → `+CPIN: READY`, ICCID, LTE registration. **Check `AT!UIMS?` before
+concluding a SIM is missing.**
+
+### What was actually proven end to end
+
+A real 127,281-byte 800×600 JPEG went camera → modem → public internet →
+relay → this PC, complete (`FFD8`…`FFD9`), pulled down by `relay_pull.py`.
+Because the SIM carries nothing, that run used a host route through the bench
+PC as a stand-in for the radio (`route add -host 165.22.181.245 gw 192.168.2.3
+dev ecm0` on the modem, plus `ip_forward` + a MASQUERADE rule on the bench —
+the route was removed afterwards so a "cellular" test cannot silently pass over
+the cable; the bench NAT rules are still in place and are inert without it).
+Everything except the radio hop is therefore proven against the real public
+server. The notification leg was proven as far as the wire: `Notify_Send: 102
+bytes sent over UDP` in the modem log, and `tcpdump` on the bench showing the
+102-byte datagram leaving for `165.22.181.245:39999`.
+
+### Firmware: 1.7.1 → 1.8.0
+
+The Scopus paths never brought the network up. `Notify_Send()` and
+`UploadFile_FromMemory()` — the two the use case actually runs on — went
+straight to `sendto`/curl, while only the SD-upload paths called
+`Network_Register()`, which is also the only thing that installs the default
+route. On a unit with no cable that is `ENETUNREACH` and curl error 7 on a
+perfectly capable modem.
+
+- **`network.c`**: a keeper thread (`sdvrNetKeep`) owns the data session —
+  brings it up on request, re-establishes it in auto mode every 30 s if the
+  network drops it, with 10→300 s backoff. `Network_IsDataUp()` judges on the
+  session **and** `/proc/net/route`, because "connected" without a route is the
+  exact failure being fixed. `RegisterAndConnect()` is the old sequence minus
+  the "server already reachable" short-circuit (the keeper must not skip
+  cellular because the cable happens to work — the cable is what is about to be
+  unplugged); `Network_Register()` keeps it. A `RegMtx` serialises the two
+  callers.
+- **The registration wait was dead code.** It registered an `le_mrc`
+  state-change handler and waited on a semaphore, on threads that run no event
+  loop — the callback could never fire, and only the already-registered fast
+  path ever worked. Replaced with polling, which behaves the same on any
+  thread.
+- **`notify.c`**: on `ENETUNREACH`/`EHOSTUNREACH`/`ENETDOWN`, ask the keeper
+  and return as before — no blocking. `AT+SDVRNTFA` is idempotent and the
+  camera retries, so the retry lands once the link is up.
+- **`upload_file.c`**: `UploadFile_FromMemory` waits up to 25 s for a link
+  (free when it is already up).
+- **`AT+SDVRNET=0|1` / `AT+SDVRNET?`**, `+SDVRNET: UP|ERROR <code>`, and
+  `NETAUTO=1|0` in `tconf.ini`.
+
+Verified on HW: `+SDVRNET: 1,1,1,1,"Sierra Wireless","LTE","m2m.jtglobal.com",
+"rmnet_data0","10.123.5.12","10.123.5.13",0`, keeper log
+`Network keeper: data session up`, and a `detect simulate 2` whose 102-byte
+JSON reached `Notify_Send` and was sent — the send that used to fail.
+
+`Scopus_Tester_Manual.docx` section 18 is the tester-facing procedure
+(purely additive: 32 blocks inserted, 0 deleted). The relay key is **not** in
+the repo — generate the tester's copy with
+`SCOPUS_RELAY_KEY=... python3 scopus/make_tracked_manual.py`.
 
 ---
 
@@ -156,6 +262,11 @@ suite drives the shell far faster than a person does:
 
 ### Next session — what is actually left
 
+0. **The two cellular blockers, both external** (see the 2026-08-09 section):
+   a data subscription on the SIM that actually carries traffic, and an
+   inbound **UDP 39999** rule on the droplet's DigitalOcean cloud firewall.
+   With those two, section 18 of the tester manual runs as written — every
+   other part of it is already proven against the real public relay.
 1. **Put an SD card in the N6 slot.** It is the only SKIP left, and it unlocks
    the §7 photo→SD pipeline (G4).
 2. **HTTPS.** The upload leg is proven over plain HTTP to a PC on the modem

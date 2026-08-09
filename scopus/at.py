@@ -2,19 +2,29 @@
 """Send one AT command to the modem's SDVR channel and print the reply.
 
     python3 scopus/at.py "AT+SDVRVER"
-    python3 scopus/at.py --point-here          # aim the modem at this PC
+    python3 scopus/at.py --point-here             # aim the modem at this PC
+    python3 scopus/at.py --point-cloud 1.2.3.4    # aim it at a public relay
 
 --point-here is the whole of "Step 2" in the tester manual: it works out which
 of this PC's addresses is on the modem's subnet and sets the five endpoints
 from it, then reads them back. It is one command instead of five because the
 five have to agree with each other and with the address the server is actually
 bound to, and typing them by hand is where that goes wrong.
+
+--point-cloud is the same step for the cellular test, where the endpoints are
+a relay on the public internet instead of this PC, and where there is a sixth
+thing to get right: the modem needs its own way out. It sets the APN, turns
+the data-session keeper on, and then waits for a *route* before calling it a
+success — a modem can be registered on LTE with a PDP address and still have
+nowhere to send a packet, which is the state that makes every notification
+fail with "network unreachable" while every status screen looks healthy.
 """
 import argparse
 import os
 import socket
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 from devices import ModemAt                                  # noqa: E402
@@ -91,20 +101,118 @@ def point_here(at, http_port, udp_port, path):
     return 0
 
 
+def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd):
+    """Aim the modem at a public relay and switch the backhaul to cellular.
+
+    The cable version of this (--point-here) can work out the address by
+    asking the routing table. Nothing can work this one out: the relay is
+    wherever you put it, and over cellular the modem has no route to this PC
+    at all — the whole point is that both ends talk to a third machine.
+
+    The address must be a dotted IP, not a hostname. The upload leg would
+    accept a name (curl resolves it), but the notification leg is a raw UDP
+    socket whose endpoint goes through inet_pton, so a hostname there is
+    stored happily and then fails on every send.
+    """
+    try:
+        socket.inet_aton(ip)
+        if ip.count(".") != 3:
+            raise OSError
+    except OSError:
+        print(f"ERROR: '{ip}' is not a dotted IPv4 address. The notification "
+              f"channel cannot resolve names — pass the relay's IP.",
+              file=sys.stderr)
+        return 2
+
+    print(f"Pointing the modem at the relay at {ip}\n")
+    cmds = [f'AT+SDVRNTFHOST="{ip}"',
+            f"AT+SDVRNTFPORT={udp_port}",
+            f'AT+SDVRHOSTIP="{ip}"',
+            f"AT+SDVRPORT={http_port}",
+            f'AT+SDVRSRVRPATH="{path}"']
+    if apn:
+        cmds.append(f'AT+SDVRAPN="{apn}","{auth}","{user}","{pwd}"')
+    # Last, so the link comes up against endpoints that are already set.
+    cmds.append("AT+SDVRNET=1")
+
+    bad = [c for c in cmds if "OK" not in show(at, c)]
+
+    print("\nRead back what the modem now has:")
+    ntf = show(at, "AT+SDVRNTFHOST?") + show(at, "AT+SDVRNTFPORT?")
+    got = show(at, "AT+SDVRSRVGET")
+
+    if bad:
+        print(f"\nFAILED: {len(bad)} command(s) were not accepted: "
+              f"{', '.join(bad)}", file=sys.stderr)
+        return 1
+    if ip not in got or str(http_port) not in got or path not in got:
+        print(f"\nFAILED: the read-back does not show {ip}:{http_port}{path}.",
+              file=sys.stderr)
+        return 1
+    if ip not in ntf or str(udp_port) not in ntf:
+        print(f"\nFAILED: the read-back does not show notifications going to "
+              f"{ip}:{udp_port}.", file=sys.stderr)
+        return 1
+
+    # Bringing the radio up takes tens of seconds and AT+SDVRNET=1 returns
+    # immediately, so poll rather than declaring success on the OK. What is
+    # being waited for is a *route*, not registration: a modem can be camped
+    # on LTE with a PDP address and still have nowhere to send a packet.
+    print("\nWaiting for the cellular link (up to 90 s)…")
+    deadline = time.time() + 90
+    state = ""
+    while time.time() < deadline:
+        state = at.send("AT+SDVRNET?", 6.0).replace("\r", "")
+        fields = state.split("+SDVRNET:")[-1].split(",") if "+SDVRNET:" in state else []
+        if len(fields) > 4 and fields[3].strip() == "1":
+            break
+        time.sleep(5)
+
+    print()
+    show(at, "AT+SDVRNET?")
+    if "+SDVRNET:" in state:
+        f = [x.strip() for x in state.split("+SDVRNET:")[-1].split(",")]
+        if len(f) > 4 and f[3] == "1":
+            print(f"\nOK — cellular link up. Notifications to {ip}:{udp_port}, "
+                  f"photos to http://{ip}:{http_port}{path}")
+            return 0
+        reg, con, rte = (f[1], f[2], f[3]) if len(f) > 4 else ("?", "?", "?")
+        print(f"\nFAILED: no route out after 90 s "
+              f"(registered={reg} session={con} route={rte}).\n"
+              f"  registered=0 → no coverage, or the SIM is in the slot the\n"
+              f"                 modem is not selecting (AT!UIMS? / AT!UIMS=1)\n"
+              f"  session=0    → wrong APN, or data not provisioned on the SIM\n"
+              f"  route=0      → session up but no default route; check the log",
+              file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Send an AT command to the modem's SDVR channel.")
     ap.add_argument("command", nargs="*", help='e.g. "AT+SDVRVER"')
     ap.add_argument("--point-here", action="store_true",
                     help="set the notification + upload endpoints to this PC")
+    ap.add_argument("--point-cloud", metavar="IP", default=None,
+                    help="set the endpoints to a public relay at this IP and "
+                         "switch the modem to its cellular backhaul")
+    ap.add_argument("--apn", default=None,
+                    help="APN to set alongside --point-cloud")
+    ap.add_argument("--apn-auth", default="none",
+                    choices=["none", "pap", "chap"])
+    ap.add_argument("--apn-user", default="")
+    ap.add_argument("--apn-pass", default="")
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--udp-port", type=int, default=9999)
     ap.add_argument("--path", default="/upload")
     ap.add_argument("--timeout", type=float, default=4.0)
     args = ap.parse_args()
 
-    if not args.command and not args.point_here:
-        ap.error("give an AT command, or --point-here")
+    if not args.command and not args.point_here and not args.point_cloud:
+        ap.error("give an AT command, or --point-here / --point-cloud")
+    if args.point_here and args.point_cloud:
+        ap.error("--point-here and --point-cloud aim at different servers; "
+                 "pick one")
 
     try:
         at = ModemAt()
@@ -116,6 +224,11 @@ def main() -> int:
 
     if args.point_here:
         return point_here(at, args.http_port, args.udp_port, args.path)
+
+    if args.point_cloud:
+        return point_cloud(at, args.point_cloud, args.http_port, args.udp_port,
+                           args.path, args.apn, args.apn_auth, args.apn_user,
+                           args.apn_pass)
 
     reply = show(at, " ".join(args.command), args.timeout)
     if not reply.strip():

@@ -118,6 +118,35 @@ python3 scopus/test_server.py --http-port 8080 --udp-port 9999 \
         --dir ~/scopus-received --from-modem 192.168.2.2
 ```
 
+### Over cellular (section 18 of the manual)
+
+`test_server.py` only works while the cable is attached. On cellular the modem
+has a carrier-NAT address and your PC has no public address, so neither end can
+open a connection to the other — a third machine has to hold the middle.
+
+`cloud_relay.py` runs on a host with a public address and receives exactly what
+`test_server.py` receives; `relay_pull.py` runs on your PC and pulls it down
+over an ordinary outbound request. Both ends dial out, so it works from any
+network with nothing to configure on a router.
+
+```bash
+# on the public host (already installed as the systemd unit scopus-relay)
+python3 scopus/cloud_relay.py --key <secret> --udp-port 39999 --http-port 38080
+
+# on the bench: aim the modem there and switch it to cellular
+python3 scopus/at.py --point-cloud 165.22.181.245 --http-port 80 \
+        --udp-port 39999 --path /scopus/upload --apn <apn>
+
+# on your PC: watch what arrives
+python3 scopus/relay_pull.py --relay http://165.22.181.245/scopus --key <secret>
+```
+
+Two things bite here, both documented in `STATUS.md`: the notification host
+must be a dotted **IP** (that leg is a raw UDP socket and never resolves
+names), and the modem needs `AT+SDVRNET=1` — being registered on LTE is not
+the same as having a route, and the difference is invisible unless you look at
+the fourth flag of `AT+SDVRNET?`.
+
 ## Run
 
 Run on the host the hardware is attached to (the bench/remote PC):
@@ -168,6 +197,10 @@ scopus/
   run_integration_tests.py   # whole-product chain, hop by hop (JSON report)
   test_server.py             # the "server" end: receives notifications (UDP)
                              #   and photo uploads (HTTP), on your PC
+  cloud_relay.py             # the same receiver, on a public host, for the
+                             #   cellular test — plus a pull API
+  relay_pull.py              # pulls from the relay onto your PC (no inbound
+                             #   port needed anywhere)
   Scopus_Tester_Manual.docx  # step-by-step MANUAL E2E test (generated)
   make_tester_manual.py      # regenerates the .docx — edit this, not the docx
   STATUS.md                  # RESUME HERE: bench access, build/deploy, what's open
