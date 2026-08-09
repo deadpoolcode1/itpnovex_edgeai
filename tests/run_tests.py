@@ -368,7 +368,7 @@ def save_image_pair(image_path: Path, boxes: List[dict], dest_dir: Path,
 # when the App hangs in NN inference. NRST works even with Debug
 # Authentication locked, so this is our only software-only recovery
 # without the boot switch.
-_STM32_PROG_CLI = (
+_STM32_PROG_CLI = os.environ.get("STM32_PROG_CLI") or (
     "/home/ilan/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/"
     "STM32_Programmer_CLI"
 )
@@ -386,10 +386,20 @@ def recover_kit(sh: KitShell) -> bool:
     if not os.path.exists(_STM32_PROG_CLI):
         return False
     import subprocess
-    try:
-        subprocess.run([_STM32_PROG_CLI, "-c", "port=SWD", "-hardrst"],
-                       capture_output=True, timeout=20)
-    except Exception:
+    # `-hardrst` needs a live target connection first, which a
+    # Debug-Authentication-locked part refuses ("Unable to get core ID").
+    # Connecting with mode=UR asserts NRST for the duration of the connect
+    # attempt, which reboots the kit even though the AP stays closed — so
+    # try that first and keep -hardrst as the fallback for unlocked parts.
+    for args in (["-c", "port=SWD", "mode=UR"],
+                 ["-c", "port=SWD", "-hardrst"]):
+        try:
+            subprocess.run([_STM32_PROG_CLI, *args],
+                           capture_output=True, timeout=30)
+            break
+        except Exception:
+            continue
+    else:
         return False
     # CDC re-enumerates ~5–8 s after NRST. KitShell.reopen() polls.
     time.sleep(6.0)
