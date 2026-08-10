@@ -62,7 +62,7 @@ BENCH_USER = "user"
 
 # The APN this bench's SIM uses. A placeholder here would be a step the tester
 # cannot complete, and the wrong APN is indistinguishable from a dead SIM.
-BENCH_APN = "m2m.jtglobal.com"
+BENCH_APN = "internet"
 
 RELAY_IP = "165.22.181.245"
 RELAY_HTTP_PORT = 80

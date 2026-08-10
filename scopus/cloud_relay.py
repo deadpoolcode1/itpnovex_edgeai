@@ -191,6 +191,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _text(self, code, text):
+        """A plain-text answer with an explicit Content-Length.
+
+        The device treats any 2xx as success and anything else as an error.
+        This is HTTP/1.1 with keep-alive, so the length has to be declared or
+        curl waits for a body that never ends.
+        """
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ── device side ──────────────────────────────────────────────────────
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0") or 0)
@@ -205,6 +219,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(401, {"error": "bad token"})
             return
 
+        # A notification over HTTP instead of UDP. Same event, same shape, so
+        # the pull side and the counters cannot tell the two apart — only the
+        # `via` field records which wire it came down, which is what makes it
+        # possible to switch transports without touching relay_pull.py or the
+        # tester's procedure.
+        #
+        # This exists because UDP is the one leg that cannot be relied on: it
+        # needs an inbound rule on the hosting firewall that TCP 80 already
+        # has, and a datagram that is dropped anywhere in between leaves no
+        # trace at either end. POST answers with a status code, so the device
+        # learns whether the event actually landed.
+        if urllib.parse.urlparse(self.path).path == "/notify":
+            text = body.decode(errors="replace")
+            try:
+                obj, valid = json.loads(text), True
+            except json.JSONDecodeError:
+                obj, valid = None, False
+            ev = self.store.add("notification",
+                                {"from": self._peer(), "raw": text,
+                                 "json": obj, "valid": valid, "via": "http"})
+            self.logf(f"NOTIFICATION from {self._peer()} over HTTP "
+                      f"seq={ev['seq']} "
+                      f"{'valid JSON' if valid else 'NOT VALID JSON'}: "
+                      f"{text[:200]}")
+            self._text(200, "OK")
+            return
+
         name = pathlib.Path(self.headers.get("X-Filename") or "upload.bin").name
         ok, kind = jpeg_verdict(body)
         ev = self.store.add("upload", {
@@ -217,14 +258,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.logf(f"UPLOAD from {self._peer()} {len(body)} bytes "
                   f"seq={ev['seq']} {kind}")
 
-        # The device treats any 2xx as success and anything else as an upload
-        # error, so answer plainly and always with a Content-Length: this is
-        # HTTP/1.1 with keep-alive and curl will otherwise hang for the body.
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self._text(200, "OK")
 
     # ── viewer side ──────────────────────────────────────────────────────
     def do_GET(self):

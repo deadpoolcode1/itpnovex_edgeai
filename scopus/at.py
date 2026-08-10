@@ -101,6 +101,12 @@ def point_here(at, http_port, udp_port, path):
     # address, and answers ERROR rather than guessing.
     cmds = [f'AT+SDVRNTFHOST="{ip}"',
             f"AT+SDVRNTFPORT={udp_port}",
+            # Explicitly back to UDP: this is the command Step C4 uses to
+            # leave the cellular procedure, and the local server in Step 3
+            # listens on a datagram port. Leaving the transport wherever the
+            # cellular run left it would make the cable test receive nothing
+            # for a reason nothing on screen explains.
+            "AT+SDVRNTFPROTO=0",
             f'AT+SDVRHOSTIP="{ip}"',
             f"AT+SDVRPORT={http_port}",
             f'AT+SDVRSRVRPATH="{path}"']
@@ -132,7 +138,8 @@ def point_here(at, http_port, udp_port, path):
     return 0
 
 
-def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd):
+def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd,
+                notify_proto="http", notify_path="/scopus/notify"):
     """Aim the modem at a public relay and switch the backhaul to cellular.
 
     The cable version of this (--point-here) can work out the address by
@@ -156,11 +163,24 @@ def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd):
         return 2
 
     print(f"Pointing the modem at the relay at {ip}\n")
-    cmds = [f'AT+SDVRNTFHOST="{ip}"',
-            f"AT+SDVRNTFPORT={udp_port}",
-            f'AT+SDVRHOSTIP="{ip}"',
-            f"AT+SDVRPORT={http_port}",
-            f'AT+SDVRSRVRPATH="{path}"']
+
+    # Notifications go over HTTP by default on the cellular procedure, and
+    # over UDP only if asked. A datagram needs an inbound rule on the relay's
+    # host that TCP 80 already has for the photos, and when it is dropped
+    # anywhere in between neither end can tell; a POST is answered with a
+    # status code the modem logs per event. So on cellular the notification
+    # port is the *web* port, not the datagram port.
+    if notify_proto == "http":
+        cmds = [f'AT+SDVRNTFHOST="{ip}"',
+                f"AT+SDVRNTFPORT={http_port}",
+                f'AT+SDVRNTFPROTO=1,"{notify_path}"']
+    else:
+        cmds = [f'AT+SDVRNTFHOST="{ip}"',
+                f"AT+SDVRNTFPORT={udp_port}",
+                "AT+SDVRNTFPROTO=0"]
+    cmds += [f'AT+SDVRHOSTIP="{ip}"',
+             f"AT+SDVRPORT={http_port}",
+             f'AT+SDVRSRVRPATH="{path}"']
     if apn:
         cmds.append(f'AT+SDVRAPN="{apn}","{auth}","{user}","{pwd}"')
     # Last, so the link comes up against endpoints that are already set.
@@ -169,7 +189,8 @@ def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd):
     bad = [c for c in cmds if "OK" not in show(at, c)]
 
     print("\nRead back what the modem now has:")
-    ntf = show(at, "AT+SDVRNTFHOST?") + show(at, "AT+SDVRNTFPORT?")
+    ntf = (show(at, "AT+SDVRNTFHOST?") + show(at, "AT+SDVRNTFPORT?")
+           + show(at, "AT+SDVRNTFPROTO?"))
     got = show(at, "AT+SDVRSRVGET")
 
     if bad:
@@ -204,7 +225,10 @@ def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd):
     if "+SDVRNET:" in state:
         f = [x.strip() for x in state.split("+SDVRNET:")[-1].split(",")]
         if len(f) > 4 and f[3] == "1":
-            print(f"\nOK — cellular link up. Notifications to {ip}:{udp_port}, "
+            where = (f"http://{ip}:{http_port}{notify_path}"
+                     if notify_proto == "http" else
+                     f"{ip}:{udp_port} (UDP)")
+            print(f"\nOK — cellular link up. Notifications to {where}, "
                   f"photos to http://{ip}:{http_port}{path}")
             return 0
         reg, con, rte = (f[1], f[2], f[3]) if len(f) > 4 else ("?", "?", "?")
@@ -240,6 +264,13 @@ def main() -> int:
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--udp-port", type=int, default=9999)
     ap.add_argument("--path", default="/upload")
+    ap.add_argument("--notify-proto", choices=("http", "udp"), default="http",
+                    help="how --point-cloud sends notifications (default "
+                         "http: rides the same TCP port the photos already "
+                         "use, and the relay answers with a status code)")
+    ap.add_argument("--notify-path", default="/scopus/notify",
+                    help="request path for HTTP notifications "
+                         "(default /scopus/notify)")
     ap.add_argument("--timeout", type=float, default=4.0)
     args = ap.parse_args()
 
@@ -278,7 +309,7 @@ def main() -> int:
     if args.point_cloud:
         return point_cloud(at, args.point_cloud, args.http_port, args.udp_port,
                            args.path, args.apn, args.apn_auth, args.apn_user,
-                           args.apn_pass)
+                           args.apn_pass, args.notify_proto, args.notify_path)
 
     reply = show(at, " ".join(args.command), args.timeout)
     if not reply.strip():
