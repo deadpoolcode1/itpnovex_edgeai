@@ -69,6 +69,10 @@ RELAY_HTTP_PORT = 80
 RELAY_PATH = "/scopus/upload"
 RELAY_BASE = f"http://{RELAY_IP}/scopus"
 RELAY_UDP_PORT = 39999
+# Where notifications are POSTed on the cellular procedure. They ride the same
+# web port as the photos rather than a datagram port, so they cross whatever
+# the relay's host already allows through for the uploads.
+RELAY_NOTIFY_PATH = "/scopus/notify"
 RELAY_KEY = os.environ.get("SCOPUS_RELAY_KEY", "<ask-for-the-relay-key>")
 
 
@@ -1010,6 +1014,32 @@ def build():
               "reply comes back as unreadable rubbish, which looks like a "
               "broken modem and is not one. --raw needs the USB cable, even "
               "though what you are testing is cellular.")
+    doc.add_paragraph(
+        "First: which SIM is the modem actually using? This board has room "
+        "for two — the plastic card you can see, and a second one soldered "
+        "onto it — and the modem uses whichever it was last told to. Ask it:")
+    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRSIM?"')
+    expected(doc)
+    code(doc, '  AT+SDVRSIM?\n'
+              '      +SDVRSIM:1,1,"<ICCID>","<IMSI>"\n'
+              "      OK")
+    doc.add_paragraph(
+        "The first two numbers must match: the first is the card the product "
+        "is configured to use, the second is the one it is on. The ICCID is "
+        "the long number printed on the SIM itself — check it is the card you "
+        "put in.")
+    note(doc, "Do not skip this. On the wrong card everything below still "
+              "passes — the SIM reads, the modem registers, the link reports "
+              "all four numbers as 1, an address is issued — and then nothing "
+              "is ever delivered, because that card has no data service. It "
+              "cost a full day of chasing the network before anyone looked at "
+              "the ICCID. If the two numbers differ, set it and try again:",
+         warn=True)
+    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRSIM=1"')
+    doc.add_paragraph("1 is the plastic holder, 2 the second holder, 0 the "
+                      "soldered one.")
+
+    doc.add_paragraph()
     doc.add_paragraph("Is the SIM being read?")
     cmd(doc, f'{CD}python3 scopus/at.py --raw "AT+CPIN?"')
     expected(doc)
@@ -1059,9 +1089,19 @@ def build():
               f'      +SDVRNET: 1,1,1,1,"<operator>","LTE","<apn>",'
               f'"rmnet_data0","10.x.x.x","10.x.x.x",0\n'
               "      OK\n\n"
-              f"OK — cellular link up. Notifications to {RELAY_IP}:"
-              f"{RELAY_UDP_PORT}, photos to "
-              f"http://{RELAY_IP}:{RELAY_HTTP_PORT}{RELAY_PATH}")
+              f"OK — cellular link up. Notifications to "
+              f"http://{RELAY_IP}:{RELAY_HTTP_PORT}{RELAY_NOTIFY_PATH}, "
+              f"photos to http://{RELAY_IP}:{RELAY_HTTP_PORT}{RELAY_PATH}")
+    note(doc, f"Over cellular both the events and the photos travel as web "
+              f"traffic, on port {RELAY_HTTP_PORT} — the same port your "
+              f"browser uses. Over the cable (Steps 3 and 4) the events go a "
+              f"different way, as datagrams on port {RELAY_UDP_PORT}. That is "
+              f"deliberate: a datagram gets no answer, so nothing can tell you "
+              f"whether it arrived, and out on a mobile network it is the part "
+              f"most likely to be discarded silently on the way. A web request "
+              f"is answered, so the modem records for every event whether it "
+              f"landed. The command above switches this for you; you do not "
+              f"have to set it.")
     doc.add_paragraph("The four numbers after +SDVRNET: are the whole story:")
     table(doc, ["Position", "Means", "If it is 0"],
           [["1st", "cellular mode is switched on",
@@ -1112,6 +1152,11 @@ def build():
         "and turn the cellular mode off:")
     cmd(doc, f"{CD}python3 scopus/at.py --point-here")
     cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRNET=0"')
+    note(doc, "--point-here also puts events back on the cable's datagram "
+              "port, which is what the server in Step 3 listens on. If you "
+              "skip it and go straight back to Step 3, the events have "
+              "nowhere to land and Step 8 fails for a reason nothing on "
+              "screen explains.")
     note(doc, "AT+SDVRNET=0 stops the modem maintaining the mobile "
               "connection; it does not cut a transfer that is in progress.")
 
@@ -1142,11 +1187,17 @@ def build():
             "to re-seat it; nothing in this document can be run until it "
             "does."],
            ["Photos arrive but events do not",
-            "These use different ports and different protocols — photos go "
-            f"over TCP {RELAY_HTTP_PORT}, events over UDP {RELAY_UDP_PORT}. "
-            "Photos arriving proves the mobile connection works, so the "
-            "difference is the UDP port. Report it; it is a firewall rule on "
-            "the server, not anything on the bench."]])
+            "On this procedure both travel the same way, over port "
+            f"{RELAY_HTTP_PORT}, so one arriving and not the other is not a "
+            "network problem. Check the modem is set to send events as web "
+            f"requests:  {CD}python3 scopus/at.py \"AT+SDVRNTFPROTO?\"  — it "
+            f"should answer 1 and \"{RELAY_NOTIFY_PATH}\". If it answers 0 "
+            "the modem is still sending datagrams, which the relay's host "
+            "does not accept; re-run Step C1."],
+           ["Everything passes but nothing is ever delivered",
+            "Check which SIM the modem is on — Step C0. On the wrong card "
+            "every check in this section passes and no data crosses. That is "
+            "the single most likely cause of this exact symptom."]])
 
     doc.save(OUT)
     print(f"wrote {OUT}")
