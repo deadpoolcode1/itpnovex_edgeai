@@ -158,8 +158,16 @@ typedef struct
   /* V5 — detection reporting (§4.2). How long a new detection count must
    * hold before it is believed and reported. Every change of the debounced
    * count raises an event, in both directions, so this window is what
-   * stands between a flickering detector and an event every few seconds. */
-  uint16_t  detect_debounce_ms;
+   * stands between a flickering detector and an event every few seconds.
+   *
+   * uint32 rather than uint16 on purpose. The upgrade path copies the bytes
+   * past the stored struct's size out of the defaults, so a new field that
+   * fits inside the previous struct's *trailing padding* leaves sizeof
+   * unchanged, gets copied nothing, and comes up as whatever was in that
+   * padding — zero. A uint16 here did exactly that and read back 0 ms on
+   * the first flashed unit. A uint32 forces the struct to grow, so the
+   * migration has bytes to copy and the default actually arrives. */
+  uint32_t  detect_debounce_ms;
 
 } t_registry_data;
 

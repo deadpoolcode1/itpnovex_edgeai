@@ -238,7 +238,7 @@ static uint32_t          _nn_prev_boxes    = 0U;
  * nothing to photograph. */
 #define NN_DEBOUNCE_DEFAULT_MS   1000U
 
-static volatile uint16_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
+static volatile uint32_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
 static uint32_t          _nn_cand_boxes    = 0U;  /* value being confirmed */
 static uint32_t          _nn_cand_since    = 0U;  /* tick it first showed  */
 static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
@@ -247,14 +247,14 @@ static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
  * setting still waits at least one tick. */
 static uint32_t _nn_debounce_ticks(void)
 {
-  uint32_t ms = (uint32_t)_nn_debounce_ms;
+  uint32_t ms = _nn_debounce_ms;
   if (ms == 0U) { return 0U; }
   uint32_t ticks = (ms * TX_TIMER_TICKS_PER_SECOND) / 1000U;
   return (ticks == 0U) ? 1U : ticks;
 }
 
-void nn_task_debounce_set(uint16_t ms)  { _nn_debounce_ms = ms; }
-uint16_t nn_task_debounce_get(void)     { return _nn_debounce_ms; }
+void nn_task_debounce_set(uint32_t ms)  { _nn_debounce_ms = ms; }
+uint32_t nn_task_debounce_get(void)     { return _nn_debounce_ms; }
 
 void nn_task_detect_set(bool enable)
 {

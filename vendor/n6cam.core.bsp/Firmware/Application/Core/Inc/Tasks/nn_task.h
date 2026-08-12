@@ -173,8 +173,8 @@ void nn_task_det_set(uint8_t mask);
  * @param ms Milliseconds the new count must hold continuously. Default
  *           1000. 0 disables the wait and reports every frame's change.
  */
-void nn_task_debounce_set(uint16_t ms);
-uint16_t nn_task_debounce_get(void);
+void nn_task_debounce_set(uint32_t ms);
+uint32_t nn_task_debounce_get(void);
 
 /**
  * @brief Inject a synthetic detection edge. Used to test the

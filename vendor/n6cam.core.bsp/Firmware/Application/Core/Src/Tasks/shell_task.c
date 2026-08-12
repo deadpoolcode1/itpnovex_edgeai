@@ -1963,18 +1963,18 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if ((argc >= 3U) && (strcmp((char*)argv[2], "query") != 0))
     {
       long ms = strtol((char*)argv[2], NULL, 0);
-      if ((ms < 0) || (ms > 65535)) return LWSHELL_ERROR_SYNTAX_CMD;
-      nn_task_debounce_set((uint16_t)ms);
+      if ((ms < 0) || (ms > 600000)) return LWSHELL_ERROR_SYNTAX_CMD;
+      nn_task_debounce_set((uint32_t)ms);
       t_registry_data *reg = registry_acquire();
       if (reg)
       {
-        reg->detect_debounce_ms = (uint16_t)ms;
+        reg->detect_debounce_ms = (uint32_t)ms;
         registry_release();
         registry_request_save();
       }
     }
-    CMD_PRINTF(stream, "detect debounce: %u ms%s",
-               (unsigned)nn_task_debounce_get(), lwshell_eol());
+    CMD_PRINTF(stream, "detect debounce: %lu ms%s",
+               (unsigned long)nn_task_debounce_get(), lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
