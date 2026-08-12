@@ -138,10 +138,28 @@ bool nn_task_detect_get(void);
 
 /**
  * @brief Set the SoW §4.2 'action_msk' for on-detection side effects.
- *        bit0 = save to SD (W12), bit1 = report cellular (W11/W13).
- *        Checked on each new-object edge. 0 = no side effects.
+ *        bit0 = save to SD (W12), bit1 = report cellular (W11/W13),
+ *        bit2 = upload the photo to the remote server.
+ *
+ *        bit2 is SoW §3.1's "taking photo and sending to remote server on
+ *        detection of new objects", which the §4.2 mask table never gave a
+ *        bit — so until now the only way to get a picture off the device
+ *        was to type `photo upload`. It is rate-limited internally; the
+ *        transfer is far slower than the scene it describes.
+ *
+ *        Checked on each change of the debounced count. bit0 and bit2 do
+ *        nothing when that count changes to zero: there is nobody to
+ *        photograph. 0 = no side effects.
  */
 void nn_task_action_set(uint8_t mask);
+
+/**
+ * @brief Automatic-upload counters: photos dropped by the rate floor, and
+ *        photos dropped because the capture pipeline was already busy.
+ *        Both are normal under load; a climbing 'skipped' means the scene
+ *        is changing faster than the link can carry pictures of it.
+ */
+void nn_task_upload_stats(uint32_t *skipped, uint32_t *busy);
 
 /**
  * @brief Set the SoW §4.2 'det_msk' (proposal W5/W6 class filter).

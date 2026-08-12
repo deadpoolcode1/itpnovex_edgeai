@@ -256,6 +256,26 @@ static uint32_t _nn_debounce_ticks(void)
 void nn_task_debounce_set(uint32_t ms)  { _nn_debounce_ms = ms; }
 uint32_t nn_task_debounce_get(void)     { return _nn_debounce_ms; }
 
+/* Floor between automatic photo uploads (action_msk bit2). The JPEG crosses
+ * the internal 115200 link to the modem before it goes anywhere, which is
+ * 10-15 s for a typical ~95 KB frame, and a room with people moving through
+ * it changes far faster. Fixed rather than configurable on purpose: it is a
+ * property of the link, not a preference, and another registry field would
+ * mean another struct version and another settings reset on upgrade. */
+#define NN_AUTO_UPLOAD_MIN_MS     20000U
+#define NN_AUTO_UPLOAD_MIN_TICKS  ((NN_AUTO_UPLOAD_MIN_MS / 1000U) * \
+                                   TX_TIMER_TICKS_PER_SECOND)
+
+static uint32_t _nn_upload_next     = 0U;  /* tick the next one is allowed */
+static uint32_t _nn_uploads_skipped = 0U;  /* dropped by the rate floor    */
+static uint32_t _nn_uploads_busy    = 0U;  /* pipeline already busy        */
+
+void nn_task_upload_stats(uint32_t *skipped, uint32_t *busy)
+{
+  if (skipped != NULL) *skipped = _nn_uploads_skipped;
+  if (busy    != NULL) *busy    = _nn_uploads_busy;
+}
+
 void nn_task_detect_set(bool enable)
 {
   /* Start from a known-empty scene. Without this a `detect stop` taken
@@ -525,24 +545,71 @@ static void _nn_task_run(uint32_t args)
       }
       else if (count_changed && (_nn_action_mask != 0U))
       {
-        /* bit0 = save to SD: build SoW §7 filename + trigger snapshot.
-         * Not on the change to zero — there is nobody to photograph. */
-        if ((_nn_action_mask & 0x01U) && (_nn_stable_boxes > 0U))
+        /* bits 0 and 2 both want a picture of what was just detected, so
+         * build the SoW §7 filename once. Neither fires on the change to
+         * zero — there is nobody to photograph. */
+        char fname[48];
+        if (((_nn_action_mask & 0x05U) != 0U) && (_nn_stable_boxes > 0U))
         {
           t_datetime dt = { 0 };
           (void)bsp_rtc_get_time(&dt);
           uint32_t ser = HAL_GetUIDw0();
-          char fname[48];
           snprintf(fname, sizeof(fname),
                    "%lu_%02u%02u20%02u_%02u%02u%02u.rdy",
                    (unsigned long)ser,
                    (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
                    (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds);
-          /* Atomic claim so we don't clobber a competing producer
-           * (shell `photo savesd`) racing on the shared filename
-           * buffer. If the pipeline is already busy, drop this one
-           * — we can't block inference waiting for SD. */
+        }
+
+        /* bit0 = save to SD.
+         * Atomic claim so we don't clobber a competing producer (shell
+         * `photo savesd`) racing on the shared filename buffer. If the
+         * pipeline is already busy, drop this one — we can't block
+         * inference waiting for SD. */
+        if ((_nn_action_mask & 0x01U) && (_nn_stable_boxes > 0U))
+        {
           (void)snapshot_request(fname);
+        }
+
+        /* bit2 = upload the photo to the remote server, SoW §3.1: "Enable/
+         * Disable taking photo and sending to remote server on detection of
+         * new objects". The §4.2 mask table only ever defined bits 0 and 1,
+         * so this half of §3.1 had no way to be switched on: the event said
+         * how many people there were and no picture of them ever left the
+         * device unless somebody typed `photo upload` by hand.
+         *
+         * Same trigger the shell command uses — a slot claim that returns
+         * immediately; snapshot_task does the capture, the encode and the
+         * SDVR+SENDBIN transfer on its own thread, so inference is never
+         * held behind the UART.
+         *
+         * Rate-limited, because the transfer is the slow part of this
+         * product and the scene is not. ~95 KB over the internal 115200
+         * link takes 10-15 s, and a room where people come and go changes
+         * faster than that; without a floor between uploads the queue would
+         * never drain and every later picture would describe a moment long
+         * past. One photo per NN_AUTO_UPLOAD_MIN_MS, the rest counted and
+         * dropped — a dropped photo is recoverable, a permanently backed-up
+         * link is not. */
+        if ((_nn_action_mask & 0x04U) && (_nn_stable_boxes > 0U))
+        {
+          if ((int32_t)(tx_time_get() - _nn_upload_next) >= 0)
+          {
+            static uint32_t _auto_upload_ref = 0U;
+            _auto_upload_ref++;
+            if (snapshot_request_upload("photo", _auto_upload_ref, fname))
+            {
+              _nn_upload_next = tx_time_get() + NN_AUTO_UPLOAD_MIN_TICKS;
+            }
+            else
+            {
+              _nn_uploads_busy++;   /* pipeline busy — not a rate drop */
+            }
+          }
+          else
+          {
+            _nn_uploads_skipped++;
+          }
         }
         /* bit1 = report: emit the SoW §6 notification for this detection.
          * shell_notify_emit writes it to the CDC shell and queues it to the

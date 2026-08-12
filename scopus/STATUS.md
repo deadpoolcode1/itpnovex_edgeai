@@ -77,6 +77,39 @@ Camera: `Application_signed.bin` over CDC. Modem:
 `_build_sdvr_v1110/…/sdvrApp.wp76xx.update`, then `--mark-good` inside
 probation.
 
+### 4. The SoW's automatic photo upload was never implemented — now it is
+
+The customer asked why no image appeared while events kept arriving. The
+answer was that nothing uploads a photo on its own: `action_msk` had bit0
+(save to SD) and bit1 (report), and a picture only ever left the device when
+somebody typed `photo upload`.
+
+That is a real gap against the SoW, not a demo mistake. **§3.1 lists five
+enable/disable bullets and the last two are the automatic ones** — "taking
+photo and saving to SD card **on detection of new objects**" and "taking photo
+and **sending to remote server** on detection of new objects" — while the §4.2
+mask table only ever defined two bits. Half of §3.1 had no way to be switched
+on.
+
+Added as **bit2**: `detect profile 0x01 0x06` = report + upload
+(`0x07` with the SD snapshot as well). It calls the same
+`snapshot_request_upload()` the shell command uses, so the capture, encode and
+SENDBIN transfer happen on snapshot_task and inference is never held behind
+the UART. Rate-limited to one photo per 20 s — a ~95 KB JPEG needs 10–15 s on
+the internal 115200 link and a room changes faster than that, so without a
+floor the queue would never drain and every later picture would describe a
+moment long past. Drops are counted, not hidden: `detect stats` prints
+`auto-upload skipped=<rate> busy=<pipeline>`.
+
+Proven on hardware, nothing typed:
+
+```
+72  14:13:38Z  notification  rsd 4
+73  14:13:54Z  UPLOAD  102135 bytes  JPEG, complete
+```
+
+and the JPEG shows four people, which is what `rsd` said.
+
 ### Also seen, unfixed
 
 - **The CDC shell wedges under a heavy detection load.** `cam.py` first
