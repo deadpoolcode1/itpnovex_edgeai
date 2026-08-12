@@ -1,6 +1,91 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-09. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-12. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-12 — a live demo, and the three faults it found
+
+The whole chain ran over real cellular to the public relay during a customer
+demo: `detect simulate 3` and a 94,943-byte JPEG both reached
+`165.22.181.245` **from 2.54.57.163**, a Partner mobile address, and live
+detections followed all afternoon. Modem app 1.10.0, preflight 12/12, SIM
+`+SDVRSIM:1,1` on the Partner card. What broke is worth more than what worked.
+
+### 1. The data route died and the keeper could not recover it — FIXED (1.11.0)
+
+`+SDVRNET: 1,1,1,**0**` — cellular on, registered, session "connected", **no
+route**. On the modem, `rmnet_data0` was **DOWN with no address**, while
+`le_mdc` reported CONNECTED with an IP and a gateway. Every notification and
+photo failed with `Notify HTTP: no route — requesting the data session`.
+
+The keeper noticed (`Network_IsDataUp()` judges on the route, correctly) and
+retried at 10 s, 20 s, 40 s — and could never succeed: `RegisterAndConnect()`
+calls `le_mdc_StartSession()`, gets `LE_DUPLICATE`, finds the duplicate **is**
+tracked as CONNECTED, and returns `LE_OK` without touching it. Hence
+`bring-up failed (err 0)` forever. **`AT+SDVRNET=0/1` and a full
+`app restart sdvrApp` both changed nothing** — neither stops a session Legato
+believes is up.
+
+Unblocked by hand (this is the field workaround, ~5 s):
+
+```bash
+ssh root@192.168.2.2 "/sbin/ip link set rmnet_data0 up; \
+  /sbin/ip addr add <ip>/32 dev rmnet_data0; \
+  /sbin/ip route add <gw> dev rmnet_data0 scope link; \
+  /sbin/ip route add default via <gw> dev rmnet_data0"
+```
+(`<ip>`/`<gw>` are the last two fields of `AT+SDVRNET?` — today
+10.67.51.120 / .121.) `curl` from the modem then answered 200 and the queued
+backlog flushed at once.
+
+Fixed properly in `network.c` with `RecycleDataSession()`: when the sequence
+reports success but `Network_IsDataUp()` is still false, **stop the session and
+start it again**, then install the route on the way up. "Connected" and
+"usable" are different claims; only the second is worth anything to a caller.
+
+### 2. Only arrivals were reported, so a scene that never empties goes silent
+
+The camera fired solely on the 0→N edge, so **3 → 4 raised nothing**. The lens
+was pointed at a monitor showing a stock photo of three people, which kept the
+scene permanently occupied — the customer could stand in front of it all day
+and never produce an event. Nothing was broken; the trigger could not arm.
+
+Changed in `nn_task.c`: the detection **count** is what is reported, and
+**every change of it** raises an event, both directions, including the change
+to 0 (rsn stays 0x10, rsd carries the new count; the SD snapshot is skipped on
+the 0, there being nobody to photograph).
+
+### 3. …and the same edge, flickering, produced an event every few seconds
+
+The other half of the same fault. The edge re-armed the instant the count
+touched zero, so one frame with the boxes dropped — glare, motion blur, a
+confidence on the threshold — read as the room emptying and re-entering. Six
+events stamped over 12 s arrived over 26 s: each leg is one `AT+SDVRNTFA` plus
+an HTTP POST plus an ack, ~4–6 s, so the events outpaced the drain and the lag
+compounded. They were **distinct events, not duplicates** (`num` 47…52) — the
+modem's dedup correctly left them alone.
+
+Fixed with a debounce: a new count must hold **continuously for 1000 ms**
+before it is believed. `detect debounce <ms>` / `detect debounce query`,
+persisted (registry V5, `detect_debounce_ms`). 0 restores the old
+report-every-frame behaviour. Time, not frames, because frame rate varies with
+load and it is steadiness in seconds the customer's server cares about.
+
+**Not yet flashed / installed** — both builds are clean but the demo was live.
+Camera: `Application_signed.bin` over CDC. Modem:
+`_build_sdvr_v1110/…/sdvrApp.wp76xx.update`, then `--mark-good` inside
+probation.
+
+### Also seen, unfixed
+
+- **The CDC shell wedges under a heavy detection load.** `cam.py` first
+  answers "busy sending a notification", then stops answering entirely, while
+  the camera keeps detecting and notifying perfectly. `uhubctl -l 3-7 -p 1 -a
+  cycle` cleared it once and it wedged again within the minute. Photos are only
+  reachable from that shell, so an on-demand photo is what is lost.
+- **`mdm stats` counts `ntf: unconfirmed`** for notifications that did arrive —
+  the ack path is lossy, the delivery is not.
 
 ---
 

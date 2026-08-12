@@ -53,7 +53,7 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        4U
+#define REGISTRY_VERSION        5U
 
 /* Wifi */
 #define WIFI_SSID_LEN           31U
@@ -155,6 +155,12 @@ typedef struct
    * timer in shell's main loop clears it after ~30 s of uptime. */
   uint8_t   boot_count;
 
+  /* V5 — detection reporting (§4.2). How long a new detection count must
+   * hold before it is believed and reported. Every change of the debounced
+   * count raises an event, in both directions, so this window is what
+   * stands between a flickering detector and an event every few seconds. */
+  uint16_t  detect_debounce_ms;
+
 } t_registry_data;
 
 /*-------------------------------------------------------------------------*//**
@@ -198,6 +204,7 @@ const t_registry_data registry_defaults =
   .motion_sensitivity          = 50U,
   .motion_no_motion_timeout_s  = 30U,
   .boot_count                  = 0U,
+  .detect_debounce_ms          = 1000U,  /* a change must hold for 1 s */
 
   /* Wifi */
   .wifi_mode            = 0U,

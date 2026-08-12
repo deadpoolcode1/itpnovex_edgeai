@@ -154,6 +154,29 @@ void nn_task_action_set(uint8_t mask);
 void nn_task_det_set(uint8_t mask);
 
 /**
+ * @brief Set how long a new detection count must hold before it is believed
+ *        and reported (SoW §4.2).
+ *
+ *        The reporting rule is "every change of the debounced count", in
+ *        both directions — 3 -> 4 and 4 -> 3 alike, and 0 when the last
+ *        person leaves. Reporting only the 0 -> N arrival, as the firmware
+ *        did before, means somebody joining a group already in view raises
+ *        nothing; reporting every frame's raw count means a detector that
+ *        flickers for one frame raises an event every few seconds. The
+ *        window is what separates the two.
+ *
+ *        Measured on the bench with both faults live: a static scene
+ *        produced an event every few seconds, faster than the modem could
+ *        drain them, while a person walking up to people already in frame
+ *        produced none at all.
+ *
+ * @param ms Milliseconds the new count must hold continuously. Default
+ *           1000. 0 disables the wait and reports every frame's change.
+ */
+void nn_task_debounce_set(uint16_t ms);
+uint16_t nn_task_debounce_get(void);
+
+/**
  * @brief Inject a synthetic detection edge. Used to test the
  *        detect -> snapshot -> SD -> notify chain when the camera
  *        optics are subpar (out of focus, dirty lens, etc.) so real

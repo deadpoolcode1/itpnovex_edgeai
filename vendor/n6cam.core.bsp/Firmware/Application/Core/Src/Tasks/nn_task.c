@@ -203,7 +203,73 @@ static volatile uint8_t _nn_det_mask       = 0x01U; /* default people */
  * only on 0->N transitions, not every frame at 22 Hz. */
 static uint32_t          _nn_prev_boxes    = 0U;
 
-void nn_task_detect_set(bool enable)   { _nn_detect_enabled = enable; }
+/* Debounced count, and what was last reported.
+ *
+ * Two faults were measured on the bench, and they are the same fault seen
+ * from two sides:
+ *
+ *   - The raw edge re-arms the instant the count touches zero, so a single
+ *     frame in which the detector drops every box — glare, motion blur, a
+ *     confidence sitting on the threshold — reads as the room emptying and
+ *     the next frame reads as a fresh arrival. A static scene produced an
+ *     event every few seconds, faster than the modem could drain them.
+ *   - Firing only on 0->N means a person joining people already in view
+ *     raises nothing at all: 3 -> 4 is not an edge. A scene that never
+ *     empties therefore never reports again, and looks broken from the
+ *     outside while working exactly as written.
+ *
+ * So the count itself is debounced — a new value must hold **continuously
+ * for _nn_debounce_ms** before it is believed — and every change of the
+ * debounced value is reported, not just the departure from zero. The
+ * default is 1000 ms: a person walking in is reported a second later, and
+ * nothing that does not survive a whole second is reported at all. 0
+ * disables the wait and reports every frame's change, which is the old
+ * behaviour and the reason for the storm.
+ *
+ * The window is measured in time rather than frames on purpose. Frame rate
+ * varies with load, so "N frames" is a different amount of steadiness at
+ * 30 Hz than at 12, and it is steadiness in seconds that the customer's
+ * server cares about.
+ *
+ * Every change is reported in both directions — 3 -> 4 and 4 -> 3 alike —
+ * including the change to zero, which is how a server learns the area is
+ * clear. rsn stays 0x10 and rsd carries the new count, so an rsd of 0 reads
+ * as "no people now". The SD snapshot is skipped on that one: there is
+ * nothing to photograph. */
+#define NN_DEBOUNCE_DEFAULT_MS   1000U
+
+static volatile uint16_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
+static uint32_t          _nn_cand_boxes    = 0U;  /* value being confirmed */
+static uint32_t          _nn_cand_since    = 0U;  /* tick it first showed  */
+static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
+
+/* ThreadX ticks for the configured window, rounded up so a sub-tick
+ * setting still waits at least one tick. */
+static uint32_t _nn_debounce_ticks(void)
+{
+  uint32_t ms = (uint32_t)_nn_debounce_ms;
+  if (ms == 0U) { return 0U; }
+  uint32_t ticks = (ms * TX_TIMER_TICKS_PER_SECOND) / 1000U;
+  return (ticks == 0U) ? 1U : ticks;
+}
+
+void nn_task_debounce_set(uint16_t ms)  { _nn_debounce_ms = ms; }
+uint16_t nn_task_debounce_get(void)     { return _nn_debounce_ms; }
+
+void nn_task_detect_set(bool enable)
+{
+  /* Start from a known-empty scene. Without this a `detect stop` taken
+   * while people were in view leaves the count believed, and the first
+   * arrival after `detect start` reports nothing new. */
+  if (enable)
+  {
+    _nn_cand_boxes   = 0U;
+    _nn_cand_since   = tx_time_get();
+    _nn_stable_boxes = 0U;
+    _nn_prev_boxes   = 0U;
+  }
+  _nn_detect_enabled = enable;
+}
 bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
@@ -300,9 +366,9 @@ void nn_task_simulate_detection(uint32_t boxes)
   /* Drive the same edge logic the inference loop uses. We replay the
    * snapshot + notification side effects inline because we don't want
    * to wait for the next camera frame to wake the loop. */
-  if ((boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U))
+  if ((boxes != _nn_stable_boxes) && (_nn_action_mask != 0U))
   {
-    if (_nn_action_mask & 0x01U)
+    if ((_nn_action_mask & 0x01U) && (boxes > 0U))
     {
       t_datetime dt = { 0 };
       (void)bsp_rtc_get_time(&dt);
@@ -317,7 +383,14 @@ void nn_task_simulate_detection(uint32_t boxes)
     }
     LINFO(TRACE_NN, "[simulate] %lu object(s)", (unsigned long)boxes);
   }
-  _nn_prev_boxes = boxes;
+  /* Adopt the simulated count as the believed one, with the window
+   * restarted: a simulate is an assertion about the scene, and the live
+   * loop should report the real count as a change away from it rather
+   * than immediately re-reporting what was just simulated. */
+  _nn_stable_boxes = boxes;
+  _nn_cand_boxes   = boxes;
+  _nn_cand_since   = tx_time_get();
+  _nn_prev_boxes   = boxes;
 }
 
 /* COCO-class -> SoW class mapping (proposal W5/W6).
@@ -416,6 +489,26 @@ static void _nn_task_run(uint32_t args)
        * per the action_msk profile. Edge-only so we don't spam SD
        * with one JPEG per frame at 22 Hz. */
       uint32_t cur_boxes = (uint32_t)_pp_box_count;
+
+      /* Debounce the count, then report every change of the debounced
+       * value. See the _nn_debounce block above for why both halves of
+       * this are needed. */
+      if (cur_boxes != _nn_cand_boxes)
+      {
+        _nn_cand_boxes = cur_boxes;
+        _nn_cand_since = tx_time_get();     /* restart the window */
+      }
+
+      /* Signed compare, so the wait stays correct across tick wrap. */
+      bool count_changed = false;
+      if ((_nn_cand_boxes != _nn_stable_boxes) &&
+          ((int32_t)(tx_time_get() - _nn_cand_since) >=
+           (int32_t)_nn_debounce_ticks()))
+      {
+        _nn_stable_boxes = _nn_cand_boxes;
+        count_changed    = true;
+      }
+
       /* Never let an injected picture masquerade as a real detection. The
        * side effects here are the product's outward claims — a JPEG filed
        * as evidence and a notification telling the customer's server that
@@ -423,18 +516,18 @@ static void _nn_task_run(uint32_t args)
        * reports its count on the console, which is what an injection test
        * actually reads, and `detect simulate` is still the explicit way to
        * exercise this path on purpose. */
-      if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U) && (_nn_action_mask != 0U)
+      if (count_changed && (_nn_action_mask != 0U)
           && (_nn_test_frame_override != NULL))
       {
         LWARNING(TRACE_NN, "%lu detection(s) from the injected test frame — "
                            "not reported (use 'detect simulate' to test the "
                            "notification path)", (unsigned long)cur_boxes);
       }
-      else if ((cur_boxes > 0U) && (_nn_prev_boxes == 0U)
-               && (_nn_action_mask != 0U))
+      else if (count_changed && (_nn_action_mask != 0U))
       {
-        /* bit0 = save to SD: build SoW §7 filename + trigger snapshot */
-        if (_nn_action_mask & 0x01U)
+        /* bit0 = save to SD: build SoW §7 filename + trigger snapshot.
+         * Not on the change to zero — there is nobody to photograph. */
+        if ((_nn_action_mask & 0x01U) && (_nn_stable_boxes > 0U))
         {
           t_datetime dt = { 0 };
           (void)bsp_rtc_get_time(&dt);
@@ -461,9 +554,10 @@ static void _nn_task_run(uint32_t args)
          * detection and a real one are indistinguishable downstream. */
         if (_nn_action_mask & 0x02U)
         {
-          shell_notify_emit(0x10U, cur_boxes, false);
+          shell_notify_emit(0x10U, _nn_stable_boxes, false);
         }
-        LINFO(TRACE_NN, "detected %lu object(s)", (unsigned long)cur_boxes);
+        LINFO(TRACE_NN, "count now %lu object(s)",
+              (unsigned long)_nn_stable_boxes);
       }
       _nn_prev_boxes = cur_boxes;
     }

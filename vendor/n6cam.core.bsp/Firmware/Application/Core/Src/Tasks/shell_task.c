@@ -329,7 +329,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query | simulate [N]]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> | profile query | debounce <ms> | debounce query | simulate [N]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
@@ -531,6 +531,7 @@ void _shell_task_init(void)
       }
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
+      nn_task_debounce_set(reg->detect_debounce_ms);
       registry_release();
     }
   }
@@ -1948,6 +1949,32 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                (unsigned long)boxes, lwshell_eol());
     /* Also fire the +SDVRNTF the inference loop would have. rsn=0x10 = people. */
     _notify_emit(0x10U, boxes, false);
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+  /* detect debounce <ms> | detect debounce query
+   *
+   * How long a new count must hold before it is believed and reported.
+   * Every change of that debounced count raises an event, so this is the
+   * single knob between "a flickering detector reports every few seconds"
+   * and "a change is missed". Default 1000 ms. */
+  if (strcmp(sub, "debounce") == 0)
+  {
+    if ((argc >= 3U) && (strcmp((char*)argv[2], "query") != 0))
+    {
+      long ms = strtol((char*)argv[2], NULL, 0);
+      if ((ms < 0) || (ms > 65535)) return LWSHELL_ERROR_SYNTAX_CMD;
+      nn_task_debounce_set((uint16_t)ms);
+      t_registry_data *reg = registry_acquire();
+      if (reg)
+      {
+        reg->detect_debounce_ms = (uint16_t)ms;
+        registry_release();
+        registry_request_save();
+      }
+    }
+    CMD_PRINTF(stream, "detect debounce: %u ms%s",
+               (unsigned)nn_task_debounce_get(), lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
