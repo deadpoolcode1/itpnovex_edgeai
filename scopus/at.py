@@ -201,9 +201,21 @@ def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd,
         print(f"\nFAILED: the read-back does not show {ip}:{http_port}{path}.",
               file=sys.stderr)
         return 1
-    if ip not in ntf or str(udp_port) not in ntf:
+    # Judge the notification endpoint against the port it was actually sent
+    # to. Over HTTP that is the web port — the datagram port is not set at
+    # all, and asserting on it failed a modem whose every endpoint read back
+    # correctly. A check that fails a good configuration is worse than no
+    # check: the next person goes looking for a fault in the device.
+    ntf_port = http_port if notify_proto == "http" else udp_port
+    if ip not in ntf or str(ntf_port) not in ntf:
         print(f"\nFAILED: the read-back does not show notifications going to "
-              f"{ip}:{udp_port}.", file=sys.stderr)
+              f"{ip}:{ntf_port}.", file=sys.stderr)
+        return 1
+    if notify_proto == "http" and (
+            "+SDVRNTFPROTO:1" not in ntf.replace(" ", "")
+            or notify_path not in ntf):
+        print(f"\nFAILED: the read-back does not show notifications over HTTP "
+              f"to {notify_path}.", file=sys.stderr)
         return 1
 
     # Bringing the radio up takes tens of seconds and AT+SDVRNET=1 returns
