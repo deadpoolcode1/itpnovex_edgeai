@@ -166,6 +166,170 @@ Output: a self-contained `results/test-report-<ts>.html` + same-stem `.pdf`
 | `MODEM_PASSWORD` | `Ss123` | modem root password |
 | `HOST_IP` | auto (modem default gw) | host endpoint for §6/§8 E2E |
 
+## Command reference
+
+Everything a tester can type, in one place. Run all of it from the repo root on
+the bench PC (the host the two devices are cabled to).
+
+### Before anything else
+
+```bash
+python3 scopus/preflight.py
+```
+
+Takes no options. One line per check — camera CDC port, modem AT port, this
+PC's address on the modem's subnet, modem reachable over Ethernet, server ports
+free, test image present — and exits 0 only when the bench is fit to test on.
+Every failure prints what to do about it. Run this first: a failure here is a
+bench fault, and chasing it as a product fault is where the hours go.
+
+### `cam.py` — talk to the camera
+
+```bash
+python3 scopus/cam.py "detect start"
+python3 scopus/cam.py "photo savesd" --wait 30
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `command…` | — | the shell command, quoted |
+| `--wait SEC` | 4 (25 for `photo` / `frame run`) | how long to listen for the reply |
+| `--tty PATH` | auto (`usb-STMicroelectronics_N6Cam_*-if02`) | override the CDC port |
+
+Camera shell commands — the device's own list, `cam.py commands` prints it:
+
+| Command | Parameters |
+|---|---|
+| `rtc` | `[set DDMMYYYYHHMMSS]` — get or set the clock |
+| `version` | application version |
+| `system` | `[version]` — fw / uid / dev / rev (§3.7) |
+| `commands` | list every command with its parameters (§3.7) |
+| `echo` | `on \| off \| query` |
+| `irled` | `on \| off \| query` |
+| `motion` | `sense <0..100> <timeout_s>` \| `query` |
+| `img` | `size H W` \| `quality 1..100` \| `color YCBCR\|RGB\|CMYK` \| `chroma 0\|1` \| `query` |
+| `detect` | `start` \| `stop` \| `profile <det_msk> <act_msk>` \| `profile query` \| `debounce <ms>` \| `debounce query` \| `stats` \| `simulate [N]` |
+| `notify` | `enable <mask>` \| `disable` \| `trigger <code>` \| `period <s>` \| `query` |
+| `photo` | `savesd` \| `upload` — capture a JPEG to SD, or straight out through the modem |
+| `sd` | `query` \| `ls` \| `format CONFIRM` |
+| `frame` | `upload` \| `load <file.raw>` \| `run` \| `clear` \| `query` — inject a test frame into the NN |
+| `tile` | `grid c r` \| `crop px` \| `frame W H` \| `overlap h v` \| `thresh conf iou` \| `upload` \| `run` \| `live [n]` \| `query` \| `clear` \| `default` |
+| `mdm` | `<AT command>` \| `relink` \| `stats` \| `raw on\|off` \| `test wedge [baud]` \| `test urc <line>` \| `test echo` — modem pass-through (§4.6) |
+| `camera` | `flip H\|V\|off` \| `aec <-2.0..2.0>\|off` \| `awb <0..5>\|auto` \| `gain <0..72000 mdB>` \| `exposure <0..33000 µs>` \| `brightness <0..100>` |
+| `safeboot` | `status` \| `clear` \| `test` — bootloop counter and safe-mode drill |
+| `update` | `[app \| model]` — receive new firmware/model over CDC and reflash |
+| `recovery` | reboot into FSBL recovery (halts the chip) |
+
+The three masks, since they are the ones testers get wrong:
+
+- `detect profile <det_msk>` — bit0 = people, bit1 = vehicles.
+- `detect profile <act_msk>` — bit0 = save to SD, bit1 = report over cellular,
+  bit2 = upload the photo. **`7` is the full product**; the default is `0`,
+  which detects and does nothing with it.
+- `notify enable <mask>` — 1 NetReg, 2 MotionStart, 4 MotionStop, 8 Periodic,
+  0x10 People, 0x20 Vehicle. `0x30` is people + vehicles.
+
+### `at.py` — talk to the modem
+
+```bash
+python3 scopus/at.py "AT+SDVRVER"
+python3 scopus/at.py --point-here                  # aim the modem at this PC
+python3 scopus/at.py --point-cloud 165.22.181.245 --apn <apn>
+python3 scopus/at.py --raw "AT+CPIN?"              # ask the modem itself
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `command…` | — | the AT command, quoted |
+| `--point-here` | — | set all five endpoints to this PC's address on the modem's subnet, then read them back. This is the whole of Step 2 of the manual |
+| `--point-cloud IP` | — | same, but aimed at a public relay, and switch the modem to its cellular backhaul (sets the APN, turns `AT+SDVRNET=1` on, and waits for a **route**, not just registration) |
+| `--apn APN` | — | APN to set alongside `--point-cloud` |
+| `--apn-auth` | `none` | `none` \| `pap` \| `chap` |
+| `--apn-user` / `--apn-pass` | empty | APN credentials |
+| `--http-port N` | 8080 | photo-upload port to program |
+| `--udp-port N` | 9999 | notification port to program |
+| `--path P` | `/upload` | upload URL path |
+| `--notify-proto` | `http` | how `--point-cloud` sends notifications: `http` rides the same TCP port the photos use and gets a status code back; `udp` is the §5.2 default |
+| `--notify-path P` | `/scopus/notify` | request path for HTTP notifications |
+| `--raw` | — | send to the **modem's own** AT parser over SSH (`/dev/ttyAT`) instead of the SDVR channel — the only way to ask SIM, slot and radio questions; needs the USB Ethernet link even when testing over cellular |
+| `--timeout SEC` | 4.0 | reply timeout |
+
+The 37 `AT+SDVR*` commands and every URC they emit are tabled in
+`V20_SDVR/README.md` → *AT Commands (SDVR prefix)*. The ones a Scopus tester
+actually reaches for:
+
+| Command | What it does |
+|---|---|
+| `AT+SDVRVER` | app version — check this first after any deploy |
+| `AT+SDVRSIM?` | **check this first when cellular misbehaves** — the board has two SIM holders and running on the wrong one looks exactly like a dead network |
+| `AT+SDVRSIM=1\|2\|0` | pin the holder: external slot 1, slot 2, or the eSIM |
+| `AT+SDVRNET=1` / `AT+SDVRNET?` | bring up and inspect the data session; the **fourth** flag of the reply is the default route, and "registered" without it sends nothing |
+| `AT+SDVRSRVGET` | read back the server config `--point-here` just wrote |
+| `AT+SDVRNTFHOST="ip"` / `AT+SDVRNTFPORT=n` | notification endpoint — the host must be a dotted IP, that leg never resolves names |
+| `AT+SDVRNTFPROTO=0\|1[,"path"]` | notifications over UDP (0) or HTTP POST (1) |
+| `AT+SDVRNTFA=N,SIZE,"msg"[,…][,ENC]` | send a notification; `ENC=1` is required for JSON (see *Why group H exists*) |
+| `AT+SDVRSENDBIN=X,"TAG","TIME",REF,SIZE` | arm a live photo upload from the UART |
+| `AT+SDVRMOUNTSD` / `AT+SDVRUNMOUNTSD` / `AT+SDVRLSALL` | SD card |
+| `AT+SDVRUPLALL` / `AT+SDVRUPL=N` / `AT+SDVRUPLSTOP` | upload pending files |
+
+Anything the SDVR app does not recognise it bridges through to the modem, so
+plain `AT`, `AT+CSQ` and friends work on the same channel — except the SIM and
+radio commands, which need `--raw` (their replies come back at the wrong line
+settings and read as a broken modem).
+
+### Receivers
+
+```bash
+# on your PC, cable attached
+python3 scopus/test_server.py --http-port 8080 --udp-port 9999 \
+        --dir ~/scopus-received --from-modem 192.168.2.2 --fresh
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--http-port N` | 8080 | port for photo uploads |
+| `--udp-port N` | 9999 | port for notifications |
+| `--dir PATH` | `scopus-received` | where received files and logs land |
+| `--from-modem IP` | any | only accept datagrams from this address |
+| `--fresh` | — | start empty, moving an earlier run to `<dir>-old-<ts>` |
+
+```bash
+# on the public host (installed as the systemd unit scopus-relay)
+python3 scopus/cloud_relay.py --key <secret> --udp-port 39999 --http-port 38080
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--key K` | **required** | shared secret the pull client must present |
+| `--http-port` / `--udp-port` | 8080 / 9999 | device-facing ports |
+| `--dir PATH` | `scopus-relay-data` | storage |
+| `--device-token T` | — | also require the device's `X-Token` header (set with `AT+SDVRTOK`) |
+| `--max-photos N` | 500 | ring size |
+
+```bash
+# on your PC, over cellular
+python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--relay URL` | **required** | base URL of the relay |
+| `--key K` | **required** | the relay's shared secret |
+| `--dir PATH` | `scopus-received` | same layout as `test_server.py`, deliberately |
+| `--from-start` | — | replay everything the relay still holds, ignoring the remembered position in `<dir>/.relay-seq` |
+| `--fresh` | — | start empty, keeping an earlier run in `<dir>-old-<ts>` |
+| `--timeout SEC` | 40.0 | long-poll timeout |
+
+### Suites and manuals
+
+| Command | Options |
+|---|---|
+| `python3 scopus/run_scopus_tests.py` | none — env vars only (see *Run*) |
+| `python3 scopus/run_integration_tests.py` | `-v` / `--verbose` |
+| `python3 scopus/inference_test.py` | `--image PATH` (default `images/3_people.jpg`), `--expect N` (default 3), `--tries N` (default 4) |
+| `python3 scopus/make_tester_manual.py` | none — rewrites `Scopus_Tester_Manual.docx` |
+| `python3 scopus/make_tracked_manual.py` | `--baseline old.docx` (default: the docx at git HEAD) — also writes the tracked-changes copy for review in Word |
+
 ## Coverage (mapped to Scopus SoW v3)
 
 | Group | SoW | What it proves |
@@ -193,8 +357,12 @@ the suite never silently passes over an unavailable channel.
 
 ```
 scopus/
+  preflight.py               # is the bench fit to test on? run this first
+  cam.py                     # send one command to the camera shell
+  at.py                      # send one AT command to the modem (+ --point-*)
   run_scopus_tests.py        # per-command/per-seam suite (HTML+PDF report)
   run_integration_tests.py   # whole-product chain, hop by hop (JSON report)
+  inference_test.py          # NN only: known image in, people count out
   test_server.py             # the "server" end: receives notifications (UDP)
                              #   and photo uploads (HTTP), on your PC
   cloud_relay.py             # the same receiver, on a public host, for the
@@ -203,6 +371,7 @@ scopus/
                              #   port needed anywhere)
   Scopus_Tester_Manual.docx  # step-by-step MANUAL E2E test (generated)
   make_tester_manual.py      # regenerates the .docx — edit this, not the docx
+  make_tracked_manual.py     # + a tracked-changes copy for review in Word
   STATUS.md                  # RESUME HERE: bench access, build/deploy, what's open
   bench-tools/               # link probes and soak tools (see STATUS.md §6)
   lib/devices.py             # N6Shell, ModemAt, ModemSsh (raw termios + sshpass; no pyserial)
