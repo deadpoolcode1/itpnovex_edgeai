@@ -114,7 +114,41 @@ UINT                    status;
 
             /* Check the completion code. */
             if (status != UX_SUCCESS)
+            {
+
+                /* KAMACODE FIX: a timeout here used to return with the
+                   hardware transfer still armed, which poisoned the endpoint
+                   for the rest of the boot.
+
+                   HAL_PCD_EP_Transmit has already handed the buffer to the
+                   peripheral. Returning without taking it back leaves the
+                   endpoint busy for ever if the host never drains it: every
+                   later HAL_PCD_EP_Transmit on the same address is refused,
+                   so nothing is sent, so the semaphore is never posted, so
+                   the next caller times out too. One expired write kills the
+                   direction permanently.
+
+                   On this product that is not a corner case. The device
+                   writes to its CDC console on its own — a detection
+                   notification every time the scene changes — and a QA
+                   terminal is not always attached to read it. The first
+                   notification written with nobody listening killed the
+                   console, and from then on commands were received and
+                   executed with their replies going nowhere. It looks
+                   exactly like a hung device and is not one.
+
+                   So take the transfer back before returning: abort and
+                   flush the endpoint, then drain any post the ISR may have
+                   slipped in while we were doing it, so the next caller
+                   starts from a clean endpoint and a zero semaphore rather
+                   than inheriting a stale completion. The caller still sees
+                   the timeout and still decides what to do about it — the
+                   only thing that changes is that the next write works.  */
+                _ux_dcd_stm32_transfer_abort(dcd_stm32, transfer_request);
+                (void)_ux_utility_semaphore_get(&transfer_request -> ux_slave_transfer_request_semaphore, 0);
+
                 return(status);
+            }
 
             transfer_request -> ux_slave_transfer_request_actual_length = transfer_request->ux_slave_transfer_request_requested_length;
 
@@ -147,6 +181,15 @@ UINT                    status;
                                                 (ULONG)transfer_request -> ux_slave_transfer_request_timeout);
 
             /* Check the completion code. */
+            /* NOTE: deliberately NOT aborting the transfer on a timeout here,
+               unlike the DATA_OUT path above. The receive direction shows no
+               sign of the same fault — the shell reads with a timeout on every
+               pass of its loop and RX keeps working for days — and aborting
+               would mean flushing the endpoint, which discards a byte that
+               arrived in the instant between the timeout expiring and the
+               abort. Re-arming a still-armed OUT endpoint is a latent version
+               of the same bug, but it has never been observed, and trading a
+               working channel for a theoretical fix is a bad bargain.  */
             if (status != UX_SUCCESS)
                 return(status);
 

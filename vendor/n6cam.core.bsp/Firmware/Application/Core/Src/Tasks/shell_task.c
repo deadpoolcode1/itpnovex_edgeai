@@ -201,6 +201,7 @@ static void     _recovery_trigger(void);
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _system_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _stacks_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _commands_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _recovery_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _safeboot_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
@@ -254,6 +255,32 @@ static volatile bool _shell_binary_rx = false;
 
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
+
+/* Scratch for composing one notification, and the lock that owns it.
+ *
+ * These four buffers are ~1.2 KB together and used to be locals of
+ * _notify_emit(). That was survivable while the shell task was the only
+ * caller and fatal once the NN task became the second one: every task in
+ * this application has a 2 KB stack, and 1.2 KB of buffers plus snprintf's
+ * own frame plus the USBX write path underneath stream_write does not fit
+ * in what is left. The overflow ran off the end of the NN task's stack into
+ * whatever ThreadX had placed after it, and the symptom was not a crash at
+ * the point of damage but the USB device dying minutes later — the shell
+ * stopped answering, the kit disappeared from the host, and sometimes the
+ * watchdog reset the board. It is the same fault, in the same shape, as the
+ * one that took down the notify thread in modem_task: a big frame on a small
+ * stack, reached only on the notification path, so it hides until a
+ * detection actually fires.
+ *
+ * Static, therefore, and serialised — a notification is composed
+ * infrequently and briefly, so one lock across the whole compose costs
+ * nothing and keeps _notify_num, which is part of the message, consistent
+ * with the bytes built from it. */
+static TX_MUTEX _notify_mtx;
+static char     _notify_json[192];
+static char     _notify_line[256];
+static char     _notify_enc[192];
+static char     _notify_at[MODEM_NOTIFY_MAX];
 
 /* Emit a JSON notification on the shell stream per SoW §6.
  *   rsn — bitmask reason code
@@ -325,6 +352,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _version_cmd            , .name = "version"   , .help = "Print application version" },
   {.run = _system_cmd             , .name = "system"    , .help = "[version] - main-CPU version details (fw/uid/dev/rev) (SoW §3.7)" },
   {.run = _commands_cmd           , .name = "commands"  , .help = "List supported shell commands and parameters (SoW §3.7)" },
+  {.run = _stacks_cmd             , .name = "stacks"    , .help = "Per-task stack high-water usage since boot" },
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
@@ -410,6 +438,17 @@ static const t_lwshell_cmd  _shell_cmd_wifi[] = {
 int32_t shell_task_start(void)
 {
   int32_t status;
+
+  /* Guards the shared notification scratch. The NN task is created before
+   * this one and emits without asking this file first, which would be a
+   * race but for ThreadX creating every task in tx_application_define() and
+   * scheduling none of them until it returns — so nothing has run by the
+   * time this mutex exists. */
+  status = (int32_t)tx_mutex_create(&_notify_mtx, "tx.mtx.notify", TX_INHERIT);
+  if (status != TX_SUCCESS)
+  {
+    return status;
+  }
 
   status = (int32_t)tx_thread_create(
     &_shell.thread, "tx.task.shell",
@@ -720,6 +759,88 @@ static int32_t _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 static int32_t _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 {
   CMD_PRINTF(stream, "Application: %s%s", FW_VERSION, lwshell_eol());
+
+  /* FW_VERSION comes from version_bsp.h, which the vendor generates and
+   * which our build never regenerates — so every image we produce reports
+   * the same string, and there is no way to tell from the outside which of
+   * them is on the board. That has already cost a debugging session: a
+   * flash that silently did not take is indistinguishable from one that
+   * did. The compiler's own timestamp is unique per build and costs
+   * nothing, so it is printed alongside and the question becomes
+   * answerable. */
+  CMD_PRINTF(stream, "Build: %s %s%s", __DATE__, __TIME__, lwshell_eol());
+
+  _cmd_ack(stream, argv, argc);
+  return LWSHELL_OK;
+}
+
+/* Per-task stack high-water marks.
+ *
+ * A stack overflow on this product does not announce itself. The task that
+ * overruns keeps running; what breaks is whatever ThreadX happened to place
+ * after it, minutes later and somewhere else entirely — the USB device
+ * falling off the bus, the shell going quiet, a watchdog reset with no fault
+ * to look at. That is expensive to diagnose from the outside and trivial to
+ * read from the inside, so it is readable from the inside.
+ *
+ * ThreadX fills every stack with 0xEF at creation (TX_DISABLE_STACK_FILLING
+ * is not defined here), so the untouched run at the low end measures what
+ * has never been used and the rest is the high-water mark. It costs one
+ * scan per call and nothing at all when nobody asks.
+ *
+ * "used" is the worst case since boot, not the current depth. Anything at or
+ * near 100% has already corrupted memory — the report is late, not wrong. */
+/* ThreadX's created-thread list. Declared here rather than by including
+ * tx_thread.h, which is the kernel's internal header and expects to be
+ * compiled as part of it; these two symbols are all we want from it. */
+extern TX_THREAD *_tx_thread_created_ptr;
+extern ULONG      _tx_thread_created_count;
+
+static int32_t _stacks_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  UNUSED(argc);
+
+  TX_INTERRUPT_SAVE_AREA
+  TX_THREAD *head;
+  ULONG      count;
+
+  /* Snapshot the created-thread list under interrupt lock — a task created
+   * or deleted mid-walk would otherwise take us off into freed memory. No
+   * thread is created after start-up on this product, but the walk is cheap
+   * to make safe and expensive to debug when it is not. */
+  TX_DISABLE
+  head  = _tx_thread_created_ptr;
+  count = _tx_thread_created_count;
+  TX_RESTORE
+
+  CMD_PRINTF(stream, "%-22s %7s %7s %5s%s",
+             "task", "size", "used", "pct", lwshell_eol());
+
+  TX_THREAD *t = head;
+  for (ULONG i = 0U; (i < count) && (t != TX_NULL); i++)
+  {
+    const uint8_t *base = (const uint8_t*)t->tx_thread_stack_start;
+    ULONG          size = (ULONG)t->tx_thread_stack_size;
+
+    /* Count the fill pattern still standing at the low end. */
+    ULONG free_bytes = 0U;
+    while ((free_bytes < size) && (base[free_bytes] == 0xEFU))
+    {
+      free_bytes++;
+    }
+
+    ULONG used = size - free_bytes;
+    ULONG pct  = (size > 0U) ? ((used * 100U) / size) : 0U;
+
+    CMD_PRINTF(stream, "%-22s %7lu %7lu %4lu%%%s",
+               (t->tx_thread_name != TX_NULL) ? t->tx_thread_name : "?",
+               (unsigned long)size, (unsigned long)used,
+               (unsigned long)pct, lwshell_eol());
+
+    t = t->tx_thread_created_next;
+    if (t == head) { break; }
+  }
+
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
 }
@@ -821,8 +942,10 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 
   /* The JSON body on its own — the shell line and the AT command need the
    * same bytes wrapped differently, so build it once. */
-  char json[192];
-  int jn = snprintf(json, sizeof(json),
+  rtos_mutex_acquire(&_notify_mtx, true);
+
+  char *const json = _notify_json;
+  int jn = snprintf(json, sizeof(_notify_json),
     "{\"ser\":%lu,\"num\":%lu,\"rsn\":%lu,\"rsd\":%lu,"
     "\"tim\":\"20%02u%02u%02u%02u%02u%02u\",\"mtn\":%u,"
     "\"mod\":\"\",\"bat\":0.0,\"vol\":0.0}",
@@ -832,10 +955,10 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
     (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
     mtn ? 1U : 0U);
 
-  if ((jn > 0) && ((size_t)jn < sizeof(json)))
+  if ((jn > 0) && ((size_t)jn < sizeof(_notify_json)))
   {
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "+SDVRNTF: %s\r\n", json);
+    char *const buf = _notify_line;
+    int n = snprintf(buf, sizeof(_notify_line), "+SDVRNTF: %s\r\n", json);
     if ((n > 0) && (_shell.stream != NULL) && !_shell_binary_rx)
     {
       stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
@@ -852,7 +975,7 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
        * parameter are added below and must stay real quotes. SIZE stays the
        * true body length — the substitution is 1:1, and the modem restores
        * before it measures anything. */
-      char enc[sizeof(json)];
+      char *const enc = _notify_enc;
       for (int i = 0; i <= jn; i++)
       {
         enc[i] = (json[i] == '"') ? NOTIFY_QUOTE_SUB : json[i];
@@ -861,18 +984,18 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
       /* Split into parameters no larger than the modem's per-parameter cap.
        * The modem concatenates them back in order (ENC=1). One chunk is the
        * common case today and is byte-for-byte the single-parameter form. */
-      char at[MODEM_NOTIFY_MAX];
-      int an = snprintf(at, sizeof(at), "AT+SDVRNTFA=%lu,%d",
+      char *const at = _notify_at;
+      int an = snprintf(at, sizeof(_notify_at), "AT+SDVRNTFA=%lu,%d",
                         (unsigned long)_notify_num, jn);
-      bool ok = (an > 0) && ((size_t)an < sizeof(at));
+      bool ok = (an > 0) && ((size_t)an < sizeof(_notify_at));
 
       for (int off = 0; ok && (off < jn); off += (int)NOTIFY_CHUNK_MAX)
       {
         int take = jn - off;
         if (take > (int)NOTIFY_CHUNK_MAX) { take = (int)NOTIFY_CHUNK_MAX; }
-        int wrote = snprintf(&at[an], sizeof(at) - (size_t)an,
+        int wrote = snprintf(&at[an], sizeof(_notify_at) - (size_t)an,
                              ",\"%.*s\"", take, &enc[off]);
-        if ((wrote <= 0) || ((size_t)(an + wrote) >= sizeof(at)))
+        if ((wrote <= 0) || ((size_t)(an + wrote) >= sizeof(_notify_at)))
         {
           ok = false;
           break;
@@ -882,8 +1005,8 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 
       if (ok)
       {
-        int wrote = snprintf(&at[an], sizeof(at) - (size_t)an, ",1");
-        ok = (wrote > 0) && ((size_t)(an + wrote) < sizeof(at));
+        int wrote = snprintf(&at[an], sizeof(_notify_at) - (size_t)an, ",1");
+        ok = (wrote > 0) && ((size_t)(an + wrote) < sizeof(_notify_at));
       }
 
       if (ok)
@@ -899,6 +1022,8 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
   }
 
   _notify_num = (_notify_num + 1U) & 0xFFFFU;
+
+  rtos_mutex_acquire(&_notify_mtx, false);
 }
 
 /* Public entry point for producers outside this file — today the NN task's
