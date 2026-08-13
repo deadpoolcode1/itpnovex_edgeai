@@ -68,9 +68,17 @@
 *//*--------------------------------------------------------------------------*/
 
 /* NN task tunables
- * TODO: Optimize stack size
+ *
+ * 4 KB, not the vendor's 2 KB. This loop no longer only runs inference: on a
+ * confirmed change of the count it composes a SoW §6 notification, claims a
+ * snapshot slot and reaches down into the USB write path, and the deepest of
+ * those calls does not fit in 2 KB alongside its own frame. The buffers that
+ * made it overflow now live in static storage (see _notify_emit), which is
+ * the actual fix; this is the margin that keeps the next thing added to this
+ * loop from being another silent memory corruption. modem_task and jpeg_task
+ * are 4 KB for the same reason.
  */
-#define NN_TASK_STACK_SIZE      (2U * 1024U)
+#define NN_TASK_STACK_SIZE      (4U * 1024U)
 #define NN_TASK_PRIO            APP_PRIO_IMPORTANT
 #define NN_TASK_TIME_SLICE      APP_TIME_SLICE_DEFAULT
 
@@ -218,30 +226,73 @@ static uint32_t          _nn_prev_boxes    = 0U;
  *     empties therefore never reports again, and looks broken from the
  *     outside while working exactly as written.
  *
- * So the count itself is debounced — a new value must hold **continuously
- * for _nn_debounce_ms** before it is believed — and every change of the
- * debounced value is reported, not just the departure from zero. The
- * default is 1000 ms: a person walking in is reported a second later, and
- * nothing that does not survive a whole second is reported at all. 0
- * disables the wait and reports every frame's change, which is the old
- * behaviour and the reason for the storm.
+ * The first attempt at this required a new count to hold **continuously**
+ * for a whole window before it was believed, and it was wrong in a way that
+ * only a busy scene shows. Restarting the window on every change means a
+ * count that oscillates faster than the window never survives one: with
+ * four people in frame and one of them flickering in and out — which is
+ * exactly what a 192x192 quantised detector does to a partly-occluded or
+ * distant object — the count alternates 3,4,3,4 at frame rate and the
+ * window restarts every ~90 ms, forever. The believed count never moves,
+ * so **no notification and no photo are ever sent at all** while people are
+ * plainly in view. Measured on the bench: a static scene of four people
+ * took 144 s to report once, and reported nothing in between. Silence is a
+ * worse failure than the storm it replaced, because it looks like a dead
+ * device.
+ *
+ * What the flicker actually is decides the fix. A detector of this size
+ * misses objects that are there far more often than it invents ones that
+ * are not, so an oscillation between 3 and 4 almost always means four, seen
+ * imperfectly. The count is therefore hysteretic rather than debounced, and
+ * deliberately asymmetric:
+ *
+ *   - **Rising** is believed quickly: a higher count need only be seen
+ *     NN_RISE_CONFIRM_FRAMES times (not consecutively — the frames in
+ *     between are the dropouts) before it is adopted. One frame alone is
+ *     not enough, which is what keeps a single spurious box out.
+ *   - **Falling** must be earned: the count is adopted downward only after
+ *     it has stayed below the believed value for the whole window without
+ *     once touching it, and it then falls to the *highest* value seen
+ *     during that window rather than the last one. A person who blinks out
+ *     for three frames does not empty the room.
+ *
+ * So 3 -> 4 reports within ~200 ms, 4 -> 3 -> 4 -> 3 reports nothing, and
+ * everybody leaving reports 0 one window later. The scheme always
+ * converges: the rise path cannot be starved by oscillation, and the fall
+ * path is reset only by the count actually returning to what is believed.
  *
  * The window is measured in time rather than frames on purpose. Frame rate
  * varies with load, so "N frames" is a different amount of steadiness at
  * 30 Hz than at 12, and it is steadiness in seconds that the customer's
- * server cares about.
+ * server cares about. The rise confirmation is in frames because it is
+ * about how many looks at the scene agree, not how long they took.
  *
  * Every change is reported in both directions — 3 -> 4 and 4 -> 3 alike —
  * including the change to zero, which is how a server learns the area is
  * clear. rsn stays 0x10 and rsd carries the new count, so an rsd of 0 reads
  * as "no people now". The SD snapshot is skipped on that one: there is
- * nothing to photograph. */
-#define NN_DEBOUNCE_DEFAULT_MS   1000U
+ * nothing to photograph.
+ *
+ * `detect debounce 0` disables both halves and reports every frame's
+ * change, which is the original behaviour and the reason for the storm; it
+ * is kept because it is the only way to see the raw detector from outside. */
+#define NN_DEBOUNCE_DEFAULT_MS    1000U
+#define NN_RISE_CONFIRM_FRAMES    2U
 
 static volatile uint32_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
-static uint32_t          _nn_cand_boxes    = 0U;  /* value being confirmed */
-static uint32_t          _nn_cand_since    = 0U;  /* tick it first showed  */
 static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
+
+/* Rising: the highest count seen while collecting evidence, how many frames
+ * have exceeded the believed value, and when that evidence started (it
+ * expires a window later if it never reaches NN_RISE_CONFIRM_FRAMES). */
+static uint32_t          _nn_rise_cand     = 0U;
+static uint32_t          _nn_rise_hits     = 0U;
+static uint32_t          _nn_rise_since    = 0U;
+
+/* Falling: when the count last agreed with the believed value, and the
+ * highest it has reached since. */
+static uint32_t          _nn_fall_since    = 0U;
+static uint32_t          _nn_fall_peak     = 0U;
 
 /* ThreadX ticks for the configured window, rounded up so a sub-tick
  * setting still waits at least one tick. */
@@ -255,6 +306,100 @@ static uint32_t _nn_debounce_ticks(void)
 
 void nn_task_debounce_set(uint32_t ms)  { _nn_debounce_ms = ms; }
 uint32_t nn_task_debounce_get(void)     { return _nn_debounce_ms; }
+
+/* Reset the hysteresis to agree with whatever count is now believed. Used
+ * when the believed value is set from outside the live loop (start/stop,
+ * `detect simulate`), so the next real frame is judged against it rather
+ * than against a window left half-open by the previous scene. */
+static void _nn_count_reset(uint32_t to)
+{
+  _nn_stable_boxes = to;
+  _nn_rise_cand    = 0U;
+  _nn_rise_hits    = 0U;
+  _nn_rise_since   = tx_time_get();
+  _nn_fall_peak    = 0U;
+  _nn_fall_since   = tx_time_get();
+}
+
+/* Feed one frame's raw count in; returns true when the believed count
+ * changed, in which case _nn_stable_boxes is the new value.
+ *
+ * Called once per inference from the NN loop and nowhere else, so the state
+ * above needs no lock. */
+static bool _nn_count_update(uint32_t raw)
+{
+  uint32_t window = _nn_debounce_ticks();
+
+  /* 0 = no filtering: believe every frame, which is what the raw detector
+   * looks like and is occasionally what you want to see. */
+  if (window == 0U)
+  {
+    if (raw == _nn_stable_boxes) { return false; }
+    _nn_count_reset(raw);
+    return true;
+  }
+
+  if (raw > _nn_stable_boxes)
+  {
+    /* Evidence for a rise, carrying the highest count seen while it is
+     * collected. Taking the maximum is the whole point: with four people
+     * and one flickering, the frames that see 4 are the truthful ones and
+     * the frames that see 3 are the misses. */
+    if (_nn_rise_hits == 0U)
+    {
+      _nn_rise_cand  = raw;
+      _nn_rise_since = tx_time_get();
+    }
+    else if (raw > _nn_rise_cand)
+    {
+      _nn_rise_cand = raw;
+    }
+    _nn_rise_hits++;
+
+    if (_nn_rise_hits >= NN_RISE_CONFIRM_FRAMES)
+    {
+      _nn_count_reset(_nn_rise_cand);
+      return true;
+    }
+    return false;
+  }
+
+  /* At or below the believed count. Rise evidence is *not* thrown away here
+   * — that was the mistake in the first version. A scene alternating 3,4
+   * against a believed 3 shows one frame of evidence, then a frame that
+   * agrees, then more evidence; clearing on the agreeing frame means the
+   * second hit never arrives and the rise is starved forever. Evidence
+   * expires on the clock instead: a lone spurious box is forgotten a window
+   * later, having never been joined. */
+  if ((_nn_rise_hits > 0U) &&
+      ((int32_t)(tx_time_get() - _nn_rise_since) >= (int32_t)window))
+  {
+    _nn_rise_hits = 0U;
+    _nn_rise_cand = 0U;
+  }
+
+  if (raw == _nn_stable_boxes)
+  {
+    /* The scene agrees with what we believe: abandon any fall in progress. */
+    _nn_fall_peak  = 0U;
+    _nn_fall_since = tx_time_get();
+    return false;
+  }
+
+  /* raw < believed: a fall, believed only if it lasts. Remember the highest
+   * count seen while it lasts, so we fall to 3 rather than to the single
+   * worst frame's 1. */
+  if (raw > _nn_fall_peak) { _nn_fall_peak = raw; }
+
+  /* Signed compare, so the wait stays correct across tick wrap. */
+  if ((int32_t)(tx_time_get() - _nn_fall_since) >= (int32_t)window)
+  {
+    uint32_t settled = _nn_fall_peak;
+    _nn_count_reset(settled);
+    return true;
+  }
+  return false;
+}
 
 /* Floor between automatic photo uploads (action_msk bit2). The JPEG crosses
  * the internal 115200 link to the modem before it goes anywhere, which is
@@ -283,10 +428,8 @@ void nn_task_detect_set(bool enable)
    * arrival after `detect start` reports nothing new. */
   if (enable)
   {
-    _nn_cand_boxes   = 0U;
-    _nn_cand_since   = tx_time_get();
-    _nn_stable_boxes = 0U;
-    _nn_prev_boxes   = 0U;
+    _nn_count_reset(0U);
+    _nn_prev_boxes = 0U;
   }
   _nn_detect_enabled = enable;
 }
@@ -403,14 +546,12 @@ void nn_task_simulate_detection(uint32_t boxes)
     }
     LINFO(TRACE_NN, "[simulate] %lu object(s)", (unsigned long)boxes);
   }
-  /* Adopt the simulated count as the believed one, with the window
+  /* Adopt the simulated count as the believed one, with the hysteresis
    * restarted: a simulate is an assertion about the scene, and the live
    * loop should report the real count as a change away from it rather
    * than immediately re-reporting what was just simulated. */
-  _nn_stable_boxes = boxes;
-  _nn_cand_boxes   = boxes;
-  _nn_cand_since   = tx_time_get();
-  _nn_prev_boxes   = boxes;
+  _nn_count_reset(boxes);
+  _nn_prev_boxes = boxes;
 }
 
 /* COCO-class -> SoW class mapping (proposal W5/W6).
@@ -510,24 +651,10 @@ static void _nn_task_run(uint32_t args)
        * with one JPEG per frame at 22 Hz. */
       uint32_t cur_boxes = (uint32_t)_pp_box_count;
 
-      /* Debounce the count, then report every change of the debounced
-       * value. See the _nn_debounce block above for why both halves of
-       * this are needed. */
-      if (cur_boxes != _nn_cand_boxes)
-      {
-        _nn_cand_boxes = cur_boxes;
-        _nn_cand_since = tx_time_get();     /* restart the window */
-      }
-
-      /* Signed compare, so the wait stays correct across tick wrap. */
-      bool count_changed = false;
-      if ((_nn_cand_boxes != _nn_stable_boxes) &&
-          ((int32_t)(tx_time_get() - _nn_cand_since) >=
-           (int32_t)_nn_debounce_ticks()))
-      {
-        _nn_stable_boxes = _nn_cand_boxes;
-        count_changed    = true;
-      }
+      /* Hysteresis: quick to believe a rise, slow to believe a fall. See
+       * the _nn_debounce block above for why the symmetric version of this
+       * could sit silent for minutes on a busy scene. */
+      bool count_changed = _nn_count_update(cur_boxes);
 
       /* Never let an injected picture masquerade as a real detection. The
        * side effects here are the product's outward claims — a JPEG filed
