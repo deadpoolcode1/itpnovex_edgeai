@@ -1,6 +1,161 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-12. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-13. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-13 — ITP's two QA bugs, both root-caused and fixed
+
+`ITPNOVEX/ScopusQA` issues #1 and #2, reported by Reuven. Both reproduced on
+`t7aryz0009769z2` before anything was changed, and both turned out to be
+firmware faults rather than test-procedure mistakes.
+
+### #1 "No response for query commands" — a USBX bug, not a shell bug
+
+The tester's description was precise and worth re-reading: *"Instructions
+commands are working but there is no OK response."* That is not a hung shell.
+Proved it on the bench: with the console silent, `detect stop` sent over CDC
+**stopped the NN task** (the per-frame inference trace ceased at that instant)
+while nothing came back. The shell receives, parses and executes; only the
+transmit direction is dead. It never recovers, and it takes a reboot to clear
+— which is why the kit also looked bricked: `n6cam-update.py` drives the same
+console, so a wedged unit cannot even be reflashed.
+
+Root cause is in ST's USBX device controller,
+`ux_dcd_stm32_transfer_request.c`:
+
+```c
+HAL_PCD_EP_Transmit(...);                         /* buffer handed to the peripheral */
+status = _ux_utility_semaphore_get(&...semaphore, timeout);
+if (status != UX_SUCCESS)
+    return(status);                               /* returns, transfer still armed */
+```
+
+On a timeout it returns **without taking the transfer back**. The endpoint
+stays busy for ever: every later `HAL_PCD_EP_Transmit` on that address is
+refused, so nothing is sent, so the semaphore is never posted, so the next
+caller times out too. **One expired write kills the direction permanently.**
+
+That is reached constantly on this product because the device writes to its
+own console — a `+SDVRNTF` line every time the scene changes — and a QA
+terminal is not always attached to read it. Notifications are written with a
+100 ms timeout, so the first detection with nobody listening killed the
+console. This is also the other half of the 2026-08-06 §5.2 fix: honouring the
+timeout stopped the *hang* and left the *poisoning*.
+
+Fixed by aborting and flushing the endpoint on the timeout path, then draining
+any post the ISR slipped in, so the next caller starts clean. Deliberately
+**not** applied to the receive direction: RX shows no sign of the fault and
+flushing there would discard a byte that arrived during the abort.
+
+Two supporting fixes found along the way:
+
+- **`_notify_emit()` overflowed the NN task's stack.** It put ~1.2 KB of
+  buffers (`json`/`buf`/`enc`/`at`) on its caller's stack. That was survivable
+  while the shell task was the only caller and fatal once `nn_task` became the
+  second: every task here has a 2 KB stack. Measured after the fix, with the
+  buffers moved to static storage under a mutex, `tx.task.nn` peaks at
+  **1420 bytes** — plus the 1.2 KB it used to carry is ~2.6 KB into a 2 KB
+  stack. The NN stack is now 4 KB, matching modem/jpeg.
+- **`stacks`** — new shell command printing per-task high-water usage from
+  ThreadX's 0xEF fill. A stack overflow here corrupts something else minutes
+  later and somewhere else entirely; this makes it readable instead.
+- **`version` now also prints `Build: <date> <time>`.** `version_bsp.h` is
+  vendor-generated and our build never regenerates it, so every image reported
+  `01.08.2593089169` and a flash that silently did not take was
+  indistinguishable from one that did. That cost a debugging detour today.
+
+**Verified**: 8 minutes of continuous detection with the CDC port *closed* for
+60 s between probes — the exact condition that used to kill it. The console
+answered every round (uptime 111 s → 481 s). Before the fix it died
+permanently ~95 s after `detect start`, taking the whole USB device off the
+bus with it. Residual: 2 individual commands out of 18 returned nothing and
+the next one worked — the known notification-vs-response interleaving, not a
+wedge.
+
+### #2 "Unstable detection with multiple objects" — the debounce sat silent
+
+The 2026-08-12 debounce required a new count to hold **continuously** for
+1000 ms. With four people in frame and one flickering — exactly what a
+192×192 quantised detector does to a partly-occluded or distant object — the
+count alternates 3,4,3,4 at frame rate, the window restarts every ~90 ms, and
+the believed count never moves. **No notification and no photo are sent at
+all** while people are plainly in view. Measured on the old build: a static
+scene took **144 s** to report once, and reported nothing in between. That is
+the tester's report exactly, and it is a worse failure than the storm it
+replaced, because silence looks like a dead device.
+
+Replaced with asymmetric hysteresis, because a detector this size misses
+objects far more often than it invents them, so 3↔4 almost always means four
+seen imperfectly:
+
+- **Rising** is believed after `NN_RISE_CONFIRM_FRAMES` (2) frames above the
+  believed count, carrying the **highest** value seen. Evidence expires on the
+  clock, not on a disagreeing frame — clearing it when the count momentarily
+  agrees is what starved the rise in the first version.
+- **Falling** must hold below the believed value for the whole window without
+  once touching it, and then falls to the **highest** count seen during that
+  window. A person who blinks out for three frames does not empty the room.
+
+So 3→4 reports in ~200 ms, 4→3→4→3 reports nothing, everybody leaving reports
+0 one window later, and the scheme always converges. `detect debounce 0` still
+disables both halves. Verified on the bench: counts now report within seconds
+of the scene changing (5, 4, 0, 1, 6, 5 …) instead of after minutes.
+
+### The customer's server: the device is fine, their inbound is closed
+
+Reuven asked for the data to go straight from the device to `213.8.185.180`
+(photos TCP 8991 or 5912, notifications UDP 6734). **`213.8.185.180` is the
+office public IP of the bench itself**, and their receiver
+(`/opt/sdvr-server/server.py`, `SDVRReceiver/2.0`, plus a UDP sink on 6734) is
+already installed and running on the bench PC — it has been up 39 days. So
+nothing needs installing; it is a reachability problem:
+
+| From | 8991/tcp | 5912/tcp | 6734/udp |
+|---|---|---|---|
+| inside their LAN | HTTP 200 | connects | listening |
+| the modem, over cellular | timeout | timeout | sent, never arrives |
+| an unrelated internet host | timeout | timeout | — |
+
+The device end is proven, not assumed. The modem decoded and sent the §6 JSON
+(`AT: NTFA ENC=1 rejoined 1 part(s) -> 102 bytes`, `Notify_Send: 102 bytes
+sent over UDP`) and `tcpdump` on the receiving machine itself saw **nothing**.
+The control run settles it: the same modem, same cellular link, same
+notification path, pointed at a reachable public server —
+`Notify HTTP: 102 bytes POSTed to http://165.22.181.245:80/scopus/notify
+(200)`. Cellular data is healthy (Partner IL LTE, route up, `ping 8.8.8.8`
+0% loss).
+
+**So the inbound port-forward at 213.8.185.180 is not passing traffic from the
+internet.** That is theirs to fix. Endpoints are left configured at their
+server so it starts working the moment it opens.
+
+### Still blocked: the CN805 camera↔modem link on this bench
+
+The full camera→modem→cellular→server chain could **not** be run today. The
+link is latched in the camera→modem direction: `tx frames=51 retries=50`,
+`rx frames=3`, `ntf queued=9 sent=0`, `-> nothing reaching PF6`. The camera
+composes correct notifications (`rsd` 3/4/5/6, RTC set, right timestamps) and
+they never cross the wire.
+
+This is the known FXMA108 auto-direction translator fault (§3, §4.1), not
+anything changed today. Everything documented was tried: the ordered reset
+(modem first, wait for `sdvrApp`, then camera, camera drives first) ×2,
+`mdm relink` ×15+, and back-to-back traffic to beat the ~5 s idle latch. It
+came back for exactly one command (`mdm AT` → `OK`, `+SDVRRDY` framed through)
+and latched again. **It needs someone at the bench** — re-seat CN805 — and
+ultimately the hardware fix.
+
+### Also found: `sdvrApp` disappears across modem reboots
+
+It was absent at the start of the session and vanished again after a reboot
+despite `update --mark-good` reporting success — the system index climbed
+38 → 40 with the app gone from `app list` on a system marked `[good]`.
+AirVantage/`avcService` is running and is the obvious suspect. Reinstall,
+`--mark-good`, and **verify `HdlcChannel: init on /dev/ttyHS0` appears in
+`logread`** — without the app the camera's frames reach the bare AT parser,
+which answers a plain 9-byte `\r\nERROR\r\n` and never frames, which reads
+exactly like a dead link.
 
 ---
 
