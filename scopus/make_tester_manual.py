@@ -75,6 +75,13 @@ RELAY_UDP_PORT = 39999
 RELAY_NOTIFY_PATH = "/scopus/notify"
 RELAY_KEY = os.environ.get("SCOPUS_RELAY_KEY", "<ask-for-the-relay-key>")
 
+# Remote command channel (section 19). The broker runs on this same PC and is
+# reached on its public address, because that is the address the unit dials
+# from the mobile network — the LAN address is not routable from there.
+MQTT_HOST = "213.8.185.180"
+MQTT_PORT = 5912
+MQTT_CERT_DIR = "/opt/sdvr-server/certs"
+
 
 def code(doc, text, size=9):
     """A command / output block."""
@@ -1198,6 +1205,182 @@ def build():
             "Check which SIM the modem is on — Step C0. On the wrong card "
             "every check in this section passes and no data crosses. That is "
             "the single most likely cause of this exact symptom."]])
+
+    # ── 19. Remote commands over MQTT ────────────────────────────────
+    doc.add_page_break()
+    doc.add_heading("19. Driving the unit from the server (remote commands)",
+                    level=1)
+    doc.add_paragraph(
+        "Everything up to here is the unit talking outwards: it sees "
+        "something, it reports it, it uploads a photo. This section is the "
+        "other direction — typing a command on the server and having the "
+        "unit carry it out, over the mobile network, with no cable and "
+        "nothing opened on the unit's side.")
+
+    doc.add_heading("Why it works this way", level=2)
+    doc.add_paragraph(
+        "The unit has no address anyone can dial. On the mobile network it "
+        "sits behind the operator's NAT, so the server cannot open a "
+        "connection to it. The unit therefore opens one outwards to a "
+        "broker and holds it open, and commands are pushed down that "
+        "connection.")
+    note(doc,
+         "This is why the notification channel could not be used for "
+         "commands. A reply sent straight back to a report does reach the "
+         "unit — measured at 0.2 seconds — but the operator's NAT closes "
+         "that opening again in under 30 seconds. Probes sent 30, 60, 120 "
+         "and 240 seconds after a report never arrived. So that path can "
+         "only answer a report, never start a conversation.")
+    doc.add_paragraph(
+        "The connection is encrypted and the unit proves who it is with a "
+        "certificate. The broker will not accept a client that does not "
+        "present one, so there is no password anywhere and no way to drive "
+        "someone else's unit.")
+
+    doc.add_heading("What is already set up", level=2)
+    table(doc, ["Piece", "Where", "What it is"],
+          [["Broker (mosquitto)", f"this PC, port {MQTT_PORT}",
+            "Accepts the unit's connection over TLS and requires a client "
+            "certificate signed by our CA."],
+           ["Certificates", MQTT_CERT_DIR,
+            "ca.crt, client.crt, client.key. The same three are already "
+            "loaded on the modem under /data/sdvr/certs."],
+           ["The unit's name", "its IMEI",
+            "Used to build the topics below. Read it with the AT+SDVRMQTT? "
+            "command in Step R1 if you do not know it."]])
+
+    doc.add_heading("Step R1 — Check the unit is connected", level=2)
+    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRMQTT?"')
+    expected(doc)
+    code(doc, f'+SDVRMQTT: 1,1,"{MQTT_HOST}",{MQTT_PORT},"<IMEI>",0,1,1')
+    doc.add_paragraph(
+        "The first number is 1 when the channel is switched on, and the "
+        "second is 1 when it is actually connected. The text in the middle "
+        "is the unit's name — write it down, every command below needs it.")
+    note(doc, "If the second number is 0, the unit is not connected. Give it "
+              "half a minute and look again: it retries on its own, waiting "
+              "5 seconds then 10, 20 and so on up to a minute between "
+              "attempts. If it stays 0, run Step C0 first — with no mobile "
+              "data there is nothing for it to connect over.")
+    doc.add_paragraph("If it is switched off, switch it on with:")
+    cmd(doc, f'{CD}python3 scopus/at.py '
+             f'"AT+SDVRMQTTSRV=\\"{MQTT_HOST}\\",{MQTT_PORT}"')
+    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRMQTT=1"')
+
+    doc.add_heading("Step R2 — Watch what the unit says (Window A)", level=2)
+    doc.add_paragraph(
+        "Open a terminal window and leave this running. It shows every "
+        "command that goes out and every answer that comes back. Replace "
+        "<IMEI> with the name from Step R1.")
+    cmd(doc, f"mosquitto_sub -h {MQTT_HOST} -p {MQTT_PORT} \\\n"
+             f"  --cafile {MQTT_CERT_DIR}/ca.crt \\\n"
+             f"  --cert {MQTT_CERT_DIR}/client.crt "
+             f"--key {MQTT_CERT_DIR}/client.key \\\n"
+             f"  -t 'scopus/<IMEI>/#' -v")
+    expected(doc, "Straight away, one line:")
+    code(doc, "scopus/<IMEI>/status online")
+    note(doc, "That line is stored by the broker, so it appears the moment "
+              "you subscribe rather than only when the unit next says "
+              "something. If it says offline, the unit's connection has "
+              "dropped — the broker announces that on the unit's behalf.")
+
+    doc.add_heading("Step R3 — Send a command (Window B)", level=2)
+    doc.add_paragraph("In a second window:")
+    cmd(doc, f"mosquitto_pub -h {MQTT_HOST} -p {MQTT_PORT} \\\n"
+             f"  --cafile {MQTT_CERT_DIR}/ca.crt \\\n"
+             f"  --cert {MQTT_CERT_DIR}/client.crt "
+             f"--key {MQTT_CERT_DIR}/client.key \\\n"
+             f"  -t 'scopus/<IMEI>/cmd' -q 1 -m 'version'")
+    expected(doc, "In Window A, within a few seconds, two lines:")
+    code(doc, "scopus/<IMEI>/cmd version\n"
+              "scopus/<IMEI>/rsp Application: 01.08.2593089169 "
+              "Build: Aug 16 2026 16:24:44 version ok")
+    doc.add_paragraph(
+        "The first line is your own command coming back past you; the "
+        "second is the unit's answer. Anything you can type at the camera "
+        "console works here — try uptime, mdm stats, detect start.")
+
+    doc.add_heading("Step R4 — Ask the modem something", level=2)
+    doc.add_paragraph(
+        "A command beginning with AT is answered by the modem instead of "
+        "the camera. This is how a unit in the field gets diagnosed without "
+        "anyone travelling to it.")
+    cmd(doc, f"mosquitto_pub -h {MQTT_HOST} -p {MQTT_PORT} \\\n"
+             f"  --cafile {MQTT_CERT_DIR}/ca.crt \\\n"
+             f"  --cert {MQTT_CERT_DIR}/client.crt "
+             f"--key {MQTT_CERT_DIR}/client.key \\\n"
+             f"  -t 'scopus/<IMEI>/cmd' -q 1 -m 'AT+CSQ'")
+    expected(doc, "In Window A:")
+    code(doc, "scopus/<IMEI>/rsp AT+CSQ  +CSQ: 28,99  OK")
+    doc.add_paragraph("Useful ones to know:")
+    table(doc, ["Command", "What it tells you"],
+          [["AT+CSQ", "Signal strength. The first number: under 10 is poor, "
+                      "over 20 is good, 99 means no signal at all."],
+           ["AT+SDVRNET?", "The whole mobile picture — operator, LTE, APN, "
+                           "and the address the unit is using."],
+           ["AT+SDVRMQTT?", "This channel's own state and counters."],
+           ["AT+SDVRSIM?", "Which SIM holder the unit is reading."]])
+
+    doc.add_heading("Step R5 — The whole product, from the server", level=2)
+    doc.add_paragraph(
+        "This is the test that matters, because it uses every part at once. "
+        "Leave Window A running and send:")
+    cmd(doc, f"mosquitto_pub -h {MQTT_HOST} -p {MQTT_PORT} \\\n"
+             f"  --cafile {MQTT_CERT_DIR}/ca.crt \\\n"
+             f"  --cert {MQTT_CERT_DIR}/client.crt "
+             f"--key {MQTT_CERT_DIR}/client.key \\\n"
+             f"  -t 'scopus/<IMEI>/cmd' -q 1 -m 'photo upload'")
+    expected(doc, "In Window A, an answer like:")
+    code(doc, "scopus/<IMEI>/rsp photo upload: capturing -> SDVR+SENDBIN "
+              "ref=4 name=4194336_16082026_163709.rdy photo upload ok")
+    doc.add_paragraph(
+        "Then check the photo itself actually arrived, the same way as "
+        "Step 11:")
+    cmd(doc, "ls -lt /home/user/sdvr-uploads | head -3")
+    expected(doc, "A file called photo, around 100-130 KB, dated just now.")
+    note(doc, "A command went from this PC to the unit over the mobile "
+              "network, the camera took a picture, and the picture came back "
+              "over the same network to this PC. Nothing was plugged in at "
+              "either end. That is the whole product in one step.")
+
+    doc.add_heading("Pass criteria for this section", level=2)
+    table(doc, ["#", "What must be true"],
+          [["R-1", "AT+SDVRMQTT? shows 1,1 — switched on and connected."],
+           ["R-2", "The status line says online as soon as you subscribe."],
+           ["R-3", "A camera command (version) is answered."],
+           ["R-4", "A modem command (AT+CSQ) is answered."],
+           ["R-5", "photo upload sent from here puts a photo on this PC."],
+           ["R-6", "Every command is answered exactly ONCE. Two identical "
+                   "answers to one command is a failure — report it."]])
+
+    doc.add_heading("If the remote commands fail", level=2)
+    table(doc, ["What you see", "What it means and what to do"],
+          [["AT+SDVRMQTT? shows 1,0 and stays there",
+            "Switched on but not connecting. Almost always no mobile data "
+            "rather than anything to do with this channel — run Step C0. If "
+            "the mobile side is healthy, the certificates are the next "
+            "suspect: the modem must have all three files under "
+            "/data/sdvr/certs."],
+           ["mosquitto_sub says 'connection refused' or just exits",
+            "The broker would not accept your certificate. Check you passed "
+            "all three of --cafile, --cert and --key — leaving out --cert is "
+            "the usual mistake, and the broker rejects the connection "
+            "without explaining why."],
+           ["Your command appears on .../cmd but no answer comes back",
+            "The command reached the unit and the answer did not come back. "
+            "If it was a camera command, the camera link is the suspect — "
+            "run Step 6. If it was an AT command, report it."],
+           ["The answer arrives twice",
+            "A fault, not a quirk. It means a response was published for "
+            "each retry instead of once. Report it with the command you "
+            "sent."],
+           ["'(no output)' comes back",
+            "The unit ran something that printed nothing — usually a typing "
+            "mistake in the command. Check the spelling against what works "
+            "at the console."],
+           ["The answer stops mid-sentence with [truncated]",
+            "Expected, not a fault: a very long answer is cut after about "
+            "1.8 KB. Ask for less at a time."]])
 
     doc.save(OUT)
     print(f"wrote {OUT}")

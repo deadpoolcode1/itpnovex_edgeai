@@ -1,6 +1,122 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-13. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-16. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-16 — remote commands over MQTT, end to end over cellular
+
+ITP asked for a way to send commands *to* a deployed unit. They offered two
+options: reply on the UDP notification channel, or MQTT over their port 5912
+with a client certificate. **Both were measured before choosing, and the
+measurement decided it.**
+
+### Why not the UDP return path (it works, and it is still not enough)
+
+The firmware already had the return path: `notify.c` sends notifications from
+one UDP socket and `sdvrNotifRx` reads replies off that same fd, forwarding
+them to the camera. It works — a server reply reached the camera console
+**0.2 s** after the report.
+
+But the carrier NAT mapping closes in **under 30 seconds**. Probes sent back
+to the same address/port at t+30, +60, +120 and +240 s after a report all
+vanished; only the immediate reply arrived, confirmed at both ends (three
+`Notify: inbound datagram` lines in the modem log, one per immediate reply,
+none for the delayed probes). Partner IL, APN `internet`.
+
+So that path can answer a report. It cannot start a conversation. Commands
+have to arrive when the operator types them, which needs a held-open
+connection — hence MQTT.
+
+### What was built
+
+**Broker** — mosquitto 2.0.18 on the bench, TLS listener on **5912**, using
+the PKI that was already in `/opt/sdvr-server/certs` (the server cert's SAN
+already carries `IP:213.8.185.180`, the address the unit dials from the mobile
+network). `require_certificate true` + `use_identity_as_username true`, so the
+device's CN is its username and no password exists anywhere. Verified that a
+client presenting no certificate is refused. Config in
+`/etc/mosquitto/conf.d/scopus.conf`.
+
+**5912 was in use** by `sdvr-https.service`, ITP's mutual-TLS upload receiver.
+It is stopped, because Reuven designated 5912 for this and the photos are on
+8991. `systemctl start sdvr-https` puts it back — but not while mosquitto
+holds the port.
+
+**Modem app 1.12.0** — `mqtt.c`, a minimal MQTT 3.1.1 client over OpenSSL
+1.0.2 (the sysroot has no libmosquitto or paho; curl's MQTT support is
+experimental and carries no TLS, so it was not an option). QoS 0 out, QoS 1
+accepted and acknowledged in. LWT + retained `online`/`offline` on
+`scopus/<id>/status`. Keepalive 60 s, PINGREQ at 45 s idle, reconnect if no
+PINGRESP in 30 s — a carrier can reap an idle TCP session with neither end
+noticing, and without that check the unit sits silently uncommandable.
+Backoff 5→60 s. Client id defaults to the IMEI.
+
+New AT commands: `AT+SDVRMQTTSRV="<host>",<port>`, `AT+SDVRMQTTID="<id>"`,
+`AT+SDVRMQTT=<0|1>` / `?`, `AT+SDVRCMDR=` (the camera's response),
+`AT+SDVRNTFPROTO=2` (notifications over MQTT). URCs `+SDVRMQTT: UP|DOWN|ERROR`
+and `+SDVRCMD: "<text>"`.
+
+**Camera** — `shell_task.c` runs a remote command in the *shell task's own
+loop* with a capture stream swapped in, never on the modem task's thread:
+lwshell is not reentrant and owns one stream at a time, so the URC only parks
+the line and the shell task picks it up between iterations. Output is captured
+rather than printed, so a remote `version` is byte-identical to a typed one.
+Responses go back as `AT+SDVRCMDR`, chunked with the same backtick/128-byte
+encoding as `AT+SDVRNTFA` (the constraint belongs to the AT line, not the
+payload — and shell output contains quotes far more often than the §6 JSON).
+
+### The routing rule, and the trap under it
+
+A command starting with `AT` is answered by the modem; anything else goes to
+the camera. The first version sent every AT command to `/dev/ttyAT` and
+**every `AT+SDVR*` command came back a bare ERROR** — those handlers belong to
+`le_atServer`, which serves the host UART and the camera's HDLC link, and the
+module's own parser has never heard of them. Fixed by giving mqtt.c its own
+PTY whose slave is handed to `le_atServer` — the same trick `hdlc_channel.c`
+already uses. atServer registers handlers per command, not per device, so that
+device inherits every `+SDVR*` command for free. The handler runs on the main
+thread while the worker blocks reading the master; safe in one direction only,
+so **no AT handler may ever wait on the MQTT worker**.
+
+### The bug the first end-to-end run found
+
+**Every response was published twice.** The camera's counters showed one
+queued send per command, so the duplicate was the lossy-ack retry arriving and
+being acted on a second time — exactly what `AT+SDVRNTFA` has dedup for.
+`AT+SDVRCMDR` now has the same, keyed on numerator **and** payload hash, with
+its own slots (a shared table would let a notification evict the record of a
+response about to be retried). Re-tested: every command answered exactly once.
+
+### Proven, over cellular, against 213.8.185.180
+
+| What | Result |
+|---|---|
+| TLS + client cert | `ECDHE-RSA-AES256-GCM-SHA384`, no-cert client refused |
+| Camera command | `version` → the camera's own banner |
+| Modem command | `AT+CSQ` → `+CSQ: 28,99 OK` |
+| Our AT namespace | `AT+SDVRNET?` → the full `+SDVRNET: 1,1,1,1,"Partner IL",…` |
+| Whole product | `photo upload` sent from the server → 121,593-byte JPEG on the server |
+| Notification | `POST /notify` 100 B, HTTP 200, §6 JSON intact |
+| Photo | `POST /upload`, complete JPEG (FFD8…FFD9) |
+| Regression | `run_integration_tests.py` **56 PASS / 0 FAIL / 0 GAP / 1 SKIP** — unchanged |
+
+Route confirmed cellular, not the cable: `ip route get 213.8.185.180` on the
+modem goes via `rmnet_data0`, and their receiver logs the source as
+`213.8.185.178` (their NAT's outside address), i.e. arriving from the internet.
+
+Tester procedure: **section 19** of `Scopus_Tester_Manual.docx` (Steps R1-R5).
+
+### Also fixed on the way
+
+The bench came back from a power-cycle with **no `sdvrApp` installed at all**
+(Legato system 42, app absent; the FTDI showed a login prompt where the AT
+channel should be). Reinstalled and marked good. Two follow-ons: the FTDI AT
+channel stayed silent until the app was stopped and started once, and the
+CN805 camera→modem direction needed a single `mdm relink`. Note that an
+app-stopped `cat /dev/ttyHSL1` reading 0 bytes proves nothing while atServer
+owns the port — that measurement nearly produced a wrong "the RX pin is dead"
+diagnosis.
 
 ---
 

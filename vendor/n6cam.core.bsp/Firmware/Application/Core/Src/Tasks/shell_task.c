@@ -194,6 +194,10 @@ typedef struct
 static void     _shell_task_init(void);
 static void     _shell_task_run(uint32_t args);
 static void     _mdm_urc_forward(const char *line, size_t len, void *ctx);
+/* Remote command channel — see the block comment above the definitions. */
+static int32_t  _rcmd_stream_read(uint8_t *buff, size_t size, uint32_t timeout);
+static int32_t  _rcmd_stream_write(const uint8_t *buff, size_t size, uint32_t timeout);
+static bool     _shell_run_remote_cmd(void);
 static void     _uart_recov_task_run(uint32_t args);
 static void     _recovery_trigger(void);
 
@@ -281,6 +285,41 @@ static char     _notify_json[192];
 static char     _notify_line[256];
 static char     _notify_enc[192];
 static char     _notify_at[MODEM_NOTIFY_MAX];
+
+/* One command line and its output. Sized against what the shell actually
+ * prints: the longest single response, `commands`, is ~1.2 KB. Anything
+ * beyond REMOTE_RSP_MAX is truncated with a visible marker rather than
+ * dropped silently, because a clipped answer that says so is usable and a
+ * clipped answer that does not is a bug report. */
+#define REMOTE_CMD_MAX    200U
+#define REMOTE_RSP_MAX    1536U
+
+/* Per-message payload, bounded by the modem: NTFA_PAYLOAD_MAX there is 384
+ * bytes and the AT line cap is 512. A response longer than this is sent as
+ * several AT+SDVRCMDR commands, each published as its own message, in
+ * order — the operator reads them as consecutive lines of one answer. */
+#define REMOTE_SEG_MAX    360U
+#define REMOTE_SEG_LIMIT  5U      /* segments per response, then truncate */
+
+static TX_MUTEX  _rcmd_mtx;
+static char      _rcmd_line[REMOTE_CMD_MAX];   /* pending line, CR-terminated */
+static bool      _rcmd_pending = false;
+static uint32_t  _rcmd_num = 0U;
+
+/* Feed/capture state, touched only by the shell task while a remote
+ * command is running, so it needs no lock of its own. */
+static char      _rcmd_run[REMOTE_CMD_MAX + 2U];   /* + CR + NUL */
+static size_t    _rcmd_feed_off = 0U;
+static char      _rcmd_rsp[REMOTE_RSP_MAX + 1];
+static size_t    _rcmd_rsp_len = 0U;
+static t_stream  _rcmd_stream;
+
+/* Reused for the outbound AT line; static because a 512-byte buffer on a
+ * 2 KB task stack is how the notification path overflowed nn_task once
+ * already. */
+static char      _rcmd_enc[REMOTE_SEG_MAX + 2];
+static char      _rcmd_at[MODEM_NOTIFY_MAX];
+
 
 /* Emit a JSON notification on the shell stream per SoW §6.
  *   rsn — bitmask reason code
@@ -444,6 +483,14 @@ int32_t shell_task_start(void)
    * race but for ThreadX creating every task in tx_application_define() and
    * scheduling none of them until it returns — so nothing has run by the
    * time this mutex exists. */
+  status = (int32_t)tx_mutex_create(&_rcmd_mtx, "tx.mtx.rcmd", TX_INHERIT);
+  if (status != TX_SUCCESS)
+  {
+    LERROR(TRACE_SHELL, "Remote-cmd mutex creation failed");
+    Error_Handler();
+  }
+  (void)stream_init(&_rcmd_stream, _rcmd_stream_read, _rcmd_stream_write);
+
   status = (int32_t)tx_mutex_create(&_notify_mtx, "tx.mtx.notify", TX_INHERIT);
   if (status != TX_SUCCESS)
   {
@@ -607,6 +654,11 @@ static void _shell_task_run(uint32_t args)
       _shell.update = false;
       lwshell_stream_change(_shell.stream);
     }
+
+    /* A command that arrived from the server, run here rather than on the
+     * modem task's thread — lwshell belongs to this loop. Between updates
+     * is the only point at which the shell is provably idle. */
+    (void)_shell_run_remote_cmd();
 
     /* Clear bootloop counter once we've clearly survived the danger zone. */
     if (healthy_ticks <= HEALTHY_BOOT_TICKS)
@@ -1032,6 +1084,218 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 {
   _notify_emit(rsn, rsd, mtn);
+}
+
+/*-------------------------------------------------------------------------*//**
+ * Remote command execution — the camera end of the MQTT command channel.
+ *
+ * The modem subscribes to the unit's command topic and forwards anything
+ * that is not an AT command here, as `+SDVRCMD: "<text>"`. The text is a
+ * shell line: it runs in this shell, against these commands, and its
+ * output goes back through AT+SDVRCMDR to be published.
+ *
+ * Two constraints shape the whole design:
+ *
+ * 1. **lwshell is not reentrant and owns one stream at a time.** The URC
+ *    arrives on the modem task's thread, and running the command there
+ *    would tear the console shell in half. So the URC only *parks* the
+ *    line, and the shell task picks it up between its own iterations —
+ *    the command runs on the thread that owns lwshell, always.
+ *
+ * 2. **The output has to be captured, not printed.** lwshell writes
+ *    through whatever stream is installed, so the executor swaps in a
+ *    capture stream that appends to a buffer, runs the line, and swaps the
+ *    console back. Nothing in the command implementations changes, and a
+ *    remote `version` produces byte-identical text to a typed one.
+ *//*--------------------------------------------------------------------------*/
+
+/* Capture stream: reading hands lwshell the parked line once, writing
+ * appends to the response buffer. */
+static int32_t _rcmd_stream_read(uint8_t *buff, size_t size, uint32_t timeout)
+{
+  UNUSED(timeout);
+  size_t total = strlen(_rcmd_run);
+  if (_rcmd_feed_off >= total)
+  {
+    return 0;
+  }
+  size_t left = total - _rcmd_feed_off;
+  size_t take = (left < size) ? left : size;
+  memcpy(buff, &_rcmd_run[_rcmd_feed_off], take);
+  _rcmd_feed_off += take;
+  return (int32_t)take;
+}
+
+static int32_t _rcmd_stream_write(const uint8_t *buff, size_t size,
+                                  uint32_t timeout)
+{
+  UNUSED(timeout);
+  size_t room = (_rcmd_rsp_len < REMOTE_RSP_MAX)
+                  ? (REMOTE_RSP_MAX - _rcmd_rsp_len) : 0U;
+  size_t take = (size < room) ? size : room;
+  if (take > 0U)
+  {
+    memcpy(&_rcmd_rsp[_rcmd_rsp_len], buff, take);
+    _rcmd_rsp_len += take;
+    _rcmd_rsp[_rcmd_rsp_len] = '\0';
+  }
+  /* Always claim the whole write. Reporting a short write would make the
+   * command believe the console is congested and, for the commands that
+   * check, change what they print — the capture must not alter the
+   * output it exists to observe. */
+  return (int32_t)size;
+}
+
+/* Park a command received from the modem. Runs on the modem task's thread;
+ * does no work beyond the copy, for the reason in note 1 above. */
+void shell_remote_cmd_post(const char *text)
+{
+  if ((text == NULL) || (text[0] == '\0'))
+  {
+    return;
+  }
+
+  rtos_mutex_acquire(&_rcmd_mtx, true);
+  if (_rcmd_pending)
+  {
+    /* One at a time. Overwriting the parked line would answer the second
+     * command and leave the first unanswered but acknowledged, which is
+     * the one failure mode an operator cannot diagnose from the far end. */
+    LWARNING(TRACE_SHELL, "remote cmd: busy, rejecting '%s'", text);
+    rtos_mutex_acquire(&_rcmd_mtx, false);
+    return;
+  }
+  (void)snprintf(_rcmd_line, sizeof(_rcmd_line), "%s", text);
+  _rcmd_pending = true;
+  rtos_mutex_acquire(&_rcmd_mtx, false);
+}
+
+/* Queue one segment of a response as AT+SDVRCMDR. Encoding is identical to
+ * the notification path — backtick for the double quote, 128-byte chunks,
+ * ENC=1 — because the AT line imposes the same rules regardless of what is
+ * travelling on it. Shell output contains quotes routinely, so the
+ * substitution matters more here than it does for the §6 JSON. */
+static void _rcmd_send_segment(const char *seg, size_t len, uint32_t num)
+{
+  if ((len == 0U) || (len > REMOTE_SEG_MAX))
+  {
+    return;
+  }
+
+  for (size_t i = 0U; i < len; i++)
+  {
+    char c = seg[i];
+    /* CR/LF cannot cross an AT parameter — atServer terminates the line on
+     * them. They are the one thing the substitution cannot carry, so they
+     * become spaces and the response reads as one flowed line. */
+    if ((c == '\r') || (c == '\n')) { c = ' '; }
+    else if (c == '"')              { c = NOTIFY_QUOTE_SUB; }
+    _rcmd_enc[i] = c;
+  }
+  _rcmd_enc[len] = '\0';
+
+  int an = snprintf(_rcmd_at, sizeof(_rcmd_at), "AT+SDVRCMDR=%lu,%u",
+                    (unsigned long)num, (unsigned)len);
+  bool ok = (an > 0) && ((size_t)an < sizeof(_rcmd_at));
+
+  for (size_t off = 0U; ok && (off < len); off += NOTIFY_CHUNK_MAX)
+  {
+    size_t take = len - off;
+    if (take > NOTIFY_CHUNK_MAX) { take = NOTIFY_CHUNK_MAX; }
+    int wrote = snprintf(&_rcmd_at[an], sizeof(_rcmd_at) - (size_t)an,
+                         ",\"%.*s\"", (int)take, &_rcmd_enc[off]);
+    if ((wrote <= 0) || ((size_t)(an + wrote) >= sizeof(_rcmd_at)))
+    {
+      ok = false;
+      break;
+    }
+    an += wrote;
+  }
+
+  if (ok)
+  {
+    int wrote = snprintf(&_rcmd_at[an], sizeof(_rcmd_at) - (size_t)an, ",1");
+    ok = (wrote > 0) && ((size_t)(an + wrote) < sizeof(_rcmd_at));
+  }
+
+  if (ok)
+  {
+    (void)modem_notify_async(_rcmd_at);
+  }
+  else
+  {
+    LERROR(TRACE_SHELL, "remote cmd: response segment would overflow the "
+           "AT line; dropped");
+  }
+}
+
+/* Run any parked remote command. Called from the shell task's own loop, so
+ * lwshell is idle and this thread owns it. Returns true if one ran. */
+static bool _shell_run_remote_cmd(void)
+{
+  bool have = false;
+
+  rtos_mutex_acquire(&_rcmd_mtx, true);
+  if (_rcmd_pending)
+  {
+    /* The trailing CR is what makes lwshell treat the fed bytes as a
+     * complete line and execute it. */
+    (void)snprintf(_rcmd_run, sizeof(_rcmd_run), "%s\r", _rcmd_line);
+    _rcmd_pending = false;
+    have = true;
+  }
+  rtos_mutex_acquire(&_rcmd_mtx, false);
+
+  if (!have)
+  {
+    return false;
+  }
+
+  LINFO(TRACE_SHELL, "remote cmd: running '%s'", _rcmd_line);
+
+  _rcmd_feed_off = 0U;
+  _rcmd_rsp_len  = 0U;
+  _rcmd_rsp[0]   = '\0';
+
+  /* Echo off while captured: the echo would put the command text and a
+   * prompt into its own response, which is noise on the operator's screen
+   * and costs AT-line budget that the answer needs. */
+  bool echo_was = lwshell_echo_get();
+  lwshell_echo_set(false);
+
+  (void)lwshell_stream_change(&_rcmd_stream);
+  /* Timeout 0: the capture stream never blocks, and the whole line is
+   * already buffered, so one update consumes and runs it. */
+  (void)lwshell_update(0U);
+  (void)lwshell_stream_change(_shell.stream);
+
+  lwshell_echo_set(echo_was);
+
+  if (_rcmd_rsp_len == 0U)
+  {
+    (void)snprintf(_rcmd_rsp, sizeof(_rcmd_rsp), "(no output)");
+    _rcmd_rsp_len = strlen(_rcmd_rsp);
+  }
+
+  /* Send in order, one AT command per segment. */
+  size_t sent = 0U;
+  for (uint32_t s = 0U; (s < REMOTE_SEG_LIMIT) && (sent < _rcmd_rsp_len); s++)
+  {
+    size_t take = _rcmd_rsp_len - sent;
+    if (take > REMOTE_SEG_MAX) { take = REMOTE_SEG_MAX; }
+    _rcmd_send_segment(&_rcmd_rsp[sent], take, _rcmd_num);
+    sent += take;
+    _rcmd_num = (_rcmd_num + 1U) & 0xFFFFU;
+  }
+
+  if (sent < _rcmd_rsp_len)
+  {
+    const char *more = "[truncated]";
+    _rcmd_send_segment(more, strlen(more), _rcmd_num);
+    _rcmd_num = (_rcmd_num + 1U) & 0xFFFFU;
+  }
+
+  return true;
 }
 
 /* Test-frame injection — for validating the NN algorithm against a known
@@ -3455,6 +3719,29 @@ static const t_stream *volatile _mdm_urc_stream = NULL;
 static void _mdm_urc_forward(const char *line, size_t len, void *ctx)
 {
   (void)len; (void)ctx;
+
+  /* +SDVRCMD: "<text>" is a remote command, not a message to read. Park it
+   * for the shell task and fall through, so the console still shows what
+   * arrived — an operator watching the port needs to see that the unit is
+   * being driven from elsewhere. */
+  {
+    static const char PFX[] = "+SDVRCMD: \"";
+    if (strncmp(line, PFX, sizeof(PFX) - 1U) == 0)
+    {
+      char text[REMOTE_CMD_MAX];
+      const char *body = line + (sizeof(PFX) - 1U);
+      size_t i = 0U;
+      while ((body[i] != '\0') && (body[i] != '"') &&
+             (i + 1U < sizeof(text)))
+      {
+        text[i] = body[i];
+        i++;
+      }
+      text[i] = '\0';
+      shell_remote_cmd_post(text);
+    }
+  }
+
   /* Fall back to the shell's own stream: the forwarder is now registered at
    * shell init, before any `mdm` command has had a chance to set this. */
   const t_stream *s = _mdm_urc_stream;
