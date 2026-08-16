@@ -10,8 +10,12 @@ Control PC ─(UART/USB)─▶ N6 Main CPU (camera + detection + shell)   ← §
                                ▼
                         WP76 modem (SDVR app)                        ← §5
                                ├─ UDP notifications ─▶ server        ← §6
-                               └─ HTTPS file upload ─▶ server        ← §8
+                               ├─ HTTPS file upload ─▶ server        ← §8
+                               └─ MQTT/TLS ◀───────── server         ← commands
 ```
+
+The last arrow points the other way on purpose: it is the only leg the server
+starts. See *Remote commands* below.
 
 The two per-device suites already cover each box in isolation
 (`edgeai/tests/run_tests.py` for the N6, `V20_SDVR` `modular-tools.sh test-run`
@@ -146,6 +150,59 @@ must be a dotted **IP** (that leg is a raw UDP socket and never resolves
 names), and the modem needs `AT+SDVRNET=1` — being registered on LTE is not
 the same as having a route, and the difference is invisible unless you look at
 the fourth flag of `AT+SDVRNET?`.
+
+### Remote commands (section 19 of the manual)
+
+Everything above is the unit talking outwards. The command channel is the
+other direction: type a command on the server and the unit carries it out,
+over cellular, with nothing plugged in and nothing opened on the unit's side.
+
+The unit has no dialable address — carrier NAT — so it holds a connection
+*out* to an MQTT broker and commands are pushed down it. Transport is TLS on
+port **5912** with a **client certificate**, which is the device's identity:
+the broker maps its CN to the MQTT username, so no password travels or is
+stored, and a client with no certificate is refused outright.
+
+```bash
+# the unit: point it at the broker and switch the channel on
+python3 scopus/at.py 'AT+SDVRMQTTSRV="213.8.185.180",5912'
+python3 scopus/at.py "AT+SDVRMQTT=1"
+python3 scopus/at.py "AT+SDVRMQTT?"    # 1,1,… = enabled, connected
+
+# on the server: watch, then drive. <id> is the unit's IMEI by default.
+C=/opt/sdvr-server/certs
+mosquitto_sub -h 213.8.185.180 -p 5912 --cafile $C/ca.crt \
+        --cert $C/client.crt --key $C/client.key -t 'scopus/<id>/#' -v
+mosquitto_pub -h 213.8.185.180 -p 5912 --cafile $C/ca.crt \
+        --cert $C/client.crt --key $C/client.key \
+        -t 'scopus/<id>/cmd' -q 1 -m 'photo upload'
+```
+
+| Topic | Direction | Carries |
+|---|---|---|
+| `scopus/<id>/cmd` | to the unit | one command per message, plain text |
+| `scopus/<id>/rsp` | from the unit | that command's output |
+| `scopus/<id>/ntf` | from the unit | §6 notifications, when `AT+SDVRNTFPROTO=2` |
+| `scopus/<id>/status` | from the unit | retained `online` / `offline` (the broker publishes `offline` itself if the unit drops) |
+
+A command starting with `AT` is answered by the modem — signal, SIM,
+registration, the questions you actually want to ask a unit you cannot reach.
+Anything else is run in the camera shell, so `version`, `mdm stats`,
+`detect start` and `photo upload` all work as typed.
+
+**Why not the notification channel, which also has a return path.** It does
+work — `notify.c` sends from one UDP socket and reads replies off the same fd,
+and a reply reached the camera 0.2 s after a report. But the carrier's NAT
+mapping closes in **under 30 seconds**: probes sent back 30, 60, 120 and 240 s
+after a report never arrived, measured at both ends. That path can answer a
+report; it cannot start a conversation, which is what a command has to do.
+
+Two things bite here as well. The broker must own 5912, so ITP's
+`sdvr-https.service` is stopped on the bench (`systemctl start sdvr-https`
+restores it, but not while mosquitto holds the port) — photos are unaffected
+on 8991. And `AT+SDVR*` commands are answered by *our* atServer rather than
+the module's AT parser, which is why `mqtt.c` owns a PTY handed to atServer;
+without it every `AT+SDVR*` sent remotely comes back a bare ERROR.
 
 ## Run
 
@@ -349,6 +406,14 @@ python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
 | 12 E2E notification | §6 | modem→host UDP datagram with SoW §6 JSON fields |
 | 13 E2E HTTPS upload | §8 | SD file lands on HTTPS server with X-Timestamp/X-Ref |
 
+The **remote command channel** (`AT+SDVRMQTT*`, `AT+SDVRCMDR`, `+SDVRCMD`) is
+not in the automated suite: proving it needs a broker with the device's client
+certificate, which is server-side state the suite does not own. It is covered
+by hand instead, in section 19 of the tester manual, with its own pass
+criteria — including "every command is answered exactly ONCE", which is there
+because the lossy-ack retry published every response twice on the first
+end-to-end run.
+
 Groups self-skip with a precise reason when a prerequisite is missing (N6 on
 stock firmware, modem on a pre-Scopus build, no data session / server, etc.) —
 the suite never silently passes over an unavailable channel.
@@ -367,6 +432,8 @@ scopus/
                              #   and photo uploads (HTTP), on your PC
   cloud_relay.py             # the same receiver, on a public host, for the
                              #   cellular test — plus a pull API
+                             # (remote commands need no script here: the
+                             #   server end is mosquitto_pub/_sub, section 19)
   relay_pull.py              # pulls from the relay onto your PC (no inbound
                              #   port needed anywhere)
   Scopus_Tester_Manual.docx  # step-by-step MANUAL E2E test (generated)
