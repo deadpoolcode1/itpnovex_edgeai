@@ -100,6 +100,22 @@ AT reply** — every failure mode it guards against answers `OK`.
 
 ## Manual end-to-end test
 
+Two documents, both generated, for two different readers:
+
+| Document | For | Covers |
+|---|---|---|
+| `Scopus_QA_Flow.docx` | the run QA repeats | the flow and nothing else: the product on the cable, then the same product over cellular through the customer's server, including driving it from there over MQTT |
+| `Scopus_Tester_Manual.docx` | the first walk-through, and anything that goes wrong | what each step proves, per-step troubleshooting, the public relay, and the parts you only reach when something fails |
+
+`Scopus_QA_Flow.docx` is the short one — two parts, one command per line,
+a pass-criteria table at the end of each and a cheat sheet of the whole thing
+on the last page. It was walked end to end on the bench on 2026-08-17 and
+every "Expected" block in it is what came back that day.
+
+```bash
+python3 scopus/make_qa_flow.py
+```
+
 `Scopus_Tester_Manual.docx` walks the whole product by hand in seven steps —
 start a server on your PC, point the modem at it, configure the camera to
 detect people, inject an image, and watch the event and the photo arrive. It
@@ -384,6 +400,7 @@ python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
 | `python3 scopus/run_scopus_tests.py` | none — env vars only (see *Run*) |
 | `python3 scopus/run_integration_tests.py` | `-v` / `--verbose` |
 | `python3 scopus/inference_test.py` | `--image PATH` (default `images/3_people.jpg`), `--expect N` (default 3), `--tries N` (default 4) |
+| `python3 scopus/make_qa_flow.py` | none — rewrites `Scopus_QA_Flow.docx` |
 | `python3 scopus/make_tester_manual.py` | none — rewrites `Scopus_Tester_Manual.docx` |
 | `python3 scopus/make_tracked_manual.py` | `--baseline old.docx` (default: the docx at git HEAD) — also writes the tracked-changes copy for review in Word |
 
@@ -436,6 +453,9 @@ scopus/
                              #   server end is mosquitto_pub/_sub, section 19)
   relay_pull.py              # pulls from the relay onto your PC (no inbound
                              #   port needed anywhere)
+  Scopus_QA_Flow.docx        # the short flow QA repeats: cable, then cellular
+                             #   + MQTT against the customer's server
+  make_qa_flow.py            # regenerates it — edit this, not the docx
   Scopus_Tester_Manual.docx  # step-by-step MANUAL E2E test (generated)
   make_tester_manual.py      # regenerates the .docx — edit this, not the docx
   make_tracked_manual.py     # + a tracked-changes copy for review in Word
