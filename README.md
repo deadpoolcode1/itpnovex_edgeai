@@ -48,13 +48,15 @@ wait
 | `reboot` | Soft reboot. |
 | `echo on\|off\|query` | Terminal echo + prompt (off = scripted/silent). Persists in flash. |
 | `rtc` | Print current RTC time. |
+| `rtc sync` | Set the clock from the modem (`AT+CCLK?`), applying its timezone offset. Done automatically at start-up and whenever the modem announces itself — the camera has no battery-backed clock, so without this every photo name and event timestamp carries 2000-01-01. |
 | `rtc set DDMMYYYYHHMMSS` | Set RTC. Example: `rtc set 22052026140000` = 2026-05-22 14:00:00. |
 | `camera flip [H\|V\|off]` | Image flip. |
 | `camera aec [value\|off]` | Auto-exposure compensation, range `-2.0..2.0`. |
-| `camera awb [value\|auto]` | White-balance profile, `0..5`. |
+| `camera awb [value\|auto]` | White-balance profile. The valid range comes from the sensor's ISP tuning, not a fixed table — on the IMX335 it is `0..2`. Run with no value to list the profiles the fitted sensor actually has. |
 | `camera gain [value]` | Analog gain `0..72000` mdB. |
 | `camera exposure [value]` | Shutter `0..33000` µs. |
-| `camera brightness [value]` | Brightness `0..100`. |
+| `camera brightness [value]` | Brightness `0..100`, **where the sensor driver implements it**. The IMX335 does not, and answers `Not supported on IMX335!` — use `camera aec`, `camera exposure` or `camera gain` to change image brightness on that sensor. |
+| `camera status` | Print every camera setting at once — sensor, flip, AEC, AWB, gain, exposure, brightness. |
 | `irled on\|off\|query` | IR LED state. (PoC: drives LED_USER3 until real GPIO wired.) |
 | `motion sense <0..100> <timeout_s>` / `motion query` | Motion sensitivity + no-motion timeout. Persists. |
 | `img size H W` | Photo dimensions, persists. |

@@ -203,6 +203,7 @@ static void     _recovery_trigger(void);
 
 /* System -------------------------------------*/
 static int32_t  _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _rtc_sync_from_modem(const t_stream *stream);
 static int32_t  _version_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _system_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _stacks_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
@@ -327,7 +328,28 @@ static char      _rcmd_at[MODEM_NOTIFY_MAX];
  *   mtn — motion state (0|1)
  * Prefixed with '+SDVRNTF: ' so the host can parse it the same way it
  * parses the modem-side URC once the modem is wired. */
+/* Set from the modem URC thread, cleared by the shell loop. */
+static volatile bool _notify_netreg_pending = false;
+/* Likewise: the modem has just announced itself, so its clock is worth
+ * having. Kept separate from the notification latch because the two are
+ * answers to different questions and one may be switched off by the mask. */
+static volatile bool _rtc_sync_pending      = false;
+static uint32_t      _rtc_sync_tries       = 0U;
+
+/* The modem's answer to AT+CCLK?, caught on its way past.
+ *
+ * modem_send_at() cannot return it: the tunnel classifies every line starting
+ * with '+' that is not a terminator as a URC and routes it to this callback
+ * instead of the response buffer, so `reply` holds only "OK". That heuristic
+ * is load-bearing for the whole SDVR command set, so the clock is picked up
+ * here rather than by making the tunnel smarter. */
+static char          _cclk_line[48] = "";
+static volatile bool _cclk_seen     = false;
+/* Tick stamp of the last periodic report. */
+static uint32_t      _notify_period_last = 0U;
+
 static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
+static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force);
 
 /* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
  * user can see the command landing during bring-up; the actual IR LED GPIO
@@ -352,6 +374,8 @@ static int32_t  _camera_cmd_awb(const t_stream *stream, uint8_t **argv, size_t a
 static int32_t  _camera_cmd_gain(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _camera_cmd_exposure(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _camera_cmd_brightness(const t_stream *stream, uint8_t **argv, size_t argc);
+static int32_t  _camera_cmd_status(const t_stream *stream, uint8_t **argv, size_t argc);
+static void     _camera_brightness_hint(const t_stream *stream, int32_t status);
 
 static int32_t  _camera_print_status(const t_stream *stream, int32_t status, bool update);
 
@@ -387,7 +411,7 @@ static __ALIGN_BEGIN uint8_t _uart_recov_buf[UART_RECOV_BUF_SIZE] __ALIGN_END;
 
 /* Common -------------------------------------*/
 static const t_lwshell_cmd  _shell_cmd[] = {
-  {.run = _rtc_cmd                , .name = "rtc"       , .help = "[set DDMMYYYYHHMMSS] - get or set RTC" },
+  {.run = _rtc_cmd                , .name = "rtc"       , .help = "[set DDMMYYYYHHMMSS | sync] - get, set, or take the time from the modem" },
   {.run = _version_cmd            , .name = "version"   , .help = "Print application version" },
   {.run = _system_cmd             , .name = "system"    , .help = "[version] - main-CPU version details (fw/uid/dev/rev) (SoW §3.7)" },
   {.run = _commands_cmd           , .name = "commands"  , .help = "List supported shell commands and parameters (SoW §3.7)" },
@@ -396,7 +420,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N]]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
@@ -449,10 +473,11 @@ static bool     _crc32_ready = false;
 static const t_lwshell_cmd  _shell_cmd_camera[] = {
   { .run = _camera_cmd_flip       , .name = "flip"      , .help = "[H | V | "OPT_OFF"]" },
   { .run = _camera_cmd_aec        , .name = "aec"       , .help = "[value | "OPT_OFF"]  - Range: -2.0 - 2.0" },
-  { .run = _camera_cmd_awb        , .name = "awb"       , .help = "[value | "OPT_AUTO"] - Range: 0 - 5" },
+  { .run = _camera_cmd_awb        , .name = "awb"       , .help = "[value | "OPT_AUTO"] - Range: 0 - N, sensor-dependent (no value lists them)" },
   { .run = _camera_cmd_gain       , .name = "gain"      , .help = "[value]        - Range: 0 - 72000[mdB]" },
   { .run = _camera_cmd_exposure   , .name = "exposure"  , .help = "[value]        - Range: 0 - 33000[usec]" },
-  { .run = _camera_cmd_brightness , .name = "brightness", .help = "[value]        - Range: 0 - 100" },
+  { .run = _camera_cmd_brightness , .name = "brightness", .help = "[value]        - Range: 0 - 100 (not on every sensor)" },
+  { .run = _camera_cmd_status     , .name = "status"    , .help = "               - Print all camera settings" },
 };
 
 #if defined(N6CAM_WIFI_MURATA)
@@ -645,6 +670,12 @@ static void _shell_task_run(uint32_t args)
   uint32_t healthy_ticks = 0U;
   const uint32_t HEALTHY_BOOT_TICKS = 300U;
 
+  /* Ask for the modem's clock on our own start-up too, not only when the
+   * modem announces itself. The camera reboots far more often than the modem
+   * does — every firmware flash — and on those boots no +SDVRRDY ever comes,
+   * so waiting for one would leave the RTC at 2000-01-01 for the session. */
+  _rtc_sync_pending = true;
+
   /* Shell task */
   while (1)
   {
@@ -659,6 +690,62 @@ static void _shell_task_run(uint32_t args)
      * modem task's thread — lwshell belongs to this loop. Between updates
      * is the only point at which the shell is provably idle. */
     (void)_shell_run_remote_cmd();
+
+    /* §4.2 bit0 — network registration. The URC arrives on the modem task;
+     * emitting here keeps notification composition on one thread. */
+    if (_notify_netreg_pending)
+    {
+      _notify_netreg_pending = false;
+      _notify_emit(NOTIFY_RSN_NETREG, 0U, false);
+    }
+
+    /* Take the modem's clock. Done here and not in the URC callback because
+     * modem_send_at blocks, and the URC fires on the modem's own receive
+     * thread — asking it a question from inside its own callback would
+     * deadlock. This loop is allowed to block, and does so at most once per
+     * modem boot. */
+    if (_rtc_sync_pending && (healthy_ticks > 20U))
+    {
+      /* A couple of seconds of grace first: on a cold start the CN805 link is
+       * not up yet, and a sync attempted into a silent modem just burns the AT
+       * timeout. Retry a bounded number of times so a modem that is slow to
+       * register still ends up setting our clock, while a modem that is absent
+       * does not make this a permanent tax on the loop. */
+      if ((_rtc_sync_from_modem(NULL) == BSP_OK) || (++_rtc_sync_tries >= 5U))
+      {
+        _rtc_sync_pending = false;
+      }
+    }
+
+    /* §4.2 bit3 — periodic report. `notify period <s>` stored a value that
+     * nothing ever read ("wire into the system_task heartbeat later"), so the
+     * interval was configurable and no report was ever sent (ScopusQA #5).
+     * This loop turns at SHELL_UPDATE_TIMEOUT, which is a coarse but entirely
+     * adequate clock for a report measured in seconds.
+     *
+     * Re-read every tick rather than cached: `notify period` can change at any
+     * moment, and a cached copy would hold the old interval until reboot. */
+    {
+      uint32_t period = 0U;
+      t_registry_data *reg = registry_acquire();
+      if (reg) { period = reg->notify_period_s; registry_release(); }
+      uint32_t now = (uint32_t)tx_time_get();
+      if (period > 0U)
+      {
+        /* Unsigned difference — correct across the tick counter's wrap. */
+        if ((now - _notify_period_last) >= (period * TX_TIMER_TICKS_PER_SECOND))
+        {
+          _notify_period_last = now;
+          _notify_emit(NOTIFY_RSN_PERIODIC, 0U, false);
+        }
+      }
+      else
+      {
+        /* Disabled: keep the base moving so switching it on later does not
+         * fire immediately off a stale timestamp. */
+        _notify_period_last = now;
+      }
+    }
 
     /* Clear bootloop counter once we've clearly survived the danger zone. */
     if (healthy_ticks <= HEALTHY_BOOT_TICKS)
@@ -753,10 +840,171 @@ static bool _parse_n_digits(const char *s, size_t n, uint32_t *out)
   return true;
 }
 
+
+/**
+ * @brief Set the camera RTC from the modem's clock (AT+CCLK?).
+ *
+ * The camera has no battery-backed clock and no network of its own, so after
+ * every power cycle its RTC starts at 2000-01-01. That is not cosmetic: the
+ * SoW §7 photo name is `<serial>_DDMMYYYY_HHMMSS.rdy` and the §6 event body's
+ * `tim` field both come from this clock, so every uploaded file was stamped
+ * with the epoch and two photos in the same second could collide.
+ *
+ * The modem does have real time — it gets it from the network — and it is
+ * already on the other end of a UART we own. `AT+CCLK?` answers
+ * `+CCLK: "YY/MM/DD,HH:MM:SS+ZZ"`, where ZZ is the offset from UTC in
+ * QUARTER hours (so "+12" is +3 h). The offset is applied, i.e. the RTC ends
+ * up on local time, because that is what a tester compares against a wall
+ * clock and against the receiver's own log lines.
+ *
+ * @param stream Where to report, or NULL for the automatic path (log only).
+ * @return BSP_OK on success.
+ */
+static int32_t _rtc_sync_from_modem(const t_stream *stream)
+{
+  char reply[128] = { 0 };
+  _cclk_seen = false;
+  _cclk_line[0] = '\0';
+  /* Returns the reply length, or negative on error — not a status code. The
+   * body we actually want arrives via the URC path while this blocks. */
+  int32_t mc = modem_send_at("AT+CCLK?", reply, sizeof(reply),
+                             MODEM_AT_TIMEOUT_MS);
+  if (mc < 0)
+  {
+    if (stream) CMD_PRINTF(stream, "rtc sync: modem did not answer (%ld)%s",
+                           (long)mc, lwshell_eol());
+    LWARNING(TRACE_SHELL, "rtc sync: modem did not answer (%ld)", (long)mc);
+    return BSP_ERROR_COMPONENT;
+  }
+
+  const char *q = _cclk_seen ? strchr(_cclk_line, '"') : NULL;
+  if (q == NULL)
+  {
+    if (stream) CMD_PRINTF(stream, "rtc sync: no clock in the modem's reply%s",
+                           lwshell_eol());
+    return BSP_ERROR_COMPONENT;
+  }
+  q++;
+
+  /* "YY/MM/DD,HH:MM:SS+ZZ" — fixed offsets, so validate the separators
+   * rather than trusting the length alone. */
+  uint32_t yy, mo, dd, hh, mi, ss;
+  if ((q[2] != '/') || (q[5] != '/') || (q[8] != ',') ||
+      (q[11] != ':') || (q[14] != ':') ||
+      !_parse_n_digits(q + 0,  2, &yy) || !_parse_n_digits(q + 3,  2, &mo) ||
+      !_parse_n_digits(q + 6,  2, &dd) || !_parse_n_digits(q + 9,  2, &hh) ||
+      !_parse_n_digits(q + 12, 2, &mi) || !_parse_n_digits(q + 15, 2, &ss))
+  {
+    if (stream) CMD_PRINTF(stream, "rtc sync: could not parse '%s'%s",
+                           _cclk_line, lwshell_eol());
+    return BSP_ERROR_COMPONENT;
+  }
+
+  /* Timezone, in quarter hours, optional. */
+  int32_t tz_q = 0;
+  const char *tz = q + 17;
+  if ((*tz == '+') || (*tz == '-'))
+  {
+    uint32_t v = 0U;
+    if (_parse_n_digits(tz + 1, 2, &v))
+    {
+      tz_q = (*tz == '-') ? -(int32_t)v : (int32_t)v;
+    }
+  }
+
+  /* Apply the offset. Minutes since midnight can go outside the day, so
+   * carry into the date — a sync a few minutes either side of midnight is
+   * exactly when getting this wrong would be least visible and most wrong. */
+  int32_t minutes = (int32_t)(hh * 60U + mi) + (tz_q * 15);
+  int32_t day_adj = 0;
+  while (minutes < 0)     { minutes += 1440; day_adj--; }
+  while (minutes >= 1440) { minutes -= 1440; day_adj++; }
+
+  int32_t y = (int32_t)yy + 2000;
+  int32_t m = (int32_t)mo;
+  int32_t d = (int32_t)dd + day_adj;
+  static const uint8_t DIM[13] =
+    { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  for (;;)
+  {
+    int32_t dim = (int32_t)DIM[(m >= 1 && m <= 12) ? m : 1];
+    if ((m == 2) && (((y % 4) == 0) && (((y % 100) != 0) || ((y % 400) == 0))))
+    {
+      dim = 29;
+    }
+    if (d < 1)
+    {
+      m--; if (m < 1) { m = 12; y--; }
+      dim = (int32_t)DIM[m];
+      if ((m == 2) && (((y % 4) == 0) && (((y % 100) != 0) || ((y % 400) == 0))))
+      {
+        dim = 29;
+      }
+      d += dim;
+    }
+    else if (d > dim)
+    {
+      d -= dim;
+      m++; if (m > 12) { m = 1; y++; }
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  if ((y < 2000) || (y > 2099))
+  {
+    if (stream) CMD_PRINTF(stream, "rtc sync: modem clock not set yet (%s)%s",
+                           q, lwshell_eol());
+    return BSP_ERROR_COMPONENT;
+  }
+
+  t_datetime dt;
+  dt.year    = (uint8_t)(y - 2000);
+  dt.month   = (uint8_t)m;
+  dt.day     = (uint8_t)d;
+  dt.hours   = (uint8_t)(minutes / 60);
+  dt.minutes = (uint8_t)(minutes % 60);
+  dt.seconds = (uint8_t)ss;
+
+  int32_t status = bsp_rtc_set_time(&dt);
+  if (status != BSP_OK)
+  {
+    if (stream) CMD_PRINTF(stream, "rtc sync: set failed (%ld)%s",
+                           (long)status, lwshell_eol());
+    return status;
+  }
+
+  LINFO(TRACE_SHELL, "rtc synced from modem: %02u/%02u/20%02u %02u:%02u:%02u "
+        "(tz %+ld quarter-hours)", (unsigned)dt.day, (unsigned)dt.month,
+        (unsigned)dt.year, (unsigned)dt.hours, (unsigned)dt.minutes,
+        (unsigned)dt.seconds, (long)tz_q);
+  if (stream)
+  {
+    CMD_PRINTF(stream, "rtc sync: %02u/%02u/20%02u %02u:%02u:%02u%s",
+               (unsigned)dt.day, (unsigned)dt.month, (unsigned)dt.year,
+               (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
+               lwshell_eol());
+  }
+  return BSP_OK;
+}
+
 static int32_t _rtc_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 {
   t_datetime dt;
   int32_t    status;
+
+  /* rtc sync — take the time off the modem, which has a network to get it
+   * from. See _rtc_sync_from_modem for why this exists. */
+  if ((argc >= 2U) && (strcmp((char*)argv[1], "sync") == 0))
+  {
+    if (_rtc_sync_from_modem(stream) == BSP_OK)
+    {
+      _cmd_ack(stream, argv, argc);
+    }
+    return LWSHELL_OK;
+  }
 
   /* SoW §4.2: rtc set DDMMYYYYHHMMSS — 14 decimal digits */
   if ((argc >= 3U) && (strcmp((char*)argv[1], "set") == 0))
@@ -985,8 +1233,30 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
  * MODEM_AT_TIMEOUT_MS per attempt; an earlier prototype that called it from
  * here froze the shell for 10+ seconds, and this function is also called
  * from the NN detection path, where blocking would stall inference. */
-static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force)
 {
+  /* SoW §4.2 says the mask decides what is reported. It never did: the value
+   * was stored by `notify enable` and read back by `notify query`, and no
+   * emitter ever consulted it — which is why enabling a bit changed nothing
+   * and disabling one changed nothing either (ScopusQA #5).
+   *
+   * Only the six §4.2 bits are gated. Bits outside that table (0x40, the
+   * photo event) are ours and are not part of the mask's contract, and
+   * `notify trigger` sets `force` because its whole purpose is to exercise
+   * the transport regardless of what the unit is configured to report. */
+  if (!force && ((rsn & NOTIFY_MASK_ALL) != 0U))
+  {
+    uint32_t mask = 0U;
+    t_registry_data *reg = registry_acquire();
+    if (reg) { mask = reg->notify_enable_mask; registry_release(); }
+    if ((rsn & mask) == 0U)
+    {
+      LINFO(TRACE_SHELL, "notify: rsn=0x%02lx not in enable mask 0x%02lx — "
+            "not reported", (unsigned long)rsn, (unsigned long)mask);
+      return;
+    }
+  }
+
   t_datetime dt = { 0 };
   (void)bsp_rtc_get_time(&dt);
   /* 32-bit MCU UID low word as serial */
@@ -1078,12 +1348,26 @@ static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
   rtos_mutex_acquire(&_notify_mtx, false);
 }
 
+static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+{
+  _notify_emit_ex(rsn, rsd, mtn, false);
+}
+
 /* Public entry point for producers outside this file — today the NN task's
  * live inference loop, which has a detection to report and no business
  * knowing how a notification is composed or where it goes. */
 void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
 {
   _notify_emit(rsn, rsd, mtn);
+}
+
+/* Network registration (§4.2 bit 0). Latched by the modem URC forwarder,
+ * which runs on the modem task, and drained by the shell loop — the same
+ * split `shell_remote_cmd_post` uses, so a URC never emits a notification
+ * from inside the modem's own receive path. */
+void shell_notify_netreg(void)
+{
+  _notify_netreg_pending = true;
 }
 
 /*-------------------------------------------------------------------------*//**
@@ -2208,7 +2492,12 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
      * use, just sourced from RAM instead of the FAT. */
     static uint32_t _upload_ref;
     _upload_ref++;
-    if (!snapshot_request_upload("photo", _upload_ref, fname))
+    /* The tag becomes the server-side file name (SENDBIN tag -> X-Filename),
+     * so it must be the unique §7 name and not a constant: sending the
+     * literal "photo" every time made the receiver overwrite one file called
+     * `photo`, and only the last picture of a test run survived.
+     * (ScopusQA #4.) */
+    if (!snapshot_request_upload(fname, _upload_ref, fname))
     {
       CMD_PRINTF(stream, "photo upload: trigger failed (busy / no modem)%s",
                  lwshell_eol());
@@ -2264,7 +2553,8 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   if ((strcmp(sub, "trigger") == 0) && (argc >= 3U))
   {
     unsigned long code = strtoul((char*)argv[2], NULL, 0);
-    _notify_emit((uint32_t)code, 0U, false);
+    /* Explicit operator request — always sent, mask or no mask. */
+    _notify_emit_ex((uint32_t)code, 0U, false, true);
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2333,11 +2623,19 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       if (n < 0) return LWSHELL_ERROR_SYNTAX_CMD;
       boxes = (uint32_t)n;
     }
-    nn_task_simulate_detection(boxes);
-    CMD_PRINTF(stream, "detect simulate: %lu object(s)%s",
-               (unsigned long)boxes, lwshell_eol());
-    /* Also fire the +SDVRNTF the inference loop would have. rsn=0x10 = people. */
-    _notify_emit(0x10U, boxes, false);
+    /* Optional class: `detect simulate 2 vehicle`. The detector is
+     * person+vehicle, but with no car available to point the lens at there
+     * was no way to exercise the §4.2 `0x20` path on the bench. */
+    bool vehicle = (argc >= 4U) &&
+                   ((strcmp((char*)argv[3], "vehicle") == 0) ||
+                    (strcmp((char*)argv[3], "car") == 0));
+    nn_task_simulate_detection_class(boxes, vehicle ? 2 : 0);
+    CMD_PRINTF(stream, "detect simulate: %lu %s object(s)%s",
+               (unsigned long)boxes, vehicle ? "vehicle" : "people",
+               lwshell_eol());
+    /* Also fire the +SDVRNTF the inference loop would have, under the reason
+     * code for the class that was asserted. */
+    _notify_emit(vehicle ? NOTIFY_RSN_VEHICLE : NOTIFY_RSN_PEOPLE, boxes, false);
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -3076,7 +3374,14 @@ static int32_t _camera_cmd_awb(const t_stream *stream, uint8_t **argv, size_t ar
       _camera_print_status(stream, status, true);
       if (status == -1)
       {
-        CMD_PRINTF(stream, "Invalid profile ID (%u)!%s", idx, lwshell_eol());
+        /* Naming the real range matters: the profile table comes from the
+         * ISP tuning file for the fitted sensor, so it is not the fixed
+         * 0..5 the help text used to promise. On the IMX335 tuning there
+         * are three, and "Invalid profile ID (3)!" on its own reads like a
+         * fault rather than the end of the list. (ScopusQA #7.) */
+        CMD_PRINTF(stream, "Invalid profile ID (%u)! Valid range is 0..%u "
+                           "on %s; 'camera awb' with no value lists them.%s",
+                   idx, count, camera_get_name(), lwshell_eol());
       }
       else
       {
@@ -3185,6 +3490,7 @@ static int32_t  _camera_cmd_brightness(const t_stream *stream, uint8_t **argv, s
     status = _camera_print_status(stream, camera_set_brightness(value), true);
     if (status != 0)
     {
+      _camera_brightness_hint(stream, status);
       return LWSHELL_OK;
     }
   }
@@ -3193,6 +3499,154 @@ static int32_t  _camera_cmd_brightness(const t_stream *stream, uint8_t **argv, s
   {
     CMD_PRINTF(stream, "Brightness: %u%s", value, lwshell_eol());
   }
+  else
+  {
+    _camera_brightness_hint(stream, status);
+  }
+  return LWSHELL_OK;
+}
+
+/**
+ * @brief Explain a brightness rejection instead of leaving it bare.
+ *
+ * Brightness is a sensor-driver control, and the IMX335 driver does not
+ * implement one — `camera.sensor.ctrl.set_brightness` is NULL, which surfaces
+ * as -3 "Not supported". That is the correct answer for this sensor, but on
+ * its own it tells a tester nothing about what to do instead, so it was
+ * reported as a fault (ScopusQA #6). On an ISP part the exposure/gain/AEC
+ * controls are the ones that change image brightness, and they do work.
+ */
+static void _camera_brightness_hint(const t_stream *stream, int32_t status)
+{
+  if (status == -3)
+  {
+    CMD_PRINTF(stream, "  %s has no sensor brightness control. Use "
+                       "'camera aec <-2.0..2.0>', 'camera exposure <usec>' "
+                       "or 'camera gain <mdB>' to change image brightness.%s",
+               camera_get_name(), lwshell_eol());
+  }
+}
+
+/**
+ * @brief Camera status command: print every camera setting in one place
+ *
+ * Each sub-command already answers with the current value when given no
+ * argument, but a tester checking "what is set now?" before and after a
+ * change had to run six commands and diff them by eye (ScopusQA #3). This is
+ * the same information in one reply, in the same order as the sub-commands,
+ * and it names the sensor so a "not supported" line can be read against it.
+ *
+ * Controls the fitted sensor does not implement print their reason rather
+ * than being hidden: "not supported on this sensor" is an answer, and a
+ * silently missing line is not.
+ *
+ * @param stream  Output stream
+ * @param argv    Arguments (tokens)
+ * @param argc    Number of arguments
+ * @return Error code
+ */
+static int32_t _camera_cmd_status(const t_stream *stream, uint8_t **argv, size_t argc)
+{
+  ISP_AECAlgoTypeDef        aec;
+  ISP_AWBAlgoTypeDef        awb;
+  ISP_SensorGainTypeDef     gain;
+  ISP_SensorExposureTypeDef exp;
+  uint8_t                   flip;
+  uint8_t                   count = 0U;
+  uint8_t                   current = 0U;
+  uint16_t                  bright;
+
+  (void)argv;
+  (void)argc;
+
+  CMD_PRINTF(stream, "Sensor    : %s%s", camera_get_name(), lwshell_eol());
+  CMD_PRINTF(stream, "ISP       : %s%s",
+             camera_use_isp() ? "yes" : "no", lwshell_eol());
+
+  if (camera_get_flip(&flip) == 0)
+  {
+    if (flip == CAMERA_FLIP_NONE)
+    {
+      CMD_PRINTF(stream, "Flip      : %s%s", OPT_OFF, lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "Flip      : %s%s%s",
+                 (flip & CAMERA_FLIP_H) ? "H" : "",
+                 (flip & CAMERA_FLIP_V) ? "V" : "", lwshell_eol());
+    }
+  }
+  else
+  {
+    CMD_PRINTF(stream, "Flip      : not supported on this sensor%s", lwshell_eol());
+  }
+
+  if (camera_get_aec(&aec) == 0)
+  {
+    CMD_PRINTF(stream, "AEC       : %s, compensation %.1f EV%s",
+               aec.enable ? STATUS_ACTIVE : STATUS_INACTIVE,
+               (float)aec.exposureCompensation / 2.0f, lwshell_eol());
+  }
+  else
+  {
+    CMD_PRINTF(stream, "AEC       : not supported on this sensor%s", lwshell_eol());
+  }
+
+  if (camera_get_awb(&awb, &count, &current) == 0)
+  {
+    /* The valid profile range is whatever the tuning file carries, which is
+     * why it is reported rather than assumed — see ScopusQA #7. */
+    if (awb.enable)
+    {
+      CMD_PRINTF(stream, "AWB       : auto (profiles 0..%u available)%s",
+                 count, lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "AWB       : profile %u of 0..%u - %6luK %s%s",
+                 current, count, awb.referenceColorTemp[current],
+                 awb.label[current], lwshell_eol());
+    }
+  }
+  else
+  {
+    CMD_PRINTF(stream, "AWB       : not supported on this sensor%s", lwshell_eol());
+  }
+
+  if (camera_get_gain(&gain) == 0)
+  {
+    CMD_PRINTF(stream, "Gain      : %lu mdB (0..%lu)%s",
+               (unsigned long)gain.gain, (unsigned long)CAMERA_GAIN_MAX,
+               lwshell_eol());
+  }
+  else
+  {
+    CMD_PRINTF(stream, "Gain      : not supported on this sensor%s", lwshell_eol());
+  }
+
+  if (camera_get_exposure(&exp) == 0)
+  {
+    CMD_PRINTF(stream, "Exposure  : %lu usec (0..%lu)%s",
+               (unsigned long)exp.exposure, (unsigned long)CAMERA_EXPOSURE_MAX,
+               lwshell_eol());
+  }
+  else
+  {
+    CMD_PRINTF(stream, "Exposure  : not supported on this sensor%s", lwshell_eol());
+  }
+
+  if (camera_get_brightness(&bright) == 0)
+  {
+    CMD_PRINTF(stream, "Brightness: %u (0..%u)%s", bright,
+               (unsigned)CAMERA_BRIGHTNESS_MAX, lwshell_eol());
+  }
+  else
+  {
+    CMD_PRINTF(stream, "Brightness: not supported on %s - use aec/exposure/gain%s",
+               camera_get_name(), lwshell_eol());
+  }
+
+  _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
 }
 
@@ -3740,6 +4194,40 @@ static void _mdm_urc_forward(const char *line, size_t len, void *ctx)
       text[i] = '\0';
       shell_remote_cmd_post(text);
     }
+  }
+
+  /* §4.2 bit0 — "sent each time modem is registered to the network, on power
+   * up, reset or after network loss".
+   *
+   * Two URCs satisfy that sentence and both are needed. `+SDVRNET: UP` is the
+   * registration itself, but it only fires on a transition — restart the
+   * modem app while the data session is already up and it never comes, which
+   * would leave the "on power up" half of the requirement unreported and the
+   * event untestable on a bench that is always in coverage. `+SDVRRDY: <ver>`
+   * is the modem announcing it has just started, i.e. the power-up/reset case.
+   * `+SDVRNET: ERROR <n>` is a loss, not a registration, and must not latch. */
+  /* Catch the clock reply on its way to the console — see _cclk_line. */
+  if (strncmp(line, "+CCLK:", 6) == 0)
+  {
+    size_t i = 0U;
+    while ((line[i] != '\0') && (i + 1U < sizeof(_cclk_line)))
+    {
+      _cclk_line[i] = line[i];
+      i++;
+    }
+    _cclk_line[i] = '\0';
+    _cclk_seen = true;
+  }
+
+  if ((strncmp(line, "+SDVRNET: UP", 12) == 0) ||
+      (strncmp(line, "+SDVRRDY:", 9) == 0))
+  {
+    shell_notify_netreg();
+    /* The modem is up, so it has a clock worth copying. The camera's RTC
+     * starts at 2000-01-01 on every power cycle and stamps every photo name
+     * and event body, so this is the moment to fix it. */
+    _rtc_sync_tries   = 0U;
+    _rtc_sync_pending = true;
   }
 
   /* Fall back to the shell's own stream: the forwarder is now registered at

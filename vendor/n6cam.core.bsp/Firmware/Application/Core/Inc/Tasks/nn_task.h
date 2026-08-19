@@ -208,6 +208,14 @@ uint32_t nn_task_debounce_get(void);
 void nn_task_simulate_detection(uint32_t boxes);
 
 /**
+ * @brief As nn_task_simulate_detection, for a chosen COCO class.
+ *
+ * Lets the bench exercise the vehicle path (SoW §4.2 `0x20`) without a car
+ * in front of the lens. `class_index` 0 is person; 2 is car.
+ */
+void nn_task_simulate_detection_class(uint32_t boxes, int32_t class_index);
+
+/**
  * @brief Inject a real test image into the NN pipeline.
  *        The NN task uses `frame` as the input instead of the camera's
  *        ancillary buffer until the override is cleared (NULL). Buffer

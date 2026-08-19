@@ -273,7 +273,7 @@ Camera shell commands — the device's own list, `cam.py commands` prints it:
 
 | Command | Parameters |
 |---|---|
-| `rtc` | `[set DDMMYYYYHHMMSS]` — get or set the clock |
+| `rtc` | `[set DDMMYYYYHHMMSS \| sync]` — get, set, or take the time from the modem. Syncs automatically at start-up and on the modem's `+SDVRRDY` / `+SDVRNET: UP`; the camera has no battery-backed clock, so otherwise the §7 photo name and the §6 `tim` field both read 2000-01-01 |
 | `version` | application version |
 | `system` | `[version]` — fw / uid / dev / rev (§3.7) |
 | `commands` | list every command with its parameters (§3.7) |
@@ -288,7 +288,7 @@ Camera shell commands — the device's own list, `cam.py commands` prints it:
 | `frame` | `upload` \| `load <file.raw>` \| `run` \| `clear` \| `query` — inject a test frame into the NN |
 | `tile` | `grid c r` \| `crop px` \| `frame W H` \| `overlap h v` \| `thresh conf iou` \| `upload` \| `run` \| `live [n]` \| `query` \| `clear` \| `default` |
 | `mdm` | `<AT command>` \| `relink` \| `stats` \| `raw on\|off` \| `test wedge [baud]` \| `test urc <line>` \| `test echo` — modem pass-through (§4.6) |
-| `camera` | `flip H\|V\|off` \| `aec <-2.0..2.0>\|off` \| `awb <0..5>\|auto` \| `gain <0..72000 mdB>` \| `exposure <0..33000 µs>` \| `brightness <0..100>` |
+| `camera` | `flip H\|V\|off` \| `aec <-2.0..2.0>\|off` \| `awb <0..N>\|auto` (N from the sensor's ISP tuning — 2 on IMX335) \| `gain <0..72000 mdB>` \| `exposure <0..33000 µs>` \| `brightness <0..100>` (not implemented on IMX335) \| `status` — print all of the above |
 | `safeboot` | `status` \| `clear` \| `test` — bootloop counter and safe-mode drill |
 | `update` | `[app \| model]` — receive new firmware/model over CDC and reflash |
 | `recovery` | reboot into FSBL recovery (halts the chip) |
@@ -300,7 +300,47 @@ The three masks, since they are the ones testers get wrong:
   bit2 = upload the photo. **`7` is the full product**; the default is `0`,
   which detects and does nothing with it.
 - `notify enable <mask>` — 1 NetReg, 2 MotionStart, 4 MotionStop, 8 Periodic,
-  0x10 People, 0x20 Vehicle. `0x30` is people + vehicles.
+  0x10 People, 0x20 Vehicle. `0x30` is people + vehicles, `0x3f` is everything.
+
+  **The mask is enforced from firmware build 2026-08-19 on.** Until then it was
+  stored, echoed back by `notify query`, and consulted by nothing — so enabling
+  a bit changed nothing and disabling one changed nothing either. Events whose
+  bit is clear are now dropped with a log line naming the mask. Two deliberate
+  exceptions: `notify trigger <code>` always sends, because its purpose is to
+  exercise the transport regardless of configuration, and the photo event
+  (`0x40`) is a local extension outside the §4.2 table and is not gated.
+
+  What produces each bit:
+
+  People and vehicles are reported as **two separate notifications**, each with
+  its own count in `rsd`, and each only when that class's own count changed —
+  a person walking through a car park does not re-announce the parked cars.
+  A single event carries one `rsd`, which is why this is not one event with
+  `rsn=0x30`.
+
+  | Bit | Event | Produced by |
+  | --- | ----- | ----------- |
+  | `0x01` | Network registration | the modem's `+SDVRNET: UP`, and its `+SDVRRDY` start-up banner (the "on power up / reset" half of §4.2) |
+  | `0x02` | Motion start | the debounced detection count going from 0 to non-zero |
+  | `0x04` | Motion stop | the same count returning to 0 |
+  | `0x08` | Periodic | `notify period <s>`; `0` (the default) switches it off |
+  | `0x10` | People detected | the NN's stable person count |
+  | `0x20` | Vehicle detected | the NN's stable vehicle count. The detector is person+vehicle (`pv` model, 80 COCO classes); `_class_passes_mask` maps COCO 1-8 (bicycle, car, motorcycle, bus, truck, and the airplane/train/boat bucket) onto this bit. Needs `detect profile` bit1 set. |
+
+  Motion start/stop are edge-triggered off the *debounced* count, so a scene
+  hovering at the detection threshold cannot chatter them at frame rate, and
+  they are emitted by `detect simulate` as well as by live inference — the
+  bench has no way to walk people in front of the lens, so an edge only the
+  live path produced would be untestable there.
+
+  `detect simulate <N> [people|vehicle]` picks the class, for the same reason:
+  there is no car to point the lens at, and `0x20` needs exercising too.
+
+```
+detect profile 0x03 0x02      # detect people AND vehicles, report them
+detect simulate 2 vehicle     # -> rsn=2 rsd=2, then rsn=32 rsd=2
+detect simulate 3             # -> rsn=16 rsd=3
+```
 
 ### `at.py` — talk to the modem
 

@@ -33,6 +33,8 @@
  *
  ******************************************************************************  
  */
+#include <stdio.h>
+
 #include "fx_app.h"
 #include "jpeg_task.h"
 #include "modem_task.h"
@@ -136,7 +138,11 @@ typedef enum
 } t_snap_target;
 
 static t_snap_target _snap_target = SNAP_TARGET_SD;
-#define SNAP_TAG_MAX 31U
+/* The tag is what the server ends up naming the file (it travels as the
+ * SENDBIN tag -> the modem's X-Filename header). It therefore has to hold a
+ * whole SoW §7 name, `<serial>_DDMMYYYY_HHMMSS.rdy`, which is 30 characters
+ * for a 10-digit serial. At the old 31 it fitted only by luck. */
+#define SNAP_TAG_MAX 63U
 static char     _snap_tag[SNAP_TAG_MAX + 1U] = "";
 static uint32_t _snap_ref = 0U;
 

@@ -107,6 +107,13 @@ int32_t shell_stream_set(t_stream *stream);
  */
 void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
 
+/**
+ * @brief Latch a SoW §4.2 bit0 network-registration notification.
+ *
+ * Called from the modem URC path; the shell task emits it on its next turn.
+ */
+void shell_notify_netreg(void);
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->
 *//*-----------------------------------------------------------------------*//**

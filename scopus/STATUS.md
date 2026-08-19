@@ -1,6 +1,156 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-17. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-19. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-19 — the bench came back dead after a power-cycle, and the five QA issues
+
+### The power-cycle failure Omer reported
+
+Omer unplugged both devices, plugged them back in, and `preflight.py` then
+failed two checks while `at.py --point-here` answered every command with
+`Login incorrect` under a `swi-mdm9x28-wp login:` prompt.
+
+Root cause, proved rather than guessed: **`sdvrApp` was not installed on the
+modem at all.** `/legato/systems/current/apps/` listed 24 stock Legato apps and
+no `sdvrApp`; the system index was 47 with status `good`; and
+`/sbin/getty ttyHSL1 115200 vt100` was running. That getty *is* the login
+prompt in his log — `ttyHSL1` is shared between the kernel console and the
+SDVR app's `le_port` claim, so with the app gone nothing takes the port from
+getty and every `AT+SDVR…` line lands on a login prompt.
+
+This is the same post-power-cycle rollback seen on 2026-08-16 (system 42 that
+time). A Legato install that is never marked good reverts on the next reboot.
+Cure, as one step: install the locally built `.update`, wait for
+`app status` to list it, then `update --mark-good` **while still in
+probation**.
+
+Restored to 1.13.0, marked good (system 49), and `preflight.py` is back to
+**12/12 PASS** — including the CN805 camera→modem link, which needed no
+`mdm relink` this time.
+
+### ScopusQA issues #3-#7
+
+| # | Report | What it actually was | State |
+|---|---|---|---|
+| 3 | "Is there a query for camera settings?" | Each sub-command already answered with the current value when given no argument, but there was no way to see all six at once | **New `camera status`** — sensor, ISP, flip, AEC, AWB, gain, exposure, brightness in one reply |
+| 4 | "Only the latest image/notification appears" | **Ours, and a one-word bug.** The camera passed the literal `"photo"` as the SENDBIN tag while the unique §7 name sat in the `filename` argument, which the UART path ignores. The tag becomes the modem's `X-Filename`, so the receiver wrote one file called `photo` every time. Notifications carried **no** `X-Filename` at all, so the receiver defaulted to `upload.bin` | Fixed both ends |
+| 5 | "Not all notifications are received" | Correct, and worse than reported: the enable mask was **stored and never read by any emitter**, and 5 of the 6 §4.2 events had no producer at all | all six now emitted, mask now enforced |
+| 6 | "camera brightness — Not supported on IMX335!" | Correct answer, useless phrasing. The IMX335 driver has no `set_brightness`; on an ISP part exposure/gain/AEC are the brightness controls | Message now names the alternatives |
+| 7 | "camera awb — range is only 0-2, not 0-5" | The help text was wrong, not the firmware. The profile table comes from the sensor's ISP tuning file; IMX335 has three | Error names the real range; help and docs no longer promise a fixed 0..5 |
+
+**#4 — the fix.** `snapshot_request_upload("photo", ref, fname)` →
+`snapshot_request_upload(fname, ref, fname)` in both call sites
+(`shell_task.c` `photo upload`, `nn_task.c` auto-upload), plus `SNAP_TAG_MAX`
+31→63 so a 10-digit serial cannot truncate the name. On the modem,
+`notify.c` now builds `ntf_<modem clock>_<counter>.json` and sends it as
+`X-Filename`. Proved over cellular against the customer's receiver:
+
+```
+POST /upload  name=4194336_01012000_000245.rdy   bytes=152324
+POST /notify  name=ntf_20260819111902_000.json   bytes=99
+POST /notify  name=ntf_20260819112032_001.json   bytes=99
+POST /notify  name=ntf_20260819112032_002.json   bytes=100
+```
+
+Note the photo's `01012000`: **the camera's RTC is unset**, so the date half of
+the §7 name is epoch. Uniqueness still holds second-to-second, but two photos
+inside one second would collide, and the name carries no useful date. `rtc set
+DDMMYYYYHHMMSS` fixes it per boot; syncing the camera's RTC from the modem
+(which has real time — see the `ntf_` names above) is the proper fix and is not
+done.
+
+**#5 — the mask was decorative.** `_notify_emit` never looked at
+`notify_enable_mask`. Enabling a bit changed nothing; disabling one changed
+nothing. It is now enforced, with two deliberate exceptions: `notify trigger`
+always sends (it exists to test the transport), and the photo event `0x40` is
+outside the §4.2 table. Registry default is now `0x3F` and `REGISTRY_VERSION`
+is 6 — silence by default is the one failure mode a field unit cannot report.
+
+Producers added: `0x01` from the modem's `+SDVRNET: UP` **and** its `+SDVRRDY`
+banner (the "on power up / reset" half of §4.2 — the transition-only URC never
+fires when the app restarts while already registered, which would have left the
+event untestable on a bench that is always in coverage); `0x02`/`0x04` from the
+debounced detection count crossing zero, shared with `detect simulate` so the
+bench can exercise them without walking people past the lens; `0x08` from
+`notify period <s>` on the shell task's turn.
+
+Measured on hardware:
+
+```
+notify period 10   → rsn=8 at 00:01:52, 00:02:02, 00:02:13
+detect simulate 3  → rsn=2 rsd=3 mtn=1, then rsn=16 rsd=3
+   (3 s later)     → rsn=4 rsd=0 mtn=1, then rsn=16 rsd=0
+app restart sdvrApp→ +SDVRRDY: 1.13.0, then rsn=1
+```
+
+**`0x20` vehicle detected — I got this wrong first time and it is worth
+recording why.** I read `MULTICLASS_STATUS.md` (2026-05-23), saw "only class 0
+(person) ever fires", and concluded the event could not be delivered without a
+new model. That document describes the *relu30* experiment and is three months
+stale. The kit has since moved to the **`pv` model** — `network_generate_report.txt`
+records `generate --model pv_epoch0.onnx`, the output is (84,1344) = 4 box + 80
+COCO classes, and `_class_passes_mask()` in `nn_task.c` has mapped COCO 1-8
+(bicycle, car, motorcycle, bus, truck, airplane, train, boat) onto the vehicle
+bit for as long as `detect profile <det_msk>` has existed. Vehicles were being
+**detected and counted** all along.
+
+The actual bug was one line further on: the report hardcoded
+`shell_notify_emit(0x10, _nn_stable_boxes)` — every detection was announced as
+"people" whatever the model saw, and nothing ever emitted `0x20`. Fixed by
+splitting the filtered box buffer per class while it is being filtered
+(`_nn_people_now` / `_nn_vehicles_now`) and reporting each under its own reason
+code, each only when its own count changed. Two notifications rather than one
+`rsn=0x30`, because a single event carries one `rsd`.
+
+`detect simulate <N> [people|vehicle]` now takes a class, for the same reason
+the motion edges are shared with it: there is no car to point the lens at.
+
+```
+detect profile 0x03 0x02
+detect simulate 2 vehicle  → rsn=2 rsd=2 mtn=1, then rsn=32 rsd=2
+   (3 s later)             → rsn=4 rsd=0,       then rsn=32 rsd=0
+detect simulate 3          → rsn=16 rsd=3
+```
+
+**Lesson: check the model that is actually built in, not the status document.**
+`Model/network_generate_report.txt` names the ONNX the firmware carries;
+`Model/_backup_person_only/` exists precisely because the current one is not it.
+
+### The camera RTC now sets itself from the modem
+
+The camera has no battery-backed clock, so every power cycle started it at
+2000-01-01 — and that clock stamps both the §7 photo name and the §6 `tim`
+field, so every uploaded file was dated to the epoch. The modem has real time
+from the network and is on the other end of a UART we own.
+
+`rtc sync` sends `AT+CCLK?` and sets the RTC from
+`+CCLK: "YY/MM/DD,HH:MM:SS+ZZ"`, where **ZZ is quarter-hours** (`+12` = +3 h).
+The offset is applied, so the RTC ends up on local time — what a tester
+compares against a wall clock and against the receiver's log lines. It runs
+automatically at camera start-up **and** on the modem's `+SDVRRDY` /
+`+SDVRNET: UP`, with a bounded retry.
+
+One trap worth knowing: **`modem_send_at()` cannot return the `+CCLK:` line.**
+`_looks_like_urc()` in `modem_task.c` classifies every line starting with `+`
+that is not a terminator as a URC and routes it to the callback, so `reply`
+holds only `OK`. That heuristic is load-bearing for the whole SDVR command set,
+so the clock is caught in the URC forwarder (`_cclk_line`) instead of making
+the tunnel smarter.
+
+Measured: camera reflashed, and with no modem reboot at all the RTC came up at
+`26/08/19 15:14:41` against a bench wall clock of `15:14:47`.
+
+### Two toolchain traps
+
+- `make` in `Application/Release` picks up a **default goal from an included
+  `subdir.mk`** and answers "'Utilities/JPEG/jpeg_utils.o' is up to date"
+  while building nothing. Always `make all`.
+- The system `/usr/bin/arm-none-eabi-gcc` rejects `-fcyclomatic-complexity`.
+  Build with ST's GCC on PATH, and sign with the **standalone** CubeProgrammer
+  2.21 (`~/STMicroelectronics/...`) — the copy inside CubeIDE is 2.20 and has
+  no `-align`.
 
 ---
 

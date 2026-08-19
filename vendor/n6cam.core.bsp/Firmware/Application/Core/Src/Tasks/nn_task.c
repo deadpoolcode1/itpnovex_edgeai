@@ -42,6 +42,7 @@
 #include "stai_network.h"
 #include "snapshot_task.h"
 #include "shell_task.h"
+#include "registry.h"   /* SoW §4.2 notification reason bits */
 #include "n6cam_rtc.h"
 
 /*-------------------------------------------------------------------------*//**
@@ -281,6 +282,15 @@ static uint32_t          _nn_prev_boxes    = 0U;
 
 static volatile uint32_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
 static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
+/* Which side of the motion edge we are on, so §4.2 start/stop fire once per
+ * transition rather than once per frame. */
+static bool              _nn_motion_active = false;
+/* Latest per-class split of the filtered box buffer, and the last split
+ * actually reported, so an unchanged class is not re-announced. */
+static uint32_t          _nn_people_now     = 0U;
+static uint32_t          _nn_vehicles_now   = 0U;
+static uint32_t          _nn_people_rep     = 0U;
+static uint32_t          _nn_vehicles_rep   = 0U;
 
 /* Rising: the highest count seen while collecting evidence, how many frames
  * have exceeded the believed value, and when that evidence started (it
@@ -430,6 +440,9 @@ void nn_task_detect_set(bool enable)
   {
     _nn_count_reset(0U);
     _nn_prev_boxes = 0U;
+    _nn_motion_active = false;   /* and no motion in progress */
+    _nn_people_now = _nn_vehicles_now = 0U;
+    _nn_people_rep = _nn_vehicles_rep = 0U;
   }
   _nn_detect_enabled = enable;
 }
@@ -512,7 +525,66 @@ void nn_task_dump_output(float *head_out, float *tail_out, uint32_t *bytes_out)
  * Skips the actual NN inference — useful when the camera is out of focus
  * or the lens is dirty, so we want to verify the post-detect chain in
  * isolation. Holds the box-buffer mutex like the real path. */
+/* SoW §4.2 bits 1/2 — emit motion start / motion stop on the edges of
+ * "is anything in the scene".
+ *
+ * Shared by the inference loop and `detect simulate`, because a simulated
+ * scene has to produce the same events as a real one: the bench has no way
+ * to walk people in front of the lens, so simulate is how these get tested,
+ * and edges that only the live path emitted would be untestable there.
+ *
+ * Caller must have checked the report action bit. Latches on
+ * `_nn_motion_active`, so each transition fires exactly once.
+ */
+static void _nn_motion_edges(uint32_t count)
+{
+  if ((count > 0U) && !_nn_motion_active)
+  {
+    _nn_motion_active = true;
+    shell_notify_emit(NOTIFY_RSN_MOTION_START, count, true);
+  }
+  else if ((count == 0U) && _nn_motion_active)
+  {
+    _nn_motion_active = false;
+    shell_notify_emit(NOTIFY_RSN_MOTION_STOP, 0U, true);
+  }
+}
+
+/* SoW §4.2 bits 4/5 — report people and vehicles under their own reason
+ * codes.
+ *
+ * The detector is person+vehicle (`pv` model, 80 COCO classes, mapped to the
+ * two SoW classes by `_class_passes_mask`), but every detection used to be
+ * announced as `rsn=0x10` "people" whatever the model saw, so a car raised a
+ * people event and `0x20` was never emitted by anything — ScopusQA #5.
+ *
+ * Each class is sent only when its own count changed, so a person walking
+ * through a car park does not re-announce the parked cars on every edge.
+ * `rsd` carries that class's count, which is why these are two notifications
+ * and not one with `rsn=0x30`: a single event has only one `rsd`.
+ *
+ * Caller must have checked the report action bit.
+ */
+static void _nn_report_classes(uint32_t people, uint32_t vehicles)
+{
+  if ((_nn_det_mask & 0x01U) && (people != _nn_people_rep))
+  {
+    _nn_people_rep = people;
+    shell_notify_emit(NOTIFY_RSN_PEOPLE, people, false);
+  }
+  if ((_nn_det_mask & 0x02U) && (vehicles != _nn_vehicles_rep))
+  {
+    _nn_vehicles_rep = vehicles;
+    shell_notify_emit(NOTIFY_RSN_VEHICLE, vehicles, false);
+  }
+}
+
 void nn_task_simulate_detection(uint32_t boxes)
+{
+  nn_task_simulate_detection_class(boxes, 0);   /* COCO person */
+}
+
+void nn_task_simulate_detection_class(uint32_t boxes, int32_t class_index)
 {
   rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
   _pp_box_count = (size_t)boxes;
@@ -521,7 +593,7 @@ void nn_task_simulate_detection(uint32_t boxes)
     /* Populate one fake person-class box so consumers (nn_get_detections)
      * see something coherent. Only fields the downstream cares about. */
     memset(&_pp_box_buff[0], 0, sizeof(_pp_box_buff[0]));
-    _pp_box_buff[0].class_index = 0;   /* COCO person */
+    _pp_box_buff[0].class_index = class_index;
     _pp_box_buff[0].conf        = 1.0f;
   }
   rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
@@ -552,6 +624,28 @@ void nn_task_simulate_detection(uint32_t boxes)
    * than immediately re-reporting what was just simulated. */
   _nn_count_reset(boxes);
   _nn_prev_boxes = boxes;
+
+  /* Split the asserted scene the same way a real one is split, so the live
+   * loop's next report is a change away from what was simulated rather than a
+   * contradiction of it. */
+  if (class_index == 0)
+  {
+    _nn_people_now = boxes; _nn_vehicles_now = 0U;
+  }
+  else
+  {
+    _nn_people_now = 0U;    _nn_vehicles_now = boxes;
+  }
+  _nn_people_rep   = _nn_people_now;
+  _nn_vehicles_rep = _nn_vehicles_now;
+
+  /* The motion edge for the asserted scene. Emitted here rather than by the
+   * shell command so that the latch stays owned by one place: the live loop
+   * then reports the scene emptying as a real motion-stop. */
+  if (_nn_action_mask & 0x02U)
+  {
+    _nn_motion_edges(boxes);
+  }
 }
 
 /* COCO-class -> SoW class mapping (proposal W5/W6).
@@ -560,6 +654,14 @@ void nn_task_simulate_detection(uint32_t boxes)
  * the airplane 4 / train 6 / boat 8 bucket (the model occasionally labels
  * a car/truck as one of these; "something on wheels/wings/water" still
  * counts as a vehicle for the W6 signal). */
+static bool _class_is_vehicle(int32_t class_index)
+{
+  return (class_index == 2 || class_index == 1 ||   /* car, bicycle    */
+          class_index == 3 || class_index == 5 ||   /* motorcycle, bus */
+          class_index == 7 || class_index == 4 ||   /* truck, airplane */
+          class_index == 6 || class_index == 8);    /* train, boat     */
+}
+
 static bool _class_passes_mask(int32_t class_index, uint8_t det_msk)
 {
   /* People class (COCO person = 0) */
@@ -632,10 +734,19 @@ static void _nn_task_run(uint32_t args)
        * (filtered) view. */
       rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
       size_t kept = 0U;
+      uint32_t people = 0U, vehicles = 0U;
       for (size_t i = 0U; i < _pp_box_count; i++)
       {
-        if (_class_passes_mask((int32_t)_pp_box_buff[i].class_index, _nn_det_mask))
+        int32_t cls = (int32_t)_pp_box_buff[i].class_index;
+        if (_class_passes_mask(cls, _nn_det_mask))
         {
+          /* Split the survivors by SoW class as they are kept. §4.2 has a
+           * reason code for each (0x10 people, 0x20 vehicle) and the report
+           * used to call every detection "people" regardless of what the
+           * model actually saw — the detector has been person+vehicle since
+           * the pv model went on (ScopusQA #5). */
+          if (cls == 0)                 { people++; }
+          else if (_class_is_vehicle(cls)) { vehicles++; }
           if (kept != i)
           {
             _pp_box_buff[kept] = _pp_box_buff[i];
@@ -644,6 +755,8 @@ static void _nn_task_run(uint32_t args)
         }
       }
       _pp_box_count = kept;
+      _nn_people_now   = people;
+      _nn_vehicles_now = vehicles;
       rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
 
       /* SoW W12 / W11: on a 0->N box-count edge, fire side effects
@@ -724,7 +837,8 @@ static void _nn_task_run(uint32_t args)
           {
             static uint32_t _auto_upload_ref = 0U;
             _auto_upload_ref++;
-            if (snapshot_request_upload("photo", _auto_upload_ref, fname))
+            /* Unique name, same reason as the shell path — see ScopusQA #4. */
+            if (snapshot_request_upload(fname, _auto_upload_ref, fname))
             {
               _nn_upload_next = tx_time_get() + NN_AUTO_UPLOAD_MIN_TICKS;
             }
@@ -748,7 +862,19 @@ static void _nn_task_run(uint32_t args)
          * detection and a real one are indistinguishable downstream. */
         if (_nn_action_mask & 0x02U)
         {
-          shell_notify_emit(0x10U, _nn_stable_boxes, false);
+          /* §4.2 bits 1 and 2 — motion start / motion stop. The scene going
+           * from empty to occupied and back is the only motion signal this
+           * product has (no PIR is fitted), and neither edge was ever
+           * emitted: `notify enable` accepted 0x02/0x04 and nothing on the
+           * device produced them (ScopusQA #5).
+           *
+           * Edge-triggered off the debounced count, so a scene hovering at
+           * the detection threshold cannot chatter start/stop at frame rate.
+           * Sent before the people-detected event so a receiver reading the
+           * pair in order sees "motion began, and here is what was in it".
+           * mtn=1 marks both as motion-derived. */
+          _nn_motion_edges(_nn_stable_boxes);
+          _nn_report_classes(_nn_people_now, _nn_vehicles_now);
         }
         LINFO(TRACE_NN, "count now %lu object(s)",
               (unsigned long)_nn_stable_boxes);

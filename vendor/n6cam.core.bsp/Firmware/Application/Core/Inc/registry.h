@@ -53,7 +53,21 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        5U
+#define REGISTRY_VERSION        6U
+
+/** Notification reason bits — SoW §4.2.
+ *
+ * NOTIFY_MASK_ALL is the set the enable mask gates. Codes above it are local
+ * extensions (0x40 = photo taken) and are always sent.
+ */
+#define NOTIFY_RSN_NETREG       0x01U
+#define NOTIFY_RSN_MOTION_START 0x02U
+#define NOTIFY_RSN_MOTION_STOP  0x04U
+#define NOTIFY_RSN_PERIODIC     0x08U
+#define NOTIFY_RSN_PEOPLE       0x10U
+#define NOTIFY_RSN_VEHICLE      0x20U
+#define NOTIFY_MASK_ALL         0x3FU
+#define NOTIFY_RSN_PHOTO        0x40U
 
 /* Wifi */
 #define WIFI_SSID_LEN           31U
@@ -200,7 +214,12 @@ const t_registry_data registry_defaults =
   .detect_enable               = 0U,
   .detect_det_mask             = 1U,     /* people only by default */
   .detect_action_mask          = 0U,
-  .notify_enable_mask          = 0U,
+  /* All six SoW §4.2 events on by default. The mask used to default to 0
+   * AND be ignored by the emitter, so it read as 'everything off' while
+   * behaving as 'everything through'. Now that it is enforced, a unit that
+   * nobody has configured must still report — silence by default is the
+   * one failure mode a field unit cannot tell you about. (ScopusQA #5.) */
+  .notify_enable_mask          = NOTIFY_MASK_ALL,
   .notify_period_s             = 0U,
   .notify_dest_ip              = 0U,
   .notify_dest_port            = 0U,
