@@ -44,6 +44,7 @@
 #include "n6cam_core.h"   /* LED_USER3, bsp_led_set_state */
 #include "hdlc.h"
 #include "modem_task.h"
+#include "motion_sensor.h"
 #include "nn_task.h"
 #include "snapshot_task.h"
 #include "fx_app.h"
@@ -325,7 +326,9 @@ static char      _rcmd_at[MODEM_NOTIFY_MAX];
 /* Emit a JSON notification on the shell stream per SoW §6.
  *   rsn — bitmask reason code
  *   rsd — extra data (e.g., detected count)
- *   mtn — motion state (0|1)
+ * The §6 `mtn` field is filled in from the inertial sensor rather than passed
+ * in: it reports whether the *unit* is being moved right now, which is a
+ * property of the box and not of the event being sent.
  * Prefixed with '+SDVRNTF: ' so the host can parse it the same way it
  * parses the modem-side URC once the modem is wired. */
 /* Set from the modem URC thread, cleared by the shell loop. */
@@ -348,8 +351,8 @@ static volatile bool _cclk_seen     = false;
 /* Tick stamp of the last periodic report. */
 static uint32_t      _notify_period_last = 0U;
 
-static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
-static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force);
+static void _notify_emit(uint32_t rsn, uint32_t rsd);
+static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool force);
 
 /* IR LED runtime state. PoC: also drive LED_USER3 as a visible proxy so the
  * user can see the command landing during bring-up; the actual IR LED GPIO
@@ -418,7 +421,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _stacks_cmd             , .name = "stacks"    , .help = "Per-task stack high-water usage since boot" },
   {.run = _echo_cmd               , .name = "echo"      , .help = "[on | off | query]" },
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
-  {.run = _motion_cmd             , .name = "motion"    , .help = "[sense <0..100> <timeout_s>] | [query]" },
+  {.run = _motion_cmd             , .name = "motion"    , .help = "Board movement: [sense <0..100> <timeout_s>] | [query] | [read] | [selftest] | [simulate 0|1]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
   {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
@@ -607,6 +610,11 @@ void _shell_task_init(void)
   uint8_t boot_n = 0U;
   bool safe_mode = false;
 
+  /* §4.5 motion-sensor parameters, read under the same lock as everything
+   * else and applied once it is released. */
+  uint8_t  motion_sens    = 50U;
+  uint32_t motion_timeout = 30U;
+
   /* Apply persisted shell settings (SoW §4.1 + §3.1 detect) + read
    * bootloop counter under the registry lock. NO write here — the
    * bump already happened in registry_task_init. */
@@ -643,9 +651,17 @@ void _shell_task_init(void)
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
       nn_task_debounce_set(reg->detect_debounce_ms);
+      motion_sens    = reg->motion_sensitivity;
+      motion_timeout = reg->motion_no_motion_timeout_s;
       registry_release();
     }
   }
+
+  /* §3.5/§4.5 — the board's own movement sensor, armed with the parameters
+   * `motion sense` persisted. It gets no task of its own: the detector is a
+   * few register reads at 5 Hz, and driving it from the shell loop keeps
+   * every notification producer on one thread. */
+  (void)motion_sensor_init(motion_sens, motion_timeout);
 
   /*-->> READY <<--*/
   LINFO(TRACE_SHELL, "Task started");
@@ -691,12 +707,17 @@ static void _shell_task_run(uint32_t args)
      * is the only point at which the shell is provably idle. */
     (void)_shell_run_remote_cmd();
 
+    /* §4.2 bits 1/2 — the box itself being moved. One turn of the inertial
+     * detector; it emits motion start/stop from here, on this thread, like
+     * every other notification. */
+    motion_sensor_poll();
+
     /* §4.2 bit0 — network registration. The URC arrives on the modem task;
      * emitting here keeps notification composition on one thread. */
     if (_notify_netreg_pending)
     {
       _notify_netreg_pending = false;
-      _notify_emit(NOTIFY_RSN_NETREG, 0U, false);
+      _notify_emit(NOTIFY_RSN_NETREG, 0U);
     }
 
     /* Take the modem's clock. Done here and not in the URC callback because
@@ -736,7 +757,7 @@ static void _shell_task_run(uint32_t args)
         if ((now - _notify_period_last) >= (period * TX_TIMER_TICKS_PER_SECOND))
         {
           _notify_period_last = now;
-          _notify_emit(NOTIFY_RSN_PERIODIC, 0U, false);
+          _notify_emit(NOTIFY_RSN_PERIODIC, 0U);
         }
       }
       else
@@ -1233,7 +1254,7 @@ static int32_t _irled_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
  * MODEM_AT_TIMEOUT_MS per attempt; an earlier prototype that called it from
  * here froze the shell for 10+ seconds, and this function is also called
  * from the NN detection path, where blocking would stall inference. */
-static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force)
+static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool force)
 {
   /* SoW §4.2 says the mask decides what is reported. It never did: the value
    * was stored by `notify enable` and read back by `notify query`, and no
@@ -1275,7 +1296,7 @@ static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force)
     (unsigned long)rsn, (unsigned long)rsd,
     (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day,
     (unsigned)dt.hours, (unsigned)dt.minutes, (unsigned)dt.seconds,
-    mtn ? 1U : 0U);
+    motion_sensor_state() ? 1U : 0U);
 
   if ((jn > 0) && ((size_t)jn < sizeof(_notify_json)))
   {
@@ -1348,17 +1369,17 @@ static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool mtn, bool force)
   rtos_mutex_acquire(&_notify_mtx, false);
 }
 
-static void _notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+static void _notify_emit(uint32_t rsn, uint32_t rsd)
 {
-  _notify_emit_ex(rsn, rsd, mtn, false);
+  _notify_emit_ex(rsn, rsd, false);
 }
 
 /* Public entry point for producers outside this file — today the NN task's
  * live inference loop, which has a detection to report and no business
  * knowing how a notification is composed or where it goes. */
-void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn)
+void shell_notify_emit(uint32_t rsn, uint32_t rsd)
 {
-  _notify_emit(rsn, rsd, mtn);
+  _notify_emit(rsn, rsd);
 }
 
 /* Network registration (§4.2 bit 0). Latched by the modem URC forwarder,
@@ -2509,7 +2530,7 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 
   /* Emit a notification carrying the action + filename. rsn=0x40 = photo-event
    * bit (extension to SoW §4.2's bit table). rsd encodes savesd vs upload. */
-  _notify_emit(0x40U, savesd ? 1U : 2U, false);
+  _notify_emit(NOTIFY_RSN_PHOTO, savesd ? 1U : 2U);
 
   _cmd_ack(stream, argv, argc);
   return LWSHELL_OK;
@@ -2554,7 +2575,7 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   {
     unsigned long code = strtoul((char*)argv[2], NULL, 0);
     /* Explicit operator request — always sent, mask or no mask. */
-    _notify_emit_ex((uint32_t)code, 0U, false, true);
+    _notify_emit_ex((uint32_t)code, 0U, true);
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2635,7 +2656,7 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                lwshell_eol());
     /* Also fire the +SDVRNTF the inference loop would have, under the reason
      * code for the class that was asserted. */
-    _notify_emit(vehicle ? NOTIFY_RSN_VEHICLE : NOTIFY_RSN_PEOPLE, boxes, false);
+    _notify_emit(vehicle ? NOTIFY_RSN_VEHICLE : NOTIFY_RSN_PEOPLE, boxes);
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2815,51 +2836,139 @@ static int32_t _img_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
-/* SoW §4.5 motion sense <sensitivity 0-100> <no_motion_timeout_s> | motion query.
- * PoC: parameters persist in registry; sensor wiring (W16) is a future task. */
+/* SoW §3.5/§4.5 — the board's movement sensor.
+ *
+ *   motion sense <sensitivity 0..100> <no_motion_timeout_s>
+ *   motion query        what is configured, and what the sensor is doing
+ *   motion read         the raw acceleration vector, in mg
+ *   motion selftest     make the sensor itself produce motion, with no hands
+ *   motion simulate <0|1>   assert the state, bypassing the sensor
+ *
+ * This is the *unit* moving — the box picked up, knocked or tilted — and not
+ * objects moving in the field of view; the two were conflated once and the
+ * §4.2 motion bits were wired to the detector's box count, which is not what
+ * §4.5 describes. Detection of people and vehicles has its own reason codes
+ * (0x10 / 0x20) and is untouched by anything here.
+ *
+ * The parameters persist in the registry and are applied to the running
+ * detector immediately: `motion sense` is expected to change how the unit
+ * behaves now, not after the next reboot. */
 static int32_t _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 {
-  uint8_t  sens = 0U;
-  uint32_t timeout_s = 0U;
+  if (argc < 2U) return LWSHELL_ERROR_SYNTAX_CMD;
+  const char *sub = (const char*)argv[1];
 
-  if ((argc >= 4U) && (strcmp((char*)argv[1], "sense") == 0))
+  if ((argc >= 4U) && (strcmp(sub, "sense") == 0))
   {
-    int s = atoi((char*)argv[2]);
+    int  s = atoi((char*)argv[2]);
     long t = atol((char*)argv[3]);
     if ((s < 0) || (s > 100) || (t < 0))
     {
       return LWSHELL_ERROR_SYNTAX_CMD;
     }
-    sens = (uint8_t)s;
-    timeout_s = (uint32_t)t;
 
     t_registry_data *reg = registry_acquire();
     if (reg)
     {
-      reg->motion_sensitivity         = sens;
-      reg->motion_no_motion_timeout_s = timeout_s;
+      reg->motion_sensitivity         = (uint8_t)s;
+      reg->motion_no_motion_timeout_s = (uint32_t)t;
       registry_release();
       registry_request_save();
     }
-    CMD_PRINTF(stream, "motion: sensitivity=%u timeout=%lu%s",
-               (unsigned)sens, (unsigned long)timeout_s, lwshell_eol());
+    motion_sensor_config((uint8_t)s, (uint32_t)t);
+
+    t_motion_status st;
+    motion_sensor_status(&st);
+    CMD_PRINTF(stream, "motion: sensitivity=%u timeout=%lu (threshold %lu mg)%s",
+               (unsigned)st.sensitivity, (unsigned long)st.timeout_s,
+               (unsigned long)st.threshold_mg, lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
-  else if ((argc >= 2U) && (strcmp((char*)argv[1], "query") == 0))
+
+  if (strcmp(sub, "query") == 0)
   {
-    t_registry_data *reg = registry_acquire();
-    if (reg)
-    {
-      sens      = reg->motion_sensitivity;
-      timeout_s = reg->motion_no_motion_timeout_s;
-      registry_release();
-    }
+    t_motion_status st;
+    motion_sensor_status(&st);
+
+    /* The first line is the §4.5 answer and has kept its wording since the
+     * parameters were storage-only, because the test suite and the tester's
+     * manual both read it. Everything the sensor knows follows underneath. */
     CMD_PRINTF(stream, "motion: sensitivity=%u timeout=%lu%s",
-               (unsigned)sens, (unsigned long)timeout_s, lwshell_eol());
+               (unsigned)st.sensitivity, (unsigned long)st.timeout_s,
+               lwshell_eol());
+    if (st.present)
+    {
+      CMD_PRINTF(stream, "motion: sensor LSM6DSO32 at 0x%02X, threshold %lu mg%s",
+                 (unsigned)st.addr, (unsigned long)st.threshold_mg, lwshell_eol());
+      CMD_PRINTF(stream, "motion: state=%s%s deviation=%lu mg peak=%lu mg still=%lu s%s",
+                 st.active ? "moving" : "still",
+                 st.forced ? " (simulated)" : "",
+                 (unsigned long)st.last_dev_mg, (unsigned long)st.peak_dev_mg,
+                 (unsigned long)st.still_s, lwshell_eol());
+      CMD_PRINTF(stream, "motion: events start=%lu stop=%lu%s",
+                 (unsigned long)st.starts, (unsigned long)st.stops, lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "motion: sensor not present — start/stop not produced%s",
+                 lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
+
+  if (strcmp(sub, "read") == 0)
+  {
+    int32_t mg[3] = { 0 };
+    if (motion_sensor_read(mg) != BSP_OK)
+    {
+      CMD_PRINTF(stream, "motion read: sensor not available%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+    /* At rest one axis reads about ±1000 — that is gravity, and it is the
+     * cheapest proof the part is alive and mounted the way we think. */
+    CMD_PRINTF(stream, "motion read: x=%ld y=%ld z=%ld mg%s",
+               (long)mg[0], (long)mg[1], (long)mg[2], lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if (strcmp(sub, "selftest") == 0)
+  {
+    /* The sensor's electrostatic self-test deflects the proof mass, so the
+     * step it produces travels the whole real path — filter, threshold, state
+     * machine, notification. It is how a bench with nobody near it exercises
+     * §4.2 motion start/stop for real. */
+    int32_t delta = 0;
+    int32_t rc = motion_sensor_selftest(&delta);
+    CMD_PRINTF(stream, "motion selftest: %s (shift %ld mg)%s",
+               (rc == BSP_OK) ? "sensor responded" : "no valid response",
+               (long)delta, lwshell_eol());
+    if (rc != BSP_OK) { return LWSHELL_OK; }
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if ((argc >= 3U) && (strcmp(sub, "simulate") == 0))
+  {
+    /* Transport only — this asserts the state and skips the sensor, the way
+     * `detect simulate` asserts a scene. `motion selftest` is the one to use
+     * when the sensor is meant to be part of what is under test. */
+    const char *arg = (const char*)argv[2];
+    bool on = (strcmp(arg, "1") == 0) || (strcmp(arg, "on") == 0) ||
+              (strcmp(arg, "start") == 0);
+    bool off = (strcmp(arg, "0") == 0) || (strcmp(arg, "off") == 0) ||
+               (strcmp(arg, "stop") == 0);
+    if (!on && !off) { return LWSHELL_ERROR_SYNTAX_CMD; }
+
+    motion_sensor_force(on);
+    CMD_PRINTF(stream, "motion simulate: %s%s", on ? "moving" : "still",
+               lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
   return LWSHELL_ERROR_SYNTAX_CMD;
 }
 

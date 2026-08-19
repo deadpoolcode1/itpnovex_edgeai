@@ -44,7 +44,7 @@
 | **W11** | On detect — send alert message to the modem | ⏳ Pending — needs the MangOH UART link (W3). |
 | **W13** | On detect — transmit JPEG over UART | ⏳ Pending — same dependency. |
 | **W15** | IR LEDs on/off via USB command | ✅ DONE EARLY — `irled on/off/query` (T03.1, T03.2 PASS). |
-| **W16** | Motion sensor enable/disable via USB | ✅ DONE EARLY — `motion sense/query` (T03.3, T03.4 PASS). |
+| **W16** | Motion sensor enable/disable via USB | ✅ DONE — `motion sense/query/read/selftest`, driving the board's LSM6DSO32 IMU and raising the §4.2 motion start/stop events (T03.3, T03.4 PASS; integration group K). Until 2026-08-19 the two parameters were stored and the sensor was never read. |
 
 `W2/W4/W15/W16` are M3 per the proposal but already in firmware — they were delivered alongside M1/M2 because the shell command surface naturally pulled them in. Acceptance against M3 deliverables when that milestone is presented.
 

@@ -1382,6 +1382,83 @@ def build():
             "Expected, not a fault: a very long answer is cut after about "
             "1.8 KB. Ask for less at a time."]])
 
+    # ── 20. the motion sensor ────────────────────────────────────────────
+    doc.add_heading("20. Checking the motion sensor (the unit being moved)",
+                    level=1)
+    doc.add_paragraph(
+        "This is a different thing from people walking in front of the "
+        "camera. The board carries its own movement sensor, and the two "
+        "motion notifications — Motion start and Motion stop — mean the "
+        "unit itself is being picked up, knocked or tilted. Objects moving "
+        "in the picture are reported separately, as People detected and "
+        "Vehicle detected.")
+    doc.add_paragraph(
+        "Two settings control it, and both survive a power cycle:")
+    table(doc, ["Setting", "What it does"],
+          [["sensitivity 0-100",
+            "How hard the box has to be disturbed before it counts. 100 is "
+            "the lightest touch (about 15 mg), 0 needs a deliberate shove "
+            "(about 500 mg). 50 is the default."],
+           ["no-motion timeout",
+            "How long the box then has to be still before Motion stop is "
+            "sent. Seconds."]])
+
+    doc.add_heading("Step M1 — Check the sensor is there and awake", level=2)
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion query"')
+    expected(doc)
+    code(doc, "motion: sensitivity=50 timeout=30\n"
+              "motion: sensor LSM6DSO32 at 0xD6, threshold 265 mg\n"
+              "motion: state=still deviation=3 mg peak=0 mg still=142 s\n"
+              "motion: events start=0 stop=0")
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion read"')
+    expected(doc)
+    code(doc, "motion read: x=986 y=-77 z=80 mg")
+    note(doc,
+         "One axis reading about 1000 is gravity. Which axis depends on how "
+         "the box is standing. If all three read near zero, the sensor is "
+         "answering but not measuring — report it.")
+
+    doc.add_heading("Step M2 — Make it report a movement", level=2)
+    doc.add_paragraph(
+        "Set a short no-motion timeout first, so you do not wait 30 seconds "
+        "for the second event, and allow the two motion events to be "
+        "reported:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "notify enable 0xff"')
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion sense 50 10"')
+    doc.add_paragraph("Now move the box: pick it up, put it down, or tap it "
+                      "firmly. Watch Window A.")
+    expected(doc)
+    code(doc, '{"ser":4194336,"num":0,"rsn":2,"rsd":688,'
+              '"tim":"20260819170215","mtn":1,…}\n'
+              '{"ser":4194336,"num":1,"rsn":4,"rsd":15,'
+              '"tim":"20260819170230","mtn":0,…}')
+    table(doc, ["Field", "Meaning"],
+          [["rsn=2", "Motion start."],
+           ["rsn=4", "Motion stop, sent once the box has been still for the "
+                     "no-motion timeout."],
+           ["rsd", "On start, how big the disturbance was, in mg. On stop, "
+                   "how long the movement lasted, in seconds."],
+           ["mtn", "1 while the box is moving. It is on every notification, "
+                   "not only these two, so an event that arrives during a "
+                   "move says so."]])
+
+    doc.add_heading("Step M3 — If nobody can touch the box", level=2)
+    doc.add_paragraph(
+        "The sensor can push its own measuring element, which produces a "
+        "real movement with nobody near the unit. Use this when the bench "
+        "is remote:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion selftest"')
+    expected(doc)
+    code(doc, "motion selftest: sensor responded (shift 681 mg)")
+    doc.add_paragraph(
+        "The same two notifications follow, exactly as if the box had been "
+        "moved by hand. There is also motion simulate 0|1, which asserts "
+        "the state without involving the sensor at all — use it only to "
+        "test the reporting path, never to prove the sensor works.")
+
+    doc.add_paragraph("Put the timeout back when you are done:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion sense 50 30"')
+
     doc.save(OUT)
     print(f"wrote {OUT}")
     if RELAY_KEY.startswith("<"):

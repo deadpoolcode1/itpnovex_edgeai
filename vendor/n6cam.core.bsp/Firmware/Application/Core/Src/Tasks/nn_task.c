@@ -282,9 +282,6 @@ static uint32_t          _nn_prev_boxes    = 0U;
 
 static volatile uint32_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
 static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
-/* Which side of the motion edge we are on, so §4.2 start/stop fire once per
- * transition rather than once per frame. */
-static bool              _nn_motion_active = false;
 /* Latest per-class split of the filtered box buffer, and the last split
  * actually reported, so an unchanged class is not re-announced. */
 static uint32_t          _nn_people_now     = 0U;
@@ -440,7 +437,6 @@ void nn_task_detect_set(bool enable)
   {
     _nn_count_reset(0U);
     _nn_prev_boxes = 0U;
-    _nn_motion_active = false;   /* and no motion in progress */
     _nn_people_now = _nn_vehicles_now = 0U;
     _nn_people_rep = _nn_vehicles_rep = 0U;
   }
@@ -519,37 +515,6 @@ void nn_task_dump_output(float *head_out, float *tail_out, uint32_t *bytes_out)
   if (bytes_out) *bytes_out = _nn_dump.bytes;
 }
 
-/* SoW test-injection (firmware-side simulate). Sets a synthetic box count
- * + a synthetic person-class box, runs the same on-edge side-effects the
- * inference loop would: snapshot trigger + notification + trace log.
- * Skips the actual NN inference — useful when the camera is out of focus
- * or the lens is dirty, so we want to verify the post-detect chain in
- * isolation. Holds the box-buffer mutex like the real path. */
-/* SoW §4.2 bits 1/2 — emit motion start / motion stop on the edges of
- * "is anything in the scene".
- *
- * Shared by the inference loop and `detect simulate`, because a simulated
- * scene has to produce the same events as a real one: the bench has no way
- * to walk people in front of the lens, so simulate is how these get tested,
- * and edges that only the live path emitted would be untestable there.
- *
- * Caller must have checked the report action bit. Latches on
- * `_nn_motion_active`, so each transition fires exactly once.
- */
-static void _nn_motion_edges(uint32_t count)
-{
-  if ((count > 0U) && !_nn_motion_active)
-  {
-    _nn_motion_active = true;
-    shell_notify_emit(NOTIFY_RSN_MOTION_START, count, true);
-  }
-  else if ((count == 0U) && _nn_motion_active)
-  {
-    _nn_motion_active = false;
-    shell_notify_emit(NOTIFY_RSN_MOTION_STOP, 0U, true);
-  }
-}
-
 /* SoW §4.2 bits 4/5 — report people and vehicles under their own reason
  * codes.
  *
@@ -570,15 +535,21 @@ static void _nn_report_classes(uint32_t people, uint32_t vehicles)
   if ((_nn_det_mask & 0x01U) && (people != _nn_people_rep))
   {
     _nn_people_rep = people;
-    shell_notify_emit(NOTIFY_RSN_PEOPLE, people, false);
+    shell_notify_emit(NOTIFY_RSN_PEOPLE, people);
   }
   if ((_nn_det_mask & 0x02U) && (vehicles != _nn_vehicles_rep))
   {
     _nn_vehicles_rep = vehicles;
-    shell_notify_emit(NOTIFY_RSN_VEHICLE, vehicles, false);
+    shell_notify_emit(NOTIFY_RSN_VEHICLE, vehicles);
   }
 }
 
+/* SoW test-injection (firmware-side simulate). Sets a synthetic box count
+ * + a synthetic person-class box, runs the same on-edge side-effects the
+ * inference loop would: snapshot trigger + notification + trace log.
+ * Skips the actual NN inference — useful when the camera is out of focus
+ * or the lens is dirty, so we want to verify the post-detect chain in
+ * isolation. Holds the box-buffer mutex like the real path. */
 void nn_task_simulate_detection(uint32_t boxes)
 {
   nn_task_simulate_detection_class(boxes, 0);   /* COCO person */
@@ -638,14 +609,6 @@ void nn_task_simulate_detection_class(uint32_t boxes, int32_t class_index)
   }
   _nn_people_rep   = _nn_people_now;
   _nn_vehicles_rep = _nn_vehicles_now;
-
-  /* The motion edge for the asserted scene. Emitted here rather than by the
-   * shell command so that the latch stays owned by one place: the live loop
-   * then reports the scene emptying as a real motion-stop. */
-  if (_nn_action_mask & 0x02U)
-  {
-    _nn_motion_edges(boxes);
-  }
 }
 
 /* COCO-class -> SoW class mapping (proposal W5/W6).
@@ -862,18 +825,11 @@ static void _nn_task_run(uint32_t args)
          * detection and a real one are indistinguishable downstream. */
         if (_nn_action_mask & 0x02U)
         {
-          /* §4.2 bits 1 and 2 — motion start / motion stop. The scene going
-           * from empty to occupied and back is the only motion signal this
-           * product has (no PIR is fitted), and neither edge was ever
-           * emitted: `notify enable` accepted 0x02/0x04 and nothing on the
-           * device produced them (ScopusQA #5).
-           *
-           * Edge-triggered off the debounced count, so a scene hovering at
-           * the detection threshold cannot chatter start/stop at frame rate.
-           * Sent before the people-detected event so a receiver reading the
-           * pair in order sees "motion began, and here is what was in it".
-           * mtn=1 marks both as motion-derived. */
-          _nn_motion_edges(_nn_stable_boxes);
+          /* People (0x10) and vehicles (0x20) only. The §4.2 motion bits are
+           * NOT raised here: motion in this product means the *unit* being
+           * moved, measured by the inertial sensor (see motion_sensor.c), and
+           * wiring them to the scene's box count reported "the box is being
+           * carried" every time somebody walked past a stationary camera. */
           _nn_report_classes(_nn_people_now, _nn_vehicles_now);
         }
         LINFO(TRACE_NN, "count now %lu object(s)",

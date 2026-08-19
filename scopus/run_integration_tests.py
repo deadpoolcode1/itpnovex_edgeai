@@ -879,6 +879,131 @@ def g_j_tunnel_fidelity(s, ctx):
     cam.send(f'mdm AT+SDVRNTFHOST="{HOST_IP}"', "ok", 10.0)
 
 
+def _motion_cfg(cam):
+    """Read back what `motion query` says, as (sensitivity, timeout, threshold)."""
+    r = cam.send("motion query", "motion query ok", 6.0)
+    sens = re.search(r"sensitivity=(\d+)", r)
+    tmo  = re.search(r"timeout=(\d+)", r)
+    ths  = re.search(r"threshold (\d+) mg", r)
+    return (int(sens.group(1)) if sens else None,
+            int(tmo.group(1)) if tmo else None,
+            int(ths.group(1)) if ths else None,
+            r)
+
+
+def g_k_motion_sensor(s, ctx):
+    """SoW §3.5/§4.5 + §4.2 bits 1/2 — the BOX being moved.
+
+    Motion here is the unit itself being picked up, knocked or tilted, read
+    from the LSM6DSO32 on the sensors I2C. It is deliberately not the scene
+    changing: an earlier build raised these two events off the detector's box
+    count, so a person walking past a bolted-down camera reported that the
+    camera was being carried away. K7 is the guard against that coming back.
+
+    The stimulus is the sensor's own electrostatic self-test, which deflects
+    the proof mass for real — the only way a bench with nobody near it can
+    make the part produce motion, and it travels the whole path (filter,
+    threshold, state machine, notification) exactly as a shove would.
+    """
+    s.group("K — motion sensor: the unit being moved (§3.5, §4.5, §4.2 b1/b2)")
+    cam, mat = ctx["cam"], ctx["mat"]
+
+    sens0, tmo0, _, raw = _motion_cfg(cam)
+    present = "LSM6DSO32" in raw
+    s.ok("K1", "the inertial sensor is fitted and answering", present,
+         note=_one(raw, 90),
+         failnote="motion query reports no sensor: check the sensors I2C "
+                  "(the ToF shares it) and WHO_AM_I at 0xD6")
+    if not present:
+        for t, d in [("K2", "the sensor reads gravity"),
+                     ("K3", "sensitivity sets the detection threshold"),
+                     ("K4", "the sensor self-test moves the proof mass"),
+                     ("K5", "movement raises a motion-start event at the server"),
+                     ("K6", "stillness raises a motion-stop event at the server"),
+                     ("K7", "a detection does NOT raise a motion event")]:
+            s.skip(t, d, "no inertial sensor on this board")
+        return
+
+    r = cam.send("motion read", "motion read ok", 6.0)
+    m = re.search(r"x=(-?\d+) y=(-?\d+) z=(-?\d+)", r)
+    mag = None
+    if m:
+        x, y, z = (int(v) for v in m.groups())
+        mag = int((x * x + y * y + z * z) ** 0.5)
+    # A sensor that is fitted, powered and configured reads 1 g at rest. This
+    # is the cheapest proof that the part is not just answering WHO_AM_I from
+    # a half-initialised state.
+    s.ok("K2", "the sensor reads gravity at rest (≈1000 mg)",
+         mag is not None and 700 <= mag <= 1300,
+         note=f"|a| = {mag} mg" if mag else _one(r, 90))
+
+    cam.send("motion sense 100 30", "motion sense ok", 6.0)
+    _, _, ths_hi, _ = _motion_cfg(cam)
+    cam.send("motion sense 0 30", "motion sense ok", 6.0)
+    _, _, ths_lo, _ = _motion_cfg(cam)
+    s.ok("K3", "sensitivity sets the detection threshold, and inverts",
+         (ths_hi is not None and ths_lo is not None and ths_hi < ths_lo
+          and ths_hi <= 30 and ths_lo >= 300),
+         note=f"sensitivity 100 → {ths_hi} mg, 0 → {ths_lo} mg",
+         failnote="a higher sensitivity must mean a lower threshold")
+
+    watch = UdpWatch(NTF_PORT)
+    try:
+        mat.send(f'AT+SDVRNTFHOST="{HOST_IP}"', 4.0)
+        mat.send(f"AT+SDVRNTFPORT={NTF_PORT}", 4.0)
+        cam.send("notify enable 0xff", "notify enable ok", 4.0)
+        # A short no-motion timeout so the stop edge lands inside the suite;
+        # the persisted value is put back at the end of the group.
+        cam.send("motion sense 50 5", "motion sense ok", 6.0)
+        watch.drain()
+
+        r = cam.send("motion selftest", "motion selftest", 8.0)
+        shift = re.search(r"shift (-?\d+) mg", r)
+        s.ok("K4", "the sensor self-test moves the proof mass",
+             "sensor responded" in r,
+             note=f"shift {shift.group(1)} mg" if shift else _one(r, 90),
+             failnote="the part answers on I2C but its mass does not move — "
+                      "a dead or unpowered MEMS element")
+
+        dg = watch.wait(8.0)
+        body = dg.decode(errors="replace") if dg else ""
+        s.ok("K5", "movement raises a motion-start event at the server (rsn=2)",
+             '"rsn":2' in body and '"mtn":1' in body,
+             note=_one(body, 100),
+             failnote="no motion-start datagram — check `notify enable` has "
+                      "bit 1 set (the mask is enforced)")
+
+        # rsd on the stop edge is how long the episode lasted, in seconds.
+        dg = watch.wait(20.0)
+        body = dg.decode(errors="replace") if dg else ""
+        s.ok("K6", "stillness raises a motion-stop event at the server (rsn=4)",
+             '"rsn":4' in body and '"mtn":0' in body,
+             note=_one(body, 100),
+             failnote="motion never ended: the no-motion timeout did not "
+                      "expire, or the resting attitude was never re-learnt")
+
+        # The regression guard for what this group exists to separate.
+        watch.drain()
+        cam.send("detect simulate 3", "detect simulate ok", 6.0)
+        dg = watch.wait(6.0)
+        body = dg.decode(errors="replace") if dg else ""
+        got_people = '"rsn":16' in body
+        motion_dg = None
+        if got_people:
+            motion_dg = watch.wait(3.0)
+        extra = motion_dg.decode(errors="replace") if motion_dg else ""
+        s.ok("K7", "a detection reports objects only, never motion (rsn=16, no 2/4)",
+             got_people and '"rsn":2' not in extra and '"rsn":4' not in extra,
+             note=_one(body, 100),
+             failnote="the detector is raising §4.2 motion events again — "
+                      "motion means the box moving, not the scene changing")
+        cam.send("detect simulate 0", "detect simulate ok", 6.0)
+    finally:
+        watch.close()
+        if sens0 is not None and tmo0 is not None:
+            cam.send(f"motion sense {sens0} {tmo0}", "motion sense ok", 6.0)
+
+
 def g_g_state_hygiene(s, ctx):
     """Things that used to wedge the system until a restart."""
     s.group("G — state hygiene / repeatability")
@@ -963,7 +1088,8 @@ def main():
         for fn in (g_a_prereq, g_b_detection, g_c_camera_notify,
                    g_d_tunnel, g_e_full_chain, g_f_photo_upload,
                    g_g_state_hygiene, g_h_ntfa_protocol,
-                   g_i_link_recovery, g_j_tunnel_fidelity):
+                   g_i_link_recovery, g_j_tunnel_fidelity,
+                   g_k_motion_sensor):
             try:
                 fn(s, ctx)
             except Exception as e:

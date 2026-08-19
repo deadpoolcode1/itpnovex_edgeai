@@ -58,7 +58,10 @@ wait
 | `camera brightness [value]` | Brightness `0..100`, **where the sensor driver implements it**. The IMX335 does not, and answers `Not supported on IMX335!` — use `camera aec`, `camera exposure` or `camera gain` to change image brightness on that sensor. |
 | `camera status` | Print every camera setting at once — sensor, flip, AEC, AWB, gain, exposure, brightness. |
 | `irled on\|off\|query` | IR LED state. (PoC: drives LED_USER3 until real GPIO wired.) |
-| `motion sense <0..100> <timeout_s>` / `motion query` | Motion sensitivity + no-motion timeout. Persists. |
+| `motion sense <0..100> <timeout_s>` / `motion query` | Movement of the **unit itself**, from the on-board LSM6DSO32 IMU: how hard the box has to be disturbed (100 = lightest touch ≈ 15 mg, 0 ≈ 500 mg) and how long it must then be still before motion is declared over. Both persist and take effect at once. Raises the §4.2 motion-start / motion-stop notifications. |
+| `motion read` | The acceleration vector in mg — at rest one axis reads ≈ ±1000, which is the cheapest proof the sensor is alive. |
+| `motion selftest` | Run the sensor's electrostatic self-test. It deflects the proof mass for real, so it is a genuine motion stimulus with nobody near the box — the way a remote bench exercises motion start/stop end to end. |
+| `motion simulate 0\|1` | Assert the motion state without the sensor (transport test only). |
 | `img size H W` | Photo dimensions, persists. |
 | `img quality <1..100>` | JPEG quality, persists. |
 | `img color YCBCR\|RGB\|CMYK` | Color space, persists. |

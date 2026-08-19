@@ -139,7 +139,8 @@ Text-line shell on the CDC ACM endpoint. Each command terminated with `\n` (or `
 - `img size <H> <W>|quality 1..100|color YCBCR|RGB|CMYK|chroma 0|1|query`
 - `rtc set DDMMYYYYHHMMSS|rtc`
 - `irled on|off|query`
-- `motion sense <0..100> <timeout_s>|motion query`
+- `motion sense <0..100> <timeout_s>|query|read|selftest|simulate 0|1` (the board's
+  own movement, from the LSM6DSO32 IMU — not objects moving in the frame)
 - `sd query|ls|format CONFIRM`
 - `frame upload|load|run|clear|query` (NN test-frame injection)
 - `update app|model` (CDC self-update, see §3.4)
@@ -203,10 +204,11 @@ When the kit fires a detect event (or any other notification-capable event), `sh
 |---|---|
 | `ser` | Kit's MCU UID (HAL_GetUIDw0) |
 | `num` | Per-boot rolling notification number |
-| `rsn` | Reason bitmask: 1 NetReg, 2 MotStart, 4 MotStop, 8 Periodic, 16 People, 32 Vehicle, 64 PhotoEvent |
-| `rsd` | Reason-specific data (e.g. for People: detected count; for PhotoEvent: 1=SD, 2=upload) |
+| `rsn` | Reason bitmask: 1 NetReg, 2 MotStart, 4 MotStop, 8 Periodic, 16 People, 32 Vehicle, 64 PhotoEvent. MotStart/MotStop are the **box being moved** (inertial sensor); People/Vehicle are the scene |
+| `rsd` | Reason-specific data (People: detected count; MotStart: the deviation that opened the episode, in mg; MotStop: how long it lasted, in seconds; PhotoEvent: 1=SD, 2=upload) |
 | `tim` | RTC timestamp `YYYYMMDDHHMMSS` |
-| `mtn`/`mod`/`bat`/`vol` | Motion / mode / battery / voltage placeholders |
+| `mtn` | Motion state of the **unit** when the notification was composed, read from the inertial sensor (`1` while the box is being moved). Carried on every notification, not only on motion events |
+| `mod`/`bat`/`vol` | Mode / battery / voltage placeholders |
 
 Emitted on:
 - the CDC shell as `+SDVRNTF: { … }\r\n`

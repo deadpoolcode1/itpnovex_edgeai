@@ -4,6 +4,111 @@ Last updated: 2026-08-19. Everything below was measured on the bench, not inferr
 
 ---
 
+## 2026-08-19 (later) — motion means the BOX, not the scene
+
+Reuven, by email the same afternoon:
+
+> the motion detection refers to motion sensor that exists on the camera to
+> identify movements of the entire board (box). With sensitivity and timeout
+> for the "no motion" condition after which motion stop notification should be
+> reported (if enabled). At this phase, motion tracking of people or vehicles
+> within the frame is not required.
+
+That is not what shipped this morning. Closing ScopusQA #5 gave §4.2 bits 1 and
+2 a producer for the first time, and the producer was the detector's debounced
+object count crossing zero — so a person walking past a bolted-down camera
+reported that the camera was being carried away. The §4.5 wording ("motion
+sensor, set sensitivity and timeout without motion") was read as a description
+of the detector, and it is not: **the board has an inertial sensor**, an
+LSM6DSO32 6-DOF IMU on the sensors I2C, listed in the SIANA datasheet and
+already probed by the BSP's own board self-test at 0xD7. `motion sense` had
+been storage-only since M1 (W16 "done early"), so nothing ever read the part.
+
+### What the camera does now (build `Aug 19 2026 16:55:13`)
+
+New `motion_sensor.c` owns the sensor and the state machine; `nn_task.c` no
+longer emits 0x02/0x04 at all and reports only people (0x10) and vehicles
+(0x20).
+
+The detector has **two legs**, because one alone misses a real class of
+movement:
+
+- the LSM6DSO32's own wake-up function — slope filter, threshold in hardware,
+  latched (`TAP_CFG0` LIR + INT_CLR_ON_READ) so a knock that starts and ends
+  between two polls is still there when we look;
+- a software comparison of the acceleration vector against its slow resting
+  average, which catches a lift or a tilt that a slope filter is deliberately
+  blind to. The reference follows the box while it is still (EMA, ~3 s) and is
+  **frozen during motion** — tracking then would chase the signal being
+  measured — and is re-learnt on the stop edge, so a unit left at a new angle
+  settles instead of reporting for ever.
+
+`SLOPE_FDS` stays 0 on purpose: routing the HPF into the wake-up path would
+also high-pass the *output* registers, and `motion read` showing real gravity
+is the cheapest proof the part is alive and mounted the way we think.
+
+Sensitivity maps linearly onto the sensor's own threshold units, inverted, with
+`WAKE_UP_DUR.WAKE_THS_W` set so one LSB is FS/256 = 15.6 mg rather than
+FS/64 = 62.5 mg — without that the *gentlest* setting the hardware can express
+is already a firm knock. Measured: 100 → 15 mg, 50 → 265 mg, 0 → 500 mg,
+against a resting noise floor of **2-5 mg** (90 s at maximum sensitivity, zero
+false events).
+
+`rsd` now carries something: on start, the deviation that opened the episode in
+mg; on stop, how long the episode lasted in seconds.
+
+**`mtn` is no longer a parameter.** It was passed in by each caller and meant
+"this event came from the motion path"; §6 says it is the motion state, so it
+is now read from the sensor when the body is composed and describes the box on
+*every* notification. `shell_notify_emit(rsn, rsd)` lost its third argument.
+
+### The bench cannot be shoved, so the sensor shoves itself
+
+`motion selftest` runs the part's electrostatic self-test, which deflects the
+proof mass for real. The step travels the whole path — filter, threshold, state
+machine, notification — so it is a genuine end-to-end stimulus with nobody near
+the box. Measured shift 681-687 mg against a 265 mg threshold. There is also
+`motion simulate 0|1`, which asserts the state and skips the sensor; it proves
+the transport only, and the manual says so.
+
+### Measured, end to end, on the cable
+
+```
+motion read                → x=986 y=-77 z=80 mg          (gravity, |a|=991)
+motion selftest            → sensor responded (shift 681 mg)
+  server: {"rsn":2,"rsd":688,"tim":"20260819170215","mtn":1,…}
+  15 s later (timeout 15): {"rsn":4,"rsd":15,"mtn":0,…}
+detect simulate 3          → {"rsn":16,"rsd":3,"mtn":0,…}   and nothing else
+notify trigger 8 while simulated-moving → {"rsn":8,"mtn":1,…}
+motion sense 100/50/0      → threshold 15 / 265 / 500 mg
+reboot                     → sensor found and armed from the persisted values
+```
+
+Two traps worth recording:
+
+- **`notify enable` had 0x30 on the unit**, so the first end-to-end attempt
+  produced `start=1 stop=1` on the camera and nothing at the server. That is
+  the mask working as intended (enforced since this morning), and it looks
+  exactly like a dead transport. Check `notify query` before suspecting the
+  link.
+- The suite's group D (`10 consecutive tunnelled commands`) scored 9/10 on one
+  run and 10/10 on the next two. That is the known CN805 flakiness this test
+  exists to watch, not a regression from this work.
+
+### Suite
+
+`run_integration_tests.py` gained **group K** (7 tests): sensor present, reads
+gravity, sensitivity inverts and bounds the threshold, self-test moves the
+mass, movement raises `rsn=2` at the server, stillness raises `rsn=4`, and — the
+guard against this whole confusion coming back — a detection raises `rsn=16`
+and **neither** motion code. Clean run: **64 total, 62 PASS / 0 FAIL / 1 GAP /
+1 SKIP**. The GAP is still C7 (a real NN detection notifying, refused for
+injected frames by design) and the SKIP is still the absent SD card.
+
+Tester manual: new section 20 (Steps M1-M3).
+
+---
+
 ## 2026-08-19 — the bench came back dead after a power-cycle, and the five QA issues
 
 ### The power-cycle failure Omer reported

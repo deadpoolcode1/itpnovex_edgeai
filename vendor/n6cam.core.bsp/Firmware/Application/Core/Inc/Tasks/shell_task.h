@@ -103,9 +103,13 @@ int32_t shell_stream_set(t_stream *stream);
  * @param rsn  Reason code (SoW §4.2 bit table: 0x10 people, 0x20 vehicles,
  *             0x40 photo event, ...).
  * @param rsd  Reason detail — for a detection, the number of objects.
- * @param mtn  Motion flag.
+ *
+ * @note The §6 `mtn` field is not a parameter: it is the unit's own motion
+ *       state, read from the inertial sensor when the body is composed, and
+ *       it therefore describes the box on every notification rather than the
+ *       event that raised this one.
  */
-void shell_notify_emit(uint32_t rsn, uint32_t rsd, bool mtn);
+void shell_notify_emit(uint32_t rsn, uint32_t rsd);
 
 /**
  * @brief Latch a SoW §4.2 bit0 network-registration notification.

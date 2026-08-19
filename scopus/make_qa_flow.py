@@ -375,7 +375,43 @@ def build():
               "counts. Events that follow you within a second of moving mean "
               "the debounce did not take.")
 
-    doc.add_heading("Step 9 — Finish", level=2)
+    doc.add_heading("Step 9 — The box being moved", level=2)
+    doc.add_paragraph(
+        "Everything up to here is about what the camera sees. This step is "
+        "about the unit itself being moved — picked up, knocked or tilted — "
+        "which the board's own movement sensor reports, separately from "
+        "anything in the picture.")
+    doc.add_paragraph(
+        "Step 4 enabled people and vehicles only (0x30). Turn the two motion "
+        "events on as well, and shorten the wait before a stop is reported:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "notify enable 0x3f"')
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion sense 50 10"')
+    doc.add_paragraph(
+        "Then move the box: pick it up, put it down, or tap it firmly. If "
+        "nobody is next to the unit, run this instead — the sensor pushes "
+        "its own measuring element, which is a real movement:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion selftest"')
+    expected(doc, "In Window A, without you typing anything further:")
+    code(doc, "[17:02:17] NOTIFICATION   from 192.168.2.2  ser=4194336 "
+              "num=0 rsn=2 rsd=688\n"
+              "[17:02:33] NOTIFICATION   from 192.168.2.2  ser=4194336 "
+              "num=1 rsn=4 rsd=15")
+    table(doc, ["Field", "Meaning"],
+          [["rsn=2", "Motion start — the unit began moving."],
+           ["rsn=4", "Motion stop — it has been still for the timeout you "
+                     "set (10 seconds above)."],
+           ["rsd", "On start, how big the disturbance was, in mg. On stop, "
+                   "how long the movement lasted, in seconds."],
+           ["mtn", "1 while the box is moving. It appears on every "
+                   "notification, so an event sent during a move says so."]])
+    note(doc, "Walking in front of the camera must NOT produce rsn=2 or "
+              "rsn=4. If it does, report it: motion means the box moving, "
+              "not the scene changing.")
+    doc.add_paragraph("Put the settings back when you are done:")
+    cmd(doc, f'{CD}python3 scopus/cam.py "motion sense 50 30"')
+    cmd(doc, f'{CD}python3 scopus/cam.py "notify enable 0x30"')
+
+    doc.add_heading("Step 10 — Finish", level=2)
     doc.add_paragraph("Press Ctrl-C in Window A. Then, if you are done "
                       "testing, stop the detector:")
     cmd(doc, f'{CD}python3 scopus/cam.py "detect stop"')
@@ -392,7 +428,10 @@ def build():
            ["6", "A real person in front of the camera produces the same two "
                  "events and a photo, with rsd matching the number of "
                  "people."],
-           ["7", "Every event has a different num. The same num twice is a "
+           ["7", "Moving the box (or motion selftest) produces rsn=2 and "
+                 "then rsn=4, and walking in front of the camera produces "
+                 "neither."],
+           ["8", "Every event has a different num. The same num twice is a "
                  "failure — report it."]],
           widths=[0.4, 5.9])
 
@@ -686,6 +725,11 @@ def build():
          f'{CD}python3 scopus/cam.py "detect start"\n'
          f'{CD}python3 scopus/cam.py "detect simulate 3" --wait 20\n'
          f'{CD}python3 scopus/cam.py "photo upload" --wait 40\n'
+         f'{CD}python3 scopus/cam.py "notify enable 0x3f"\n'
+         f'{CD}python3 scopus/cam.py "motion sense 50 10"\n'
+         f'{CD}python3 scopus/cam.py "motion selftest"      '
+         f'# or move the box by hand\n'
+         f'{CD}python3 scopus/cam.py "motion sense 50 30"\n'
          f"ls -lt ~/scopus-received | head -3")
     doc.add_paragraph()
     doc.add_paragraph("Part 2 — device side, once, on the bench PC:").bold = True

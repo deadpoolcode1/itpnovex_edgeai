@@ -80,6 +80,7 @@ Env: `SCOPUS_IMAGES` (default `edgeai/images`), `HOST_IP`, `NTF_PORT`,
 | H NTFA payload transport | the §6 JSON survives the AT channel byte-exact — see below — and a retry is idempotent |
 | I CN805 link recovery | a deliberately wedged link is recovered without rebooting the camera |
 | J `mdm` pass-through | a quoted AT parameter reaches the modem intact |
+| K motion sensor | the LSM6DSO32 reads gravity, its self-test moves the mass, and that produces motion start/stop at the server — and a detection produces neither |
 
 ### Why group H exists
 
@@ -279,7 +280,7 @@ Camera shell commands — the device's own list, `cam.py commands` prints it:
 | `commands` | list every command with its parameters (§3.7) |
 | `echo` | `on \| off \| query` |
 | `irled` | `on \| off \| query` |
-| `motion` | `sense <0..100> <timeout_s>` \| `query` |
+| `motion` | `sense <0..100> <timeout_s>` \| `query` \| `read` \| `selftest` \| `simulate 0\|1` — the **box** being moved, from the LSM6DSO32 inertial sensor (§3.5, §4.5) |
 | `img` | `size H W` \| `quality 1..100` \| `color YCBCR\|RGB\|CMYK` \| `chroma 0\|1` \| `query` |
 | `detect` | `start` \| `stop` \| `profile <det_msk> <act_msk>` \| `profile query` \| `debounce <ms>` \| `debounce query` \| `stats` \| `simulate [N]` |
 | `notify` | `enable <mask>` \| `disable` \| `trigger <code>` \| `period <s>` \| `query` |
@@ -321,20 +322,23 @@ The three masks, since they are the ones testers get wrong:
   | Bit | Event | Produced by |
   | --- | ----- | ----------- |
   | `0x01` | Network registration | the modem's `+SDVRNET: UP`, and its `+SDVRRDY` start-up banner (the "on power up / reset" half of §4.2) |
-  | `0x02` | Motion start | the debounced detection count going from 0 to non-zero |
-  | `0x04` | Motion stop | the same count returning to 0 |
+  | `0x02` | Motion start | the **unit** being moved — the inertial sensor's deviation from its resting attitude crossing the `motion sense` threshold |
+  | `0x04` | Motion stop | that deviation staying under the threshold for the `motion sense` no-motion timeout |
   | `0x08` | Periodic | `notify period <s>`; `0` (the default) switches it off |
   | `0x10` | People detected | the NN's stable person count |
   | `0x20` | Vehicle detected | the NN's stable vehicle count. The detector is person+vehicle (`pv` model, 80 COCO classes); `_class_passes_mask` maps COCO 1-8 (bicycle, car, motorcycle, bus, truck, and the airplane/train/boat bucket) onto this bit. Needs `detect profile` bit1 set. |
 
-  Motion start/stop are edge-triggered off the *debounced* count, so a scene
-  hovering at the detection threshold cannot chatter them at frame rate, and
-  they are emitted by `detect simulate` as well as by live inference — the
-  bench has no way to walk people in front of the lens, so an edge only the
-  live path produced would be untestable there.
+  **Motion means the box, not the scene.** Until 2026-08-19 bits 1 and 2 were
+  raised off the detector's debounced object count, so a person walking past a
+  bolted-down camera reported that the camera was being carried away. §3.5 and
+  §4.5 describe a *motion sensor*, and the board carries one — an LSM6DSO32
+  6-DOF IMU on the sensors I2C. The two bits now come from it, and objects
+  moving in the field of view are reported under `0x10` / `0x20` only.
+  (Confirmed by ITP, 2026-08-19: "the motion detection refers to motion sensor
+  that exists on the camera to identify movements of the entire board (box)".)
 
-  `detect simulate <N> [people|vehicle]` picks the class, for the same reason:
-  there is no car to point the lens at, and `0x20` needs exercising too.
+  `detect simulate <N> [people|vehicle]` picks the class, so the bench can
+  exercise `0x20`: there is no car to point the lens at.
 
 ```
 detect profile 0x03 0x02      # detect people AND vehicles, report them
@@ -453,7 +457,7 @@ python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
 | 2 N6 detection | §3.1, §4.2 | detect start/stop, profile set/query (people/vehicles, save-SD) |
 | 3 N6 notifications | §3.1, §4.2, §6 | notify enable/period/query, trigger → +SDVRNTF JSON, disable |
 | 4 N6 photo settings | §3.4, §4.4 | img quality/color/chroma set + query round-trip |
-| 5 N6 sensors | §3.5, §4.5 | irled on/off/query, motion sense/query persistence |
+| 5 N6 sensors | §3.5, §4.5 | irled on/off/query, motion sense/query persistence (the sensor itself is group K of the integration suite) |
 | 6 N6 camera | §4.3 | awb / exposure / gain passthrough |
 | 7 N6 → SD pipeline | §3.2, §7 | sd query/ls, `photo savesd` → `serial_DDMMYYYY_HHMMSS.rdy` appears |
 | 8 Modem SDVR control | §5.2 | AT, SDVRPING, server host/port set→SRVGET round-trip |
