@@ -247,26 +247,45 @@ static uint32_t          _nn_prev_boxes    = 0U;
  * imperfectly. The count is therefore hysteretic rather than debounced, and
  * deliberately asymmetric:
  *
- *   - **Rising** is believed quickly: a higher count need only be seen
- *     NN_RISE_CONFIRM_FRAMES times (not consecutively — the frames in
- *     between are the dropouts) before it is adopted. One frame alone is
- *     not enough, which is what keeps a single spurious box out.
+ *   - **Rising** is judged over one whole window, on how many of the looks
+ *     taken in it agreed: the higher count must appear in at least
+ *     NN_RISE_CONFIRM_PCT of the frames seen since the evidence opened,
+ *     and at least NN_RISE_CONFIRM_FRAMES times so that a very short
+ *     window still works. Not consecutively — the frames in between are
+ *     the dropouts.
  *   - **Falling** must be earned: the count is adopted downward only after
  *     it has stayed below the believed value for the whole window without
  *     once touching it, and it then falls to the *highest* value seen
  *     during that window rather than the last one. A person who blinks out
  *     for three frames does not empty the room.
  *
- * So 3 -> 4 reports within ~200 ms, 4 -> 3 -> 4 -> 3 reports nothing, and
+ * So 3 -> 4 reports one window later, 4 -> 3 -> 4 -> 3 reports nothing, and
  * everybody leaving reports 0 one window later. The scheme always
  * converges: the rise path cannot be starved by oscillation, and the fall
  * path is reset only by the count actually returning to what is believed.
  *
+ * **Why the rise is a fraction and not a count (ScopusQA #8).** Two frames
+ * was the first rule, on the reasoning that one spurious box is a blip and
+ * two agreeing looks are a scene. Measured against an empty bench, that is
+ * simply untrue: the detector invents a person for one or two frames about
+ * five times a minute, and any pair of those inside one window confirmed a
+ * rise. A camera pointed at an empty room therefore reported somebody
+ * arriving and leaving every few seconds — and with action bit2 set it
+ * uploaded a photograph of the empty room each time.
+ *
+ * No count can separate the two cases, because the flicker this scheme
+ * exists to tolerate is also non-consecutive. Only the *rate* differs, and
+ * it differs by an order of magnitude: four people with one flickering puts
+ * the higher count in about half the frames of a window, while an invented
+ * box reaches 5-8%. NN_RISE_CONFIRM_PCT sits between the two.
+ *
  * The window is measured in time rather than frames on purpose. Frame rate
  * varies with load, so "N frames" is a different amount of steadiness at
  * 30 Hz than at 12, and it is steadiness in seconds that the customer's
- * server cares about. The rise confirmation is in frames because it is
- * about how many looks at the scene agree, not how long they took.
+ * server cares about. The rise confirmation is a fraction of the frames in
+ * that window because it is about how many looks at the scene agree, not
+ * how long they took — and a fraction, unlike a count, means the same
+ * thing at 30 Hz as it does at 12.
  *
  * Every change is reported in both directions — 3 -> 4 and 4 -> 3 alike —
  * including the change to zero, which is how a server learns the area is
@@ -278,7 +297,8 @@ static uint32_t          _nn_prev_boxes    = 0U;
  * change, which is the original behaviour and the reason for the storm; it
  * is kept because it is the only way to see the raw detector from outside. */
 #define NN_DEBOUNCE_DEFAULT_MS    1000U
-#define NN_RISE_CONFIRM_FRAMES    2U
+#define NN_RISE_CONFIRM_FRAMES    2U    /* floor, for very short windows */
+#define NN_RISE_CONFIRM_PCT       40U   /* share of the window that must agree */
 
 static volatile uint32_t _nn_debounce_ms   = NN_DEBOUNCE_DEFAULT_MS;
 static uint32_t          _nn_stable_boxes  = 0U;  /* last believed count   */
@@ -290,10 +310,12 @@ static uint32_t          _nn_people_rep     = 0U;
 static uint32_t          _nn_vehicles_rep   = 0U;
 
 /* Rising: the highest count seen while collecting evidence, how many frames
- * have exceeded the believed value, and when that evidence started (it
- * expires a window later if it never reaches NN_RISE_CONFIRM_FRAMES). */
+ * have exceeded the believed value, how many frames have been looked at
+ * since, and when that evidence started. A window after it opens the
+ * evidence is judged and then cleared either way. */
 static uint32_t          _nn_rise_cand     = 0U;
 static uint32_t          _nn_rise_hits     = 0U;
+static uint32_t          _nn_rise_frames   = 0U;
 static uint32_t          _nn_rise_since    = 0U;
 
 /* Falling: when the count last agreed with the believed value, and the
@@ -323,6 +345,7 @@ static void _nn_count_reset(uint32_t to)
   _nn_stable_boxes = to;
   _nn_rise_cand    = 0U;
   _nn_rise_hits    = 0U;
+  _nn_rise_frames  = 0U;
   _nn_rise_since   = tx_time_get();
   _nn_fall_peak    = 0U;
   _nn_fall_since   = tx_time_get();
@@ -346,6 +369,13 @@ static bool _nn_count_update(uint32_t raw)
     return true;
   }
 
+  /* Every look taken while rise evidence is open counts towards the share
+   * that has to agree, whether this one agreed or not. */
+  if (_nn_rise_hits > 0U)
+  {
+    _nn_rise_frames++;
+  }
+
   if (raw > _nn_stable_boxes)
   {
     /* Evidence for a rise, carrying the highest count seen while it is
@@ -354,42 +384,54 @@ static bool _nn_count_update(uint32_t raw)
      * the frames that see 3 are the misses. */
     if (_nn_rise_hits == 0U)
     {
-      _nn_rise_cand  = raw;
-      _nn_rise_since = tx_time_get();
+      _nn_rise_cand   = raw;
+      _nn_rise_since  = tx_time_get();
+      _nn_rise_frames = 1U;
     }
     else if (raw > _nn_rise_cand)
     {
       _nn_rise_cand = raw;
     }
     _nn_rise_hits++;
-
-    if (_nn_rise_hits >= NN_RISE_CONFIRM_FRAMES)
-    {
-      _nn_count_reset(_nn_rise_cand);
-      return true;
-    }
-    return false;
+  }
+  else if (raw == _nn_stable_boxes)
+  {
+    /* The scene agrees with what we believe: abandon any fall in progress.
+     *
+     * Rise evidence is *not* thrown away here — that was the mistake in the
+     * first version. A scene alternating 3,4 against a believed 3 shows one
+     * frame of evidence, then a frame that agrees, then more evidence;
+     * clearing on the agreeing frame means the second hit never arrives and
+     * the rise is starved forever. It is judged on the clock instead. */
+    _nn_fall_peak  = 0U;
+    _nn_fall_since = tx_time_get();
   }
 
-  /* At or below the believed count. Rise evidence is *not* thrown away here
-   * — that was the mistake in the first version. A scene alternating 3,4
-   * against a believed 3 shows one frame of evidence, then a frame that
-   * agrees, then more evidence; clearing on the agreeing frame means the
-   * second hit never arrives and the rise is starved forever. Evidence
-   * expires on the clock instead: a lone spurious box is forgotten a window
-   * later, having never been joined. */
+  /* A window of looks has been taken since the evidence opened, so judge it.
+   * Enough of them agreed: adopt the highest count seen while it lasted.
+   * Too few: it was an invented box or two, and it is dropped rather than
+   * being allowed to accumulate towards a later window. */
   if ((_nn_rise_hits > 0U) &&
       ((int32_t)(tx_time_get() - _nn_rise_since) >= (int32_t)window))
   {
-    _nn_rise_hits = 0U;
-    _nn_rise_cand = 0U;
+    uint32_t cand   = _nn_rise_cand;
+    bool     enough = (_nn_rise_hits >= NN_RISE_CONFIRM_FRAMES) &&
+                      ((_nn_rise_hits * 100U) >=
+                       (_nn_rise_frames * NN_RISE_CONFIRM_PCT));
+
+    _nn_rise_hits   = 0U;
+    _nn_rise_cand   = 0U;
+    _nn_rise_frames = 0U;
+
+    if (enough && (cand > _nn_stable_boxes))
+    {
+      _nn_count_reset(cand);
+      return true;
+    }
   }
 
-  if (raw == _nn_stable_boxes)
+  if (raw >= _nn_stable_boxes)
   {
-    /* The scene agrees with what we believe: abandon any fall in progress. */
-    _nn_fall_peak  = 0U;
-    _nn_fall_since = tx_time_get();
     return false;
   }
 
@@ -444,7 +486,32 @@ void nn_task_detect_set(bool enable)
 }
 bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
-void nn_task_det_set(uint8_t mask)     { _nn_det_mask = mask; }
+
+/* Changing which classes count changes what the filtered box count *means*,
+ * so everything derived from the old mask has to go with it (ScopusQA #8).
+ *
+ * The per-class reported counts are the ones that bite. `_nn_people_rep` is
+ * only updated on a leg the mask has enabled, so people counted under
+ * det_msk=0x01 stayed "last reported: 2" all the way through a spell of
+ * vehicle-only, and the first frame after switching back to people either
+ * announced a change that had happened while nobody was listening or — worse
+ * — sat silent through a real arrival because the stale value happened to
+ * match. Switching modes is the one thing the tester does by hand between
+ * runs, which is why it was found by switching modes.
+ *
+ * Treated as a fresh start: whatever the new mask sees next is news. */
+void nn_task_det_set(uint8_t mask)
+{
+  if (mask == _nn_det_mask)
+  {
+    return;
+  }
+  _nn_det_mask = mask;
+  _nn_count_reset(0U);
+  _nn_prev_boxes = 0U;
+  _nn_people_now = _nn_vehicles_now = 0U;
+  _nn_people_rep = _nn_vehicles_rep = 0U;
+}
 
 /* Test-frame override: when non-NULL, the NN loop reads inference input
  * from this buffer instead of the camera's ancillary buffer. Useful for
