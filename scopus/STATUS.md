@@ -1,6 +1,116 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-19. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-20. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-20 — ScopusQA #8 and #9, both reproduced and both fixed
+
+Suite after the work: **64 total, 62 PASS / 0 FAIL / 1 GAP / 1 SKIP** — the
+same clean baseline as 2026-08-19. Camera build `Aug 20 2026 15:31:48`, modem
+app 1.13.0.
+
+### #9 — "unable to turn on the system after disconnecting and reconnecting"
+
+Diagnosed three times before this and never to the bottom, because the previous
+answer — an install left on probation and rolled back — fits the symptom and is
+not what happens. **Legato factory-resets itself on purpose**, and says so:
+
+```
+start.c CheckAndInstallCurrentSystem() 2024 |
+  A good system has entered a reboot loop -- reinstalling from golden.
+```
+
+`startSystem` counts boots in `/legato/bootCount` and the supervisor deletes
+that file only once the framework has been up for its boot-expire period (60 s
+here). Power-cycle the unit a few times with less than a minute in between —
+"disconnect it and reconnect it" — and the count is never cleared, so Legato
+concludes the system cannot boot and reinstalls the **factory** one. sdvrApp is
+installed on top of that system rather than being part of it, so it goes too.
+
+Reproduced live, twice: system 51 `system.md5=modified` with the app running,
+one reboot, and back as system 52 with the pristine factory md5 and no sdvr
+line in `app status`. **Marking the system good does not prevent it** — the
+guard fires on good systems by design, and the count and threshold are compiled
+into the `startSystem` binary, so there is nothing to tune.
+
+Two signals tell this apart from anything else, and both are cheap:
+`/legato/systems/current/info.properties` reads `system.md5=<the factory md5>`
+instead of `system.md5=modified`, and the index has gone *up*, so nothing looks
+rolled back. With no app to claim ttyHSL1 through `le_port`, getty keeps the
+port and every `AT+SDVR…` is answered by a login prompt.
+
+**The unit now repairs itself.** `/etc/init.d/scopus-sdvr-restore`
+(`V20_SDVR/sdvr-app/tools/scopus-sdvr-restore`) reinstalls the app from
+`/mnt/flash/scopus/sdvrApp.update`, marks it good, and stop/starts it once so
+`le_port` takes ttyHSL1 back off getty. Both live outside `/legato`, which is
+the only thing the factory reinstall replaces — `/etc` is an overlay whose
+upper layer is `/mnt/flash/ufs/etc`. Install or re-arm it with
+`python3 scopus/modem_restore.py`; `--check` reports without changing anything.
+
+Verified by priming `/legato/bootCount` and rebooting: the guard fired, the
+system came back factory as index 56, and the app was reinstalled, marked good
+and running **8 seconds later**, unaided.
+
+**The trap in arming it.** A drop-in link in `/etc/rcS.d` looks like the right
+answer and silently never runs. `/etc/init.d/rcS` expands
+`for s in /etc/rcS.d/S*` at the top of `run_S_scripts`, and the overlay that
+carries anything added to `/etc` is not mounted until `S07mount_unionfs` — one
+of the scripts already in that expanded list. The boot log proves it: it lists
+`S99enable_autosleep.sh` and `S99start_qti_le` and no drop-in of ours. The hook
+is therefore called from the end of `startlegato.sh`'s `start` case, which is
+in the read-only lower layer and so is in the list; editing it copies it up and
+the copy is what runs.
+
+**`preflight.py` was also lying about this.** `"+SDVRVER" in ver` matched the
+*echo* of the command it had just sent, so against a login prompt the check
+passed and the version was then read out of the login banner — Omer's log says
+`version [Etc/GMT-3].` and then fails the ">= 1.7.0" check against it. It now
+matches `+SDVRVER: <digits>`, and names a login prompt for what it is.
+
+### #8 — "object detection even when there is nothing in front of the camera"
+
+Real, reproduced in the first minute, and **not** specific to switching modes:
+people-only, empty scene, the camera reported a person arriving and leaving
+every ~3 s (`rsn=16 rsd=1` then `rsd=0`). With Omer's `action_msk=0x07` each one
+also uploads a photograph of the empty room.
+
+`detect debounce 0` shows the raw detector: the phantom is an isolated **one or
+two frame** blip, about five a minute. The rise gate needed
+`NN_RISE_CONFIRM_FRAMES = 2` hits inside the 1 s window, and any two blips in
+one window confirmed it — the comment claiming "one frame alone is not enough,
+which is what keeps a single spurious box out" was true and insufficient.
+
+No *count* can separate the two cases, because the 3,4,3,4 flicker the scheme
+exists to tolerate is also non-consecutive. Only the **rate** differs, by an
+order of magnitude: real flicker puts the higher count in ~half the frames of a
+window, an invented box in 5-8%. The rise is now judged over a whole window on
+the share of looks that agreed (`NN_RISE_CONFIRM_PCT = 40`), with the old count
+kept as a floor for very short windows. Cost: a real arrival reports one window
+later instead of ~200 ms, which is what `detect debounce` already promises.
+
+Measured after the change: **150 s of silence** on the same empty scene, where
+the old build produced 4 notifications in 60 s. Group B still detects 1/2/3/6
+people in the injected frames, so recall is untouched — the detector's
+confidence floor (`AI_OD_YOLOV8_PP_CONF_THRESHOLD = 0.30f`) was deliberately
+**not** retuned: that changes what counts as a detection and there is no
+labelled data on the bench to show it does no harm.
+
+Second, independent bug behind the same report: **`nn_task_det_set()` reset
+nothing.** `_nn_people_rep` is only updated on a leg the mask has enabled, so
+people counted under `det_msk=0x01` stayed "last reported: 2" through a spell of
+vehicle-only, and the first frame after switching back either announced a change
+nobody was listening for or sat silent through a real arrival because the stale
+value happened to match. A mask change is now a fresh start. Switching modes is
+the one thing a tester does by hand between runs, which is why switching modes
+is what found it.
+
+### Trap worth knowing: the `Build:` stamp lies on an incremental build
+
+`Build:` is `__DATE__ __TIME__` in **shell_task.c**. Change only `nn_task.c`,
+rebuild, flash, and `cam.py version` still reports the *old* timestamp while the
+new code is genuinely running — the file holding the stamp was not recompiled.
+`touch` shell_task.c before a build whose flash you intend to verify that way.
 
 ---
 

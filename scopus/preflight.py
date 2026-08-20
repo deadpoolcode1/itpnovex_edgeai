@@ -16,6 +16,7 @@ the product, not administering Linux.
 """
 import glob
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -146,14 +147,33 @@ def main() -> int:
         from devices import ModemAt
         at = ModemAt(modem_tty)
         ver = at.send("AT+SDVRVER", 4.0)
-        ok = "+SDVRVER" in ver
-        num = ver.split("+SDVRVER:")[-1].split()[0].strip() if ok else "-"
-        check("Modem SDVR app answers", ok, f"version {num}" if ok else "silent",
-              "The modem answered nothing. Either something else has the\n"
-              "port open (see the check above), or the SDVR application is\n"
-              "not running on the modem.")
-        if ok:
-            parts = [int(x) for x in num.split(".") if x.isdigit()]
+
+        # Match the reply, not the echo of what we just typed. `"+SDVRVER" in
+        # ver` was true either way, so when the app was gone and getty had
+        # ttyHSL1, our own command came back off the login prompt, this check
+        # passed, and the version was read out of the login banner: the bench
+        # reported `version [Etc/GMT-3].` and then failed the check below
+        # against it (ScopusQA #9). A missing app has to say so.
+        m = re.search(r"\+SDVRVER:\s*([0-9]+(?:\.[0-9]+)+)", ver)
+        num = m.group(1) if m else "-"
+        login = any(w in ver.lower() for w in ("login:", "password:",
+                                               "login incorrect"))
+        check("Modem SDVR app answers", bool(m),
+              f"version {num}" if m else
+              ("a login prompt, not the app" if login else "silent"),
+              ("The modem is answering with a Linux login prompt, which means\n"
+               "the SDVR application is not installed: Legato reinstalled its\n"
+               "factory system after the unit was power-cycled several times\n"
+               "in quick succession. Put it back with\n"
+               "  python3 scopus/modem_restore.py\n"
+               "which also stops it happening again."
+               if login else
+               "The modem answered nothing. Either something else has the\n"
+               "port open (see the check above), or the SDVR application is\n"
+               "not running on the modem. Check with\n"
+               "  python3 scopus/modem_restore.py --check"))
+        if m:
+            parts = [int(x) for x in num.split(".")]
             check("Modem firmware is new enough", parts >= [1, 7, 0], f"{num} >= 1.7.0",
                   "Older builds cannot carry the notification JSON intact.\n"
                   "Ask for a modem update before testing.")
