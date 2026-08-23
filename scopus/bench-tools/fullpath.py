@@ -21,7 +21,15 @@ CANDIDATES = ["astronaut.jpg", "camera.jpg", "1_person.jpg", "2_people.jpg",
               "3_people.jpg", "5_people.jpg"]
 FRAME_W = FRAME_H = 256
 UDP_PORT = 9999
-SSH = ["sshpass", "-p", "Ss123", "ssh", "-o", "StrictHostKeyChecking=no",
+# ScopusQA #11: the modem password is site data, not source. It comes from
+# scopus/bench.ini (untracked) or $MODEM_PASSWORD — see scopus/lib/settings.py.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))), "lib"))
+from settings import S as _S
+
+SSH = ["sshpass", "-p", _S.require("modem", "password"),
+       "ssh", "-o", "StrictHostKeyChecking=no",
        "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
        "root@192.168.2.2"]
 

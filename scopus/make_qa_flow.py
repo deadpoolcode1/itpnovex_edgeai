@@ -54,7 +54,13 @@ BENCH_USER = "user"
 # The customer's server. This address is the office public IP, and the
 # receiver, the broker and the certificates are already installed on it —
 # nothing in this document installs anything.
-SRV = "213.8.185.180"
+# ScopusQA #11: the receiver address is site data. It is still printed into
+# the generated document — the tester needs it — but it is read from
+# scopus/bench.ini (untracked) rather than committed here.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
+from settings import S as _S
+SRV = _S.require("server", "host")
 SRV_HTTP_PORT = 8991          # ITP's receiver: /upload and /notify
 MQTT_PORT = 5912              # mosquitto, TLS + client certificate
 CERTS = "/opt/sdvr-server/certs"

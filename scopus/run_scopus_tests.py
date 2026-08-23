@@ -32,7 +32,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "lib"))
 from lib.devices import N6Shell, ModemAt, ModemSsh           # noqa: E402
+from settings import S  # noqa: E402
 from lib.report import Suite, write_report, C_BOLD, C_GRN, C_RED, C_YEL, C_RST  # noqa: E402
 
 
@@ -44,6 +46,7 @@ class Ctx:
         self.ssh = None           # ModemSsh
         self.n6_mode = "absent"   # 'edgeai-app' | 'stock' | 'absent'
         self.modem_scopus = False # modem app has the new SoW v3 commands
+        self.mat_is_sdvr = True   # c.mat is the port sdvrApp registered on
         self.host_ip = os.environ.get("HOST_IP", "")
 
 
@@ -79,7 +82,9 @@ def g0_prereq(c: Ctx, s: Suite):
 
     # Modem AT / SDVR command channel -------------------------------------
     try:
-        c.mat = ModemAt(os.environ.get("SDVR_PORT") or None)
+        # See the note in run_integration_tests.py: SDVR commands fall back to
+        # the camera's `mdm` tunnel when this port is the module's own parser.
+        c.mat = ModemAt(os.environ.get("SDVR_PORT") or None, via_camera=c.n6)
         ok_at, _ = c.mat.expect("AT", "OK", 2.0)
         s.ok("T0.3", "Modem AT command channel responsive (§5.1)", ok_at,
              reason="no OK to bare AT", extra=c.mat.tty)
@@ -88,8 +93,7 @@ def g0_prereq(c: Ctx, s: Suite):
         s.ok("T0.3", "Modem AT command channel responsive (§5.1)", False, reason=str(e))
 
     # Modem SSH + SDVR app -------------------------------------------------
-    c.ssh = ModemSsh(os.environ.get("MODEM_IP", "192.168.2.2"),
-                     os.environ.get("MODEM_PASSWORD", "Ss123"))
+    c.ssh = ModemSsh(S.get("modem", "ip"), S.require("modem", "password"))
     reachable = c.ssh.reachable()
     s.ok("T0.4", "Modem reachable over SSH (side-effect channel)", reachable)
     if reachable:
@@ -106,6 +110,29 @@ def g0_prereq(c: Ctx, s: Suite):
                 s.modem_ver = mv.group(1)
             # READ-type query on a Scopus-only command — present ⇒ Scopus build.
             c.modem_scopus = "+SDVRNTFHOST:" in c.mat.send("AT+SDVRNTFHOST?", 3.0)
+
+            # Is this port the SDVR channel at all?
+            #
+            # sdvrApp registers its commands on ttyHSL1, which reaches this PC
+            # through the modem's FTDI adapter. The Sierra module ALSO exposes
+            # its own AT port over native USB (…-if03 → /dev/ttyUSB3), and the
+            # port autodetect falls back to it when the FTDI is unplugged. That
+            # port answers a bare `AT` with OK — so every liveness check passes
+            # — and answers every AT+SDVR… with ERROR, because those commands
+            # do not exist on it. Groups 8 and 10 then reported seven red
+            # FAILs for an unplugged cable, which reads exactly like a broken
+            # product and cost a session to tell apart on 2026-08-23.
+            #
+            # Two probes, and they have to disagree for this to fire: a bare AT
+            # must work (so the port is alive and it is not a serial problem)
+            # while a command that exists in every SDVR build since 1.0 must
+            # not. That combination has only one cause.
+            c.mat_is_sdvr = True
+            if not c.modem_scopus:
+                at_ok   = "OK" in c.mat.send("AT", 2.0)
+                sdvr_rx = c.mat.send("AT+SDVRPING=1", 3.0)
+                if at_ok and "+SDVRPING:" not in sdvr_rx:
+                    c.mat_is_sdvr = False
         # sdvr.log persists across boots — take the LATEST (last) entries so
         # we read the currently-running build, not an earlier boot's banner.
         log = c.ssh.sdvr_log(120)
@@ -118,6 +145,27 @@ def g0_prereq(c: Ctx, s: Suite):
             # The 4 new Scopus commands push the registered count to 33 (was 29).
             if not c.modem_scopus:
                 c.modem_scopus = int(cnts[-1]) >= 33
+
+        # Last resort: ask over the camera's AT tunnel.
+        #
+        # Both sources above can be silent at once and neither means the app is
+        # old. c.mat may be the module's own AT port (see the probe above), and
+        # /data/sdvr/sdvr.log is a ring buffer whose boot banner — the only
+        # place the version and the command count are printed — is pushed out
+        # by a busy session in well under an hour. That combination reported
+        # "version=? cmds=?" and failed T0.6 against a modem running 1.14.0
+        # with 40 commands registered, three minutes after a clean install.
+        #
+        # `mdm AT+SDVRVER` reaches the same handler over the CN805 link, and
+        # that link is already proven by T0.8 before this runs.
+        if s.modem_ver == "?" and c.n6 is not None and c.n6_mode == "edgeai-app":
+            mv = re.search(r"\+SDVRVER:\s*([0-9.]+)",
+                           c.n6.send("mdm AT+SDVRVER", max_secs=5.0) or "")
+            if mv:
+                s.modem_ver = mv.group(1)
+                c.modem_scopus = True
+                if s.modem_cmds == "?":
+                    s.modem_cmds = "via camera tunnel"
         s.ok("T0.6", "SDVR app exposes Scopus SoW v3 command set (≥33 AT cmds)",
              c.modem_scopus,
              reason=f"only {s.modem_cmds} cmds registered — pre-Scopus build "
@@ -135,13 +183,15 @@ def g0_prereq(c: Ctx, s: Suite):
 
 def _discover_host_ip(ssh: ModemSsh) -> str:
     """Find the host's IP on the modem's USB-ECM subnet (modem is .2)."""
-    rc, out, _ = ssh.run("ip route get 192.168.2.3 2>/dev/null; ip addr show 2>/dev/null | grep 'inet 192.168.2'")
+    hip = S.get("modem", "host_ip")
+    rc, out, _ = ssh.run(f"ip route get {hip} 2>/dev/null; "
+                         f"ip addr show 2>/dev/null | grep 'inet {hip.rsplit('.', 1)[0]}'")
     # The modem sees the host as the default gw on ecm0 — read it from there.
     rc, gw, _ = ssh.run("ip route show default 2>/dev/null | awk '{print $3}' | head -1")
     gw = (gw or "").strip()
     if gw.startswith("192.168.2."):
         return gw
-    return "192.168.2.3"
+    return S.get("modem", "host_ip")
 
 
 # ─────────────────────────── N6 groups ────────────────────────────────
@@ -229,6 +279,13 @@ def g3_n6_notify(c: Ctx, s: Suite):
          bool(mj) and int(mj.group(3)) == 16, extra=j.strip()[:80])
     s.ok("T3.5", "notify disable (§4.2)",
          "notify disable ok" in n.send("notify disable", "notify disable ok", 3.0))
+    # Put the period back now that T3.3 has read it. `notify period` is
+    # persisted, so leaving it at 30 s armed a §4.2 bit-3 report every 30 s for
+    # whatever ran next — which is how it reached run_integration_tests.py and
+    # cost K6 a spurious failure on 2026-08-21. The group is about the command
+    # being accepted, stored and read back; holding the unit in that state
+    # afterwards is not part of it.
+    n.send("notify period 0", "notify period ok", 3.0)
 
 
 def g4_n6_photo(c: Ctx, s: Suite):
@@ -325,10 +382,22 @@ def g7_n6_sd(c: Ctx, s: Suite):
 
 # ─────────────────────────── modem groups ─────────────────────────────
 def _modem_guard(c: Ctx, s: Suite, tids):
-    if c.mat:
+    if c.mat and c.mat_is_sdvr:
         return False
+    if not c.mat:
+        reason = "modem AT channel unavailable"
+    else:
+        # See the probe in group 0: this port is alive but is the module's own
+        # AT parser, not sdvrApp's. Skipping says so; failing would blame the
+        # product for a cable.
+        reason = (f"{getattr(c.mat, 'tty', 'this AT port')} is the Sierra "
+                  "module's own AT port, not the SDVR channel — plug the "
+                  "modem's FTDI adapter in (it carries ttyHSL1, where sdvrApp "
+                  "registers). Verify meanwhile with "
+                  "`cam.py \"mdm AT+SDVRPING=7\"`, which reaches the same "
+                  "handler over the camera link.")
     for tid, desc in tids:
-        s.skip(tid, desc, "modem AT channel unavailable")
+        s.skip(tid, desc, reason)
     return True
 
 
@@ -364,7 +433,7 @@ def g9_modem_scopus(c: Ctx, s: Suite):
             s.skip(tid, desc, f"modem on pre-Scopus build ({s.modem_cmds} cmds) — needs 1.1.0")
         return
     m = c.mat
-    host = c.host_ip or "192.168.2.3"
+    host = c.host_ip or S.get("modem", "host_ip")
     _, _ = m.expect(f'AT+SDVRNTFHOST="{host}"', "OK", 3.0)
     ok, r = m.expect("AT+SDVRNTFHOST?", host, 3.0)
     s.ok("T9.1", "AT+SDVRNTFHOST set→query round-trips (§5.2)", ok, extra=_oneline(r))
@@ -432,10 +501,10 @@ def g11_tunnel(c: Ctx, s: Suite):
 def g12_e2e_notify(c: Ctx, s: Suite):
     s.group("GROUP 12 — End-to-end notification over UDP (§6)")
     tid, desc = "T12.1", "Modem→host UDP datagram received with SoW §6 JSON fields"
-    if not c.mat or not c.modem_scopus:
+    if not c.mat or not c.mat_is_sdvr or not c.modem_scopus:
         s.skip(tid, desc, "needs modem Scopus build (AT+SDVRNTFA)")
         return
-    host = c.host_ip or "192.168.2.3"
+    host = c.host_ip or S.get("modem", "host_ip")
     port = 5005
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -514,7 +583,7 @@ def main() -> int:
                 modem_ver=s.modem_ver, modem_cmds=s.modem_cmds,
                 n6_tty=(c.n6.tty if c.n6 else "—"),
                 modem_tty=(c.mat.tty if c.mat else "—"),
-                modem_ip=os.environ.get("MODEM_IP", "192.168.2.2"),
+                modem_ip=S.get("modem", "ip"),
                 host=c.host_ip or "—")
     write_report(out, s, runtime, meta)
 

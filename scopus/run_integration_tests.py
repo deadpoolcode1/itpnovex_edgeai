@@ -42,13 +42,15 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+
+from settings import S  # noqa: E402
 from devices import N6Shell, ModemAt, ModemSsh   # noqa: E402
 
 IMAGE_DIR = Path(os.environ.get(
     "SCOPUS_IMAGES", "/home/user/work/itpnovex/edgeai/images"))
-HOST_IP = os.environ.get("HOST_IP", "192.168.2.3")
+HOST_IP = S.get("modem", "host_ip")
 NTF_PORT = int(os.environ.get("NTF_PORT", "5005"))
-MODEM_IP = os.environ.get("MODEM_IP", "192.168.2.2")
+MODEM_IP = S.get("modem", "ip")
 
 C = {"pass": "\033[92m", "fail": "\033[91m", "gap": "\033[95m",
      "skip": "\033[93m", "hdr": "\033[1m\033[94m", "dim": "\033[96m",
@@ -193,6 +195,37 @@ class UdpWatch:
             except (socket.timeout, BlockingIOError):
                 continue
             if addr[0] == self.source:
+                return data
+        return None
+
+    def wait_rsn(self, rsn, timeout):
+        """Return the first datagram from `source` carrying "rsn":<rsn>.
+
+        `wait()` returns whatever arrives next, which is only a fair test when
+        the unit has exactly one thing to say. It does not: `notify period` is
+        persisted device state, so a periodic report (rsn=8) fires on its own
+        30-second tick regardless of what the suite is doing, and any test that
+        waits for a *particular* event has roughly a one-in-six chance per run
+        of being handed the periodic instead and failing on a unit that behaved
+        correctly. Measured on 2026-08-21: the motion-stop arrived on time at
+        t+5.3 s and K6 still failed, because a periodic landed 0.2 s after the
+        motion-start and was consumed as the answer.
+
+        Datagrams that do not match are dropped, which is the right behaviour
+        here — every one of these waits follows a drain(), so anything arriving
+        in the window is either the event under test or unrelated noise.
+        """
+        return self.wait_body(('"rsn":%d' % rsn).encode(), timeout)
+
+    def wait_body(self, needle, timeout):
+        """Return the first datagram from `source` containing `needle`."""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                continue
+            if addr[0] == self.source and needle in data:
                 return data
         return None
 
@@ -508,7 +541,7 @@ def g_e_full_chain(s, ctx):
     try:
         watch.drain()
         mat.send('AT+SDVRNTFA=1,5,"hello"', 6.0)
-        dg = watch.wait(8.0)
+        dg = watch.wait_body(b"hello", 8.0)
         s.ok("E1", "modem → host UDP works when driven directly (§6)",
              dg is not None, note=_one(dg.decode(errors="replace"), 90) if dg else "",
              failnote="no datagram from the modem — the modem leg itself is down")
@@ -552,7 +585,9 @@ def g_e_full_chain(s, ctx):
                   "modem_send_at (shell_task.c)")
 
         # Hop 2: did an event actually leave the modem for the server?
-        dg2 = watch.wait(6.0)
+        # rsn=16 specifically: "a datagram arrived" would also be satisfied by
+        # an unrelated report and read as a pass on a chain that never worked.
+        dg2 = watch.wait_rsn(16, 6.0)
         if dg2 is not None:
             s.ok("E3", "detection produces a server event end to end", True,
                  note=_one(dg2.decode(errors="replace"), 90))
@@ -867,7 +902,7 @@ def g_j_tunnel_fidelity(s, ctx):
     # value silently gone. Quoting is not optional on the modem side either:
     # its parser rejects a bare dotted IP. Judge on the read-back, because the
     # truncated form is a command the modem is right to reject.
-    for tid, value in (("J1", "192.168.2.3"), ("J2", "10.9.8.7")):
+    for tid, value in (("J1", HOST_IP), ("J2", "10.9.8.7")):
         cam.send(f'mdm AT+SDVRNTFHOST="{value}"', "ok", 10.0)
         r = cam.send("mdm AT+SDVRNTFHOST?", "ok", 10.0)
         s.ok(tid, f'a quoted parameter survives the tunnel ({value})',
@@ -965,7 +1000,7 @@ def g_k_motion_sensor(s, ctx):
              failnote="the part answers on I2C but its mass does not move — "
                       "a dead or unpowered MEMS element")
 
-        dg = watch.wait(8.0)
+        dg = watch.wait_rsn(2, 8.0)
         body = dg.decode(errors="replace") if dg else ""
         s.ok("K5", "movement raises a motion-start event at the server (rsn=2)",
              '"rsn":2' in body and '"mtn":1' in body,
@@ -974,7 +1009,7 @@ def g_k_motion_sensor(s, ctx):
                       "bit 1 set (the mask is enforced)")
 
         # rsd on the stop edge is how long the episode lasted, in seconds.
-        dg = watch.wait(20.0)
+        dg = watch.wait_rsn(4, 20.0)
         body = dg.decode(errors="replace") if dg else ""
         s.ok("K6", "stillness raises a motion-stop event at the server (rsn=4)",
              '"rsn":4' in body and '"mtn":0' in body,
@@ -985,7 +1020,7 @@ def g_k_motion_sensor(s, ctx):
         # The regression guard for what this group exists to separate.
         watch.drain()
         cam.send("detect simulate 3", "detect simulate ok", 6.0)
-        dg = watch.wait(6.0)
+        dg = watch.wait_rsn(16, 6.0)
         body = dg.decode(errors="replace") if dg else ""
         got_people = '"rsn":16' in body
         motion_dg = None
@@ -1038,15 +1073,27 @@ def _one(text, n=120):
 
 # ────────────────────────────── driver ────────────────────────────────
 def quiesce_detector(cam):
-    """Stop live inference and drain whatever it already emitted.
+    """Stop live inference and the periodic report, and drain what they emitted.
 
     Called before the first group and again after the last, so neither this
-    run nor the next one has to parse shell traffic while the NN loop is
-    firing notifications underneath it.
+    run nor the next one has to parse shell traffic while something is firing
+    notifications underneath it.
+
+    `notify period` belongs here for the same reason `detect stop` does, and it
+    was missed. It is persisted device state — `run_scopus_tests.py` T3.2 sets
+    it to 30 s and the value survives reboots — so a §4.2 bit-3 report leaves
+    the unit every 30 s for the whole run, unrelated to anything under test.
+    Any test that waits for a *particular* event then has roughly a one-in-six
+    chance of being handed the periodic instead. Measured on 2026-08-21: K6
+    failed on a unit whose motion-stop was emitted correctly and on time,
+    because a periodic arrived 0.2 s after the motion-start and was consumed as
+    the answer. Nothing in either suite asserts that the periodic fires, so
+    silencing it for the run costs no coverage.
     """
     try:
         cam.send("detect stop", "detect", 4.0)
         cam.send("frame clear", "frame", 4.0)
+        cam.send("notify period 0", "notify period", 4.0)
     except Exception:
         pass
     cam.n6.drain(0.8)
@@ -1069,9 +1116,22 @@ def main():
         print(f"{C['fail']}cannot open N6 shell: {e}{C['0']}")
         return 2
     try:
-        ctx["mat"] = ModemAt(os.environ.get("SDVR_PORT") or None)
+        # via_camera: when the FTDI adapter is unplugged the port autodetect
+        # lands on the Sierra module's own AT parser, which answers a bare AT
+        # with OK and every AT+SDVR… with ERROR. ModemAt detects that and
+        # routes SDVR commands over the camera's `mdm` tunnel instead, which
+        # reaches the identical handler — so the suite runs either way.
+        ctx["mat"] = ModemAt(os.environ.get("SDVR_PORT") or None,
+                             via_camera=ctx["cam"].n6)
         ctx["mat"].prime()
-        ctx["ssh"] = ModemSsh(MODEM_IP, os.environ.get("MODEM_PASSWORD", "Ss123"))
+        if ctx["mat"].route == "camera-tunnel":
+            print(f"{C['skip']}note: {ctx['mat'].tty} is the module's own AT "
+                  f"port (FTDI adapter unplugged) — AT+SDVR* is going over the "
+                  f"camera tunnel{C['0']}")
+        elif ctx["mat"].route == "none":
+            print(f"{C['fail']}note: {ctx['mat'].tty} does not carry AT+SDVR* "
+                  f"and no camera tunnel is available{C['0']}")
+        ctx["ssh"] = ModemSsh(MODEM_IP, S.require("modem", "password"))
 
         # Start from a stopped detector, and leave one behind.
         #

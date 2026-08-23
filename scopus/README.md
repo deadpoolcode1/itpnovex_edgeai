@@ -232,13 +232,86 @@ python3 scopus/run_scopus_tests.py
 Output: a self-contained `results/test-report-<ts>.html` + same-stem `.pdf`
 (same style as the per-device reports). Env overrides:
 
-| Var | Default | Meaning |
+| Var | Comes from | Meaning |
 |---|---|---|
 | `N6_TTY` | auto (`usb-STMicroelectronics_N6Cam_*-if02`) | N6 CDC shell |
 | `SDVR_PORT` | FTDI host UART (`ttyUSB0`) | modem SDVR command channel |
-| `MODEM_IP` | `192.168.2.2` | modem SSH (side-effect checks) |
-| `MODEM_PASSWORD` | `Ss123` | modem root password |
-| `HOST_IP` | auto (modem default gw) | host endpoint for §6/§8 E2E |
+| `MODEM_IP` | `bench.ini` `[modem] ip` | modem SSH (side-effect checks) |
+| `MODEM_PASSWORD` | `bench.ini` `[modem] password` | modem root password |
+| `HOST_IP` | `bench.ini` `[modem] host_ip` | host endpoint for §6/§8 E2E |
+| `SERVER_HOST` | `bench.ini` `[server] host` | where notifications and photos go |
+
+## Bench settings — `bench.ini`
+
+Every address, port and password the tooling needs lives in **one untracked
+file**, `scopus/bench.ini`. Nothing site-specific is committed (ScopusQA #11).
+
+```bash
+cp scopus/bench.ini.template scopus/bench.ini
+$EDITOR scopus/bench.ini          # fill in your modem password and server
+```
+
+`scopus/bench.ini.template` **is** committed, and every value in it is a
+deliberate placeholder — `CHANGEME`, `203.0.113.10` (a reserved
+documentation address). If you forget to fill one in, the tool that needed it
+says which setting, in which file, and stops; it does not silently try to
+reach the placeholder.
+
+Resolution order per value: environment variable (upper-case name) → 
+`bench.ini` → `bench.ini.template`. So a one-off run can override anything
+without editing the file:
+
+```bash
+MODEM_PASSWORD=hunter2 python3 scopus/preflight.py
+python3 scopus/lib/settings.py       # show what is currently in effect
+```
+
+**Two values are committed with real data on purpose**, and the template says
+so inline: `[modem] ip = 192.168.2.2` and `[modem] host_ip = 192.168.2.3`.
+Those are the two ends of the modem's own USB/ECM link — a fixed property of
+the Sierra WP76 interface, identical on every unit ever shipped, and no more
+site data than `127.0.0.1`. Treating them as secrets would mean telling every
+reader of this repository a constant out of band.
+
+## Certificates
+
+**There is one certificate set, and HTTPS and MQTT both use it.** They are not
+configured separately and cannot diverge:
+
+| | |
+|---|---|
+| On the modem | `/data/sdvr/certs/ca.crt`, `client.crt`, `client.key` (mode `0600`) |
+| Single accessor | `Cert_GetPaths()` in `cert_manager.c` |
+| HTTPS upload | `upload_file.c` → curl `CAINFO` / `SSLCERT` / `SSLKEY` |
+| MQTT/TLS | `mqtt.c` → `SSL_CTX_load_verify_locations` / `use_certificate_file` / `use_PrivateKey_file` |
+
+So yes — provisioning them once from the SD card provisions both channels.
+The SD card is the only supported source:
+
+```
+AT+SDVRCERTIMPORT          # copy ca.crt / client.crt / client.key off the card
+AT+SDVRCERTDEL="ALL"       # remove all three from the modem
+```
+
+or, hands-free at boot, through `tconf.ini` on the same card:
+
+```ini
+CERTIMPORT      = 1        ; import on this pass
+CERTIMPORTONCE  = 1        ; ...and clear the flag afterwards
+CERTFILECA      = ca1.crt  ; optional: the names on the CARD differ
+CERTFILECLNT    = c1.crt   ; the destination slots above never change
+CERTFILECLNTKEY = c1.key
+CERTDELSD       = 1        ; wipe them off the card once imported
+```
+
+The `CERTFILE*` overrides name a **single file on the card root** — a value
+containing `/`, `\`, `.` or `..` is refused with a log line and the default
+name is used instead, so a `tconf.ini` cannot be used to read or delete a file
+elsewhere on the modem (ScopusQA #12, E·20).
+
+Neither channel will fall back to server-only verification: if any of the three
+files is missing, an https upload fails with `+SDVRUPL: ERROR 12` and MQTT
+refuses to enable, rather than connecting without a client certificate.
 
 ## Command reference
 

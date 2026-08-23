@@ -1,0 +1,53 @@
+# Scopus bench settings — TEMPLATE. Copy to bench.ini and fill in.
+#
+#     cp scopus/bench.ini.template scopus/bench.ini
+#     $EDITOR scopus/bench.ini
+#
+# bench.ini is deliberately NOT tracked by git (see .gitignore). Everything in
+# this file is site data — an address, a port or a password that is true of one
+# installation and wrong for the next — and none of it belongs in a shared
+# repository. Every value below is a placeholder; the tools will tell you which
+# one they wanted if you forget to change it.
+#
+# Any value can also be overridden per-run by an environment variable of the
+# same name in upper case, which is what CI uses:
+#
+#     MODEM_PASSWORD=... python3 scopus/preflight.py
+
+[modem]
+# The modem's address on its own USB/ECM link to this PC, and this PC's address
+# on that link. These two ARE committed with real values, and that is on
+# purpose: they are fixed properties of the Sierra WP76 ECM interface, identical
+# on every unit ever shipped, and no more site-specific than 127.0.0.1. Change
+# them only if you have re-addressed that interface yourself.
+ip       = 192.168.2.2
+host_ip  = 192.168.2.3
+
+# Modem root login. REPLACE THIS.
+user     = root
+password = CHANGEME
+
+[server]
+# Where the unit sends notifications and photos, and where the MQTT command
+# broker listens. REPLACE ALL OF THESE with your own receiver.
+host        = 203.0.113.10
+upload_port = 8991
+mqtt_port   = 5912
+notify_path = /notify
+upload_path = /upload
+
+[test_server]
+# Ports the bundled scopus/test_server.py binds when you run a receiver on this
+# PC instead of a real server. Local only; change if something else owns them.
+http_port = 8080
+udp_port  = 9999
+recv_dir  = ~/scopus-received
+
+[bench]
+# The PC the camera and modem are physically attached to, for the remote-drive
+# scripts. Leave host empty when you are already running ON that PC, which is
+# the normal case. REPLACE if you use them.
+host     =
+port     = 22
+user     = CHANGEME
+password = CHANGEME

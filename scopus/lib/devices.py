@@ -3,9 +3,10 @@ Device-access layer for the Scopus whole-system suite.
 
 Three endpoints, matching the SoW block diagram:
   - N6Shell  : the Main-CPU control channel — N6Cam CDC-ACM shell (SoW §4.1).
-  - ModemAt  : the modem SDVR command channel. On the bench the host's native
-               AT port (Sierra if03) reaches the SDVR app through its UartFilter
-               bridge, so AT+SDVR* commands land on the app (SoW §5).
+  - ModemAt  : the modem SDVR command channel — the host UART ttyHSL1, which
+               sdvrApp claims through portService and which reaches this PC
+               over the modem's FTDI adapter. NOT the Sierra module's own
+               native AT port; see the note on the class.
   - ModemSsh : root shell on the modem for side-effect verification (mounts,
                /sdvr config tree, sdvr.log, logread).
 
@@ -19,6 +20,8 @@ import os
 import subprocess
 import time
 from typing import List, Optional, Tuple
+
+from settings import S
 
 
 # ───────────────────────── N6 Main-CPU shell ──────────────────────────
@@ -116,17 +119,62 @@ class N6Shell:
 class ModemAt:
     """Raw AT channel to the modem (and through the bridge, the SDVR app).
 
-    Auto-discovers the port that answers `AT` with OK; on this bench that is
-    the Sierra native AT port (if03 → /dev/ttyUSB3). SDVR custom commands are
-    dispatched by the app's UartFilter on the same wire.
+    Auto-discovers the port that answers `AT` with OK — and that is NOT
+    sufficient to have found the right one.
+
+    sdvrApp claims **ttyHSL1**, the WP76's host UART, via portService
+    (`qmi_at_fwd.c`, le_port_Request("uart")); on this bench ttyHSL1 reaches
+    the PC through the modem's FTDI adapter, normally /dev/ttyUSB0. That is
+    the only wire on which AT+SDVR… commands exist.
+
+    The Sierra module separately exposes **its own** AT parser on native USB
+    (…-if03 → /dev/ttyUSB3). That port answers a bare `AT` with OK and answers
+    every AT+SDVR… with ERROR. With the FTDI unplugged, discover() lands on it
+    and everything looks alive while every SDVR command fails — which reads as
+    a broken product rather than a missing cable. run_scopus_tests.py probes
+    for exactly that mismatch (bare AT works, AT+SDVRPING does not) and skips
+    the modem groups with the real reason instead of failing them.
+
+    An earlier version of this docstring claimed the Sierra port was the SDVR
+    channel on this bench. It is not, and believing it cost a session.
+
+    **The camera tunnel is a real fallback.** Pass a live N6Shell as
+    `via_camera` and, when the discovered port turns out to be the module's own
+    AT parser, every AT+SDVR… is routed as `mdm <cmd>` over the CN805 link
+    instead. That reaches the identical handler in the identical app — it is
+    how `mdm AT+SDVRPING=7` has always worked — so a bench whose FTDI adapter
+    is unplugged still exercises the whole SDVR command set. `is_sdvr_channel`
+    says whether the wire itself was usable; `route` says which one is
+    actually carrying the commands.
     """
 
-    def __init__(self, tty: Optional[str] = None):
+    def __init__(self, tty: Optional[str] = None, via_camera=None):
         self.tty = tty or self.discover()
         if not self.tty:
             raise RuntimeError("Modem AT port not found")
         os.system(f"stty -F {self.tty} 115200 cs8 -cstopb -parenb raw -echo 2>/dev/null")
         self.prime()
+
+        self._cam = via_camera
+        self.is_sdvr_channel = self._probe_sdvr_channel()
+        self.route = "direct" if self.is_sdvr_channel else (
+            "camera-tunnel" if self._cam is not None else "none")
+
+    def _probe_sdvr_channel(self) -> bool:
+        """Does THIS port carry AT+SDVR…?
+
+        Two probes that have to disagree: a bare AT must work — so the port is
+        alive and this is not a serial fault — while a command present in every
+        SDVR build since 1.0 must not. That combination has one cause, and it
+        is the FTDI adapter being unplugged.
+        """
+        if "OK" not in self._raw_send("AT", 2.0):
+            return False                       # not a working AT port at all
+        return "+SDVRPING:" in self._raw_send("AT+SDVRPING=1", 3.0)
+
+    def _tunnel(self, cmd: str, timeout: float) -> str:
+        """Send one AT command over the camera's `mdm` tunnel."""
+        return self._cam.send(f"mdm {cmd}", max_secs=max(timeout, 4.0)) or ""
 
     def prime(self):
         """The SDVR app's UartFilter opens the modem AT port lazily on the
@@ -215,7 +263,19 @@ class ModemAt:
             os.close(fd)
 
     def send(self, cmd: str, timeout=3.0) -> str:
-        """Send an AT command; read until OK/ERROR terminator or timeout."""
+        """Send an AT command, over whichever wire actually carries it.
+
+        Anything that is not an AT+SDVR… command goes down the serial port
+        regardless: a bare AT, or a module command like AT+CPIN?, is answered
+        by the module's own parser and has no business in the tunnel.
+        """
+        if (not self.is_sdvr_channel and self._cam is not None
+                and cmd.upper().startswith("AT+SDVR")):
+            return self._tunnel(cmd, timeout)
+        return self._raw_send(cmd, timeout)
+
+    def _raw_send(self, cmd: str, timeout=3.0) -> str:
+        """Send an AT command down the serial port; read until OK/ERROR."""
         fd = os.open(self.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             try:
@@ -266,7 +326,13 @@ class ModemSsh:
         "-o", "ConnectTimeout=6",
     ]
 
-    def __init__(self, ip="192.168.2.2", password="Ss123"):
+    def __init__(self, ip=None, password=None):
+        # ScopusQA #11: no credential in the source. The address is the modem's
+        # own ECM-link constant and is a committed default; the password is
+        # site data and comes from bench.ini (or $MODEM_PASSWORD), which is
+        # untracked. See scopus/lib/settings.py.
+        ip       = ip or S.get("modem", "ip")
+        password = password if password is not None else S.require("modem", "password")
         self.ip = ip
         self.password = password
 

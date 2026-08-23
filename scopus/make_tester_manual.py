@@ -78,7 +78,11 @@ RELAY_KEY = os.environ.get("SCOPUS_RELAY_KEY", "<ask-for-the-relay-key>")
 # Remote command channel (section 19). The broker runs on this same PC and is
 # reached on its public address, because that is the address the unit dials
 # from the mobile network — the LAN address is not routable from there.
-MQTT_HOST = "213.8.185.180"
+# ScopusQA #11 — site data, read from scopus/bench.ini (untracked).
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
+from settings import S as _S
+MQTT_HOST = _S.require("server", "host")
 MQTT_PORT = 5912
 MQTT_CERT_DIR = "/opt/sdvr-server/certs"
 

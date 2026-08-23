@@ -1,6 +1,162 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-20. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-23. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-23 — ScopusQA #10 – #15 closed
+
+Camera build `Aug 23 2026 19:46:30`, modem app **1.14.0** (Legato system 63,
+marked good). System suite after the work: **49 total, 32 PASS / 0 FAIL /
+17 SKIP**.
+
+### The bench is missing its FTDI adapter today, and that is what every SKIP is
+
+`sdvrApp` claims **ttyHSL1** through portService, and ttyHSL1 reaches this PC
+only over the modem's FTDI adapter (normally `/dev/ttyUSB0`). It is unplugged.
+The port autodetect then lands on the Sierra module's **own** native AT port
+(`…-if03` → `/dev/ttyUSB3`), which answers a bare `AT` with `OK` and answers
+every `AT+SDVR…` with `ERROR` — so the channel looks healthy and every SDVR
+test fails. That produced **seven red FAILs for a missing cable**, which reads
+exactly like a broken product.
+
+The suite now probes for that specific disagreement — bare `AT` works while
+`AT+SDVRPING` does not — and SKIPs the modem groups naming the cable, instead
+of failing them. `scopus/lib/devices.py` carried a docstring asserting the
+Sierra port *was* the SDVR channel on this bench; it is not, and that sentence
+is what made the diagnosis take a session. It has been corrected.
+
+`T0.6` also failed while the modem was demonstrably fine: it reads the version
+from `AT+SDVRVER` (wrong port) or from the `+SDVRRDY` boot banner in
+`/data/sdvr/sdvr.log` (a ring buffer, and a busy session pushes the banner out
+in minutes). It now falls back to `mdm AT+SDVRVER` over the camera link, which
+is already proven by T0.8 before that test runs.
+
+**Plug the FTDI back in and the 11 modem SKIPs become PASSes.** Nothing about
+them is a product fault. Meanwhile every SDVR command is reachable with
+`python3 scopus/cam.py "mdm AT+SDVR…"`, which lands on the same handler.
+
+### #13 — motion start/stop now carry `rsd = 0`
+
+Measured, on ITP's own receiver at `213.8.185.180:8991`:
+
+```
+{"ser":4194336,"num":0,"rsn":2,"rsd":0,"tim":"20260823195130","mtn":1,...}
+{"ser":4194336,"num":1,"rsn":4,"rsd":0,"tim":"20260823195146","mtn":0,...}
+```
+
+Both were `rsn:2, rsd:35` / `rsn:4, rsd:16` before. Start used to send the
+deviation in **milli-g** that opened the episode and stop the episode's length
+in **seconds** — useful on a bench, and not what the field means: §4.2 `rsd` is
+a *count of objects of that class* for the detection reasons, so a receiver
+reading `rsd` uniformly saw 35 and had no way to know those were milli-g. One
+field cannot carry two units. Both measurements still reach the trace log at
+the transition, and `motion query` reports last/peak deviation and still-time
+on demand.
+
+### #14 — detection `rsd` is the count of that class, and always was
+
+`nn_task.c::_nn_report_classes` sends each class as its own notification with
+that class's count in `rsd`, and the comment there already explains why it is
+two notifications rather than one `rsn=0x30`: *a single event has only one
+`rsd`*. Confirmed on the receiver:
+
+```
+detect simulate 3          -> {"rsn":16,"rsd":3,...}      people
+detect simulate 2 vehicle  -> {"rsn":32,"rsd":2,...}      vehicles
+```
+
+So one file per notification is the intended design, not a limitation — and it
+is the same property that makes `rsd` unambiguous, which is what #13 restores.
+
+### #10 — N6 application review
+
+Applied C1, H1, M2–M5 and L1–L7. **M1 does not apply**: it assumes
+`motion_sensor_poll()` runs on a periodic task racing the shell. It does not —
+`shell_task.c` calls it from the shell loop, next to the other notification
+producers, and `_motion_cmd` runs inside `lwshell_update()` on that same
+thread, so `force`/`config`/`status` cannot race the poll. A lock there would
+be free of contention and also free of effect. The single-thread invariant is
+now stated in `motion_sensor.c` so the finding is not re-raised.
+
+H2 (unauthenticated `update`) is documented in the top-level `README.md` per
+the author note, not changed: on this build USB-C access **is** firmware-write
+access, the App slot is protected by the boot ROM's signature check and the
+model slot by nothing, and the production options are named there.
+
+`detect simulate 1000` is now rejected at the shell with
+`detect simulate: N must be 0..20`, and clamped again in the setter, so the
+out-of-bounds read *and* write (C1 — self-firing through `display_task` on
+every camera frame) cannot be reached from either direction.
+
+### #12 — SDVR firmware review
+
+All 22 findings addressed. The three that were live rather than latent:
+
+- **A·01** — `HdlcChannel_Shutdown` closed the UART and PTY fds while the pump
+  was still inside `poll()`/`read()` on them, conceding up to 200 ms in its own
+  comment. The kernel hands a closed number to the next `open()`/`socket()`, so
+  a curl upload or the MQTT TLS socket allocating in that window inherited it
+  and the pump wrote HDLC frames into someone else's connection. The thread was
+  already created joinable; nothing had ever joined it. It does now.
+- **A·02** — `URC_BeginAsync()` recorded **one** thread ref and three threads
+  claimed it. The upload worker's `URC_EndAsync()` wrote NULL over whichever of
+  MQTT/notify was live, so from the first completed upload onward `+SDVRMQTT`
+  and `+SDVRNTF` lost forced-unsolicited routing and were emitted as
+  intermediate responses to a finished AT command, which atServer discards —
+  URCs silently stopping with nothing in any log. It is a set of threads now,
+  each adding and removing only itself.
+- **D·18** — the live-photo upload ran `UploadFile_FromMemory` inline on the
+  **main** thread: `Network_EnsureData(25000)` busy-polls for up to 25 s and
+  `curl_easy_perform` carries a `CURLOPT_TIMEOUT` of at least 300, so the
+  Legato event loop stopped for up to five and a half minutes per photo — no AT
+  dispatch, no URC, and a visibly stalling `+SDVRRDY` beacon. It now goes to a
+  dedicated thread owning its own IPC sessions, the pattern `upload_engine.c`
+  already used.
+
+Two more worth naming because they made a documented feature a no-op:
+**C·14**, `AT+SDVRPROGRINTR=0` returned OK and changed nothing (three comments
+delegated the guard to `upload_file.c`, which rewrote the disabling 0 back to
+the default 10); and **C·13**, an upload percentage that overflowed a 32-bit
+`size_t` past ~42.9 MB — reachable, the suite's own stress case builds 50 MB —
+and was then collapsed to a boolean anyway, because the §8 field is `1|0`.
+
+`volatile` used as a concurrency primitive (A·06) is now `atomic_bool` in the
+three places that carried cross-thread flags.
+
+### #11 — nothing site-specific is committed any more
+
+Every address, port and password the tooling needs is in **one untracked
+file**, `scopus/bench.ini`; `scopus/bench.ini.template` is committed with
+placeholders only (`CHANGEME`, `203.0.113.10`). Resolution is environment
+variable → `bench.ini` → template, and a value left at its placeholder stops
+the tool with the setting name and the file to edit rather than timing out
+against `203.0.113.10`. `python3 scopus/lib/settings.py` prints what is in
+effect, passwords masked.
+
+Two values keep real data in the committed template and it says why inline:
+`192.168.2.2` / `192.168.2.3` are the two ends of the modem's own USB/ECM link,
+a fixed property of the Sierra WP76 interface, identical on every unit — no
+more site data than `127.0.0.1`.
+
+The three build questions are answered in
+`vendor/n6cam.core.bsp/Firmware/Model/README.md`: `libNetworkRuntime1200_CM55_GCC.a`
+is ST's prebuilt runtime, never rebuilt here, and was silently excluded from
+every delivery by a blanket `*.a` in `.gitignore` until 2026-08-21;
+`pv_epoch0` is a stale *report* naming an intermediate model, not a missing
+input; and `stai_network.h` — not `generate.sh`, not
+`network_generate_report.txt` — is the file that always states which model is
+committed.
+
+### #15 — one certificate set, and it covers both channels
+
+`upload_file.c` (curl `CAINFO`/`SSLCERT`/`SSLKEY`) and `mqtt.c`
+(`SSL_CTX_load_verify_locations` / `use_certificate_file` / `use_PrivateKey_file`)
+both call `Cert_GetPaths()`, which returns
+`/data/sdvr/certs/{ca.crt,client.crt,client.key}`. There is no second set and
+no way for the two to diverge. Provisioning from the SD card — `AT+SDVRCERTIMPORT`
+or `CERTIMPORT=1` in `tconf.ini` — provisions both. Verified live: MQTT
+connected to `213.8.185.180:5912` as `359779080290964` off those exact files.
 
 ---
 
@@ -304,12 +460,21 @@ app restart sdvrApp→ +SDVRRDY: 1.13.0, then rsn=1
 recording why.** I read `MULTICLASS_STATUS.md` (2026-05-23), saw "only class 0
 (person) ever fires", and concluded the event could not be delivered without a
 new model. That document describes the *relu30* experiment and is three months
-stale. The kit has since moved to the **`pv` model** — `network_generate_report.txt`
-records `generate --model pv_epoch0.onnx`, the output is (84,1344) = 4 box + 80
-COCO classes, and `_class_passes_mask()` in `nn_task.c` has mapped COCO 1-8
+stale. The kit has since moved to a **person+vehicle model** whose output is
+(84,1344) = 4 box + 80 COCO classes, and `_class_passes_mask()` in `nn_task.c`
+has mapped COCO 1-8
 (bicycle, car, motorcycle, bus, truck, airplane, train, boat) onto the vehicle
 bit for as long as `detect profile <det_msk>` has existed. Vehicles were being
 **detected and counted** all along.
+
+*(Correction, 2026-08-21: this paragraph originally sourced the model from
+`network_generate_report.txt`, which records `generate --model pv_epoch0.onnx`.
+That report is stale — it is one build older than the artifacts beside it. The
+committed network is `gen_best.onnx`, per `STAI_NETWORK_ORIGIN_MODEL_NAME` in
+`stai_network.h`, which is the only file in that directory that cannot drift.
+Full provenance: `vendor/n6cam.core.bsp/Firmware/Model/README.md`. Nothing
+about the conclusion above changes — both models are 80-class, and the vehicle
+mapping is the same.)*
 
 The actual bug was one line further on: the report hardcoded
 `shell_notify_emit(0x10, _nn_stable_boxes)` — every detection was announced as

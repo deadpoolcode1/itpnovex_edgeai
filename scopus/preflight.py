@@ -25,7 +25,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, "lib"))
 
-MODEM_IP = "192.168.2.2"
+from settings import S  # noqa: E402
+
+# ScopusQA #11: addresses, ports and passwords come from scopus/bench.ini
+# (untracked; scopus/bench.ini.template is the committed placeholder copy)
+# or from the matching environment variable. See scopus/lib/settings.py.
+MODEM_IP = S.get("modem", "ip")
 CAM_BY_ID = "/dev/serial/by-id/usb-STMicroelectronics_N6Cam_*-if02"
 MODEM_BY_ID = "/dev/serial/by-id/*FTDI*"
 TEST_IMAGE = os.path.join(REPO, "images", "3_people.jpg")

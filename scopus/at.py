@@ -28,9 +28,14 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+
+from settings import S  # noqa: E402
 from devices import ModemAt, ModemSsh                        # noqa: E402
 
-MODEM_IP = "192.168.2.2"
+# ScopusQA #11: addresses, ports and passwords come from scopus/bench.ini
+# (untracked; scopus/bench.ini.template is the committed placeholder copy)
+# or from the matching environment variable. See scopus/lib/settings.py.
+MODEM_IP = S.get("modem", "ip")
 
 
 def raw_at(cmd, timeout=8.0):
