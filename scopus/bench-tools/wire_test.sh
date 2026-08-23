@@ -3,7 +3,14 @@
 # Stops sdvrApp so the UART is free, dumps raw bytes off /dev/ttyHS0 while the
 # camera transmits, then restarts the app. Restart happens even on failure.
 set -u
-M="sshpass -p Ss123 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@192.168.2.2"
+# ScopusQA #11: the modem login is site data, not source. It comes from
+# scopus/bench.ini (untracked) via settings.py — bench.ini.template is the
+# committed copy and carries placeholders only.
+_SC="$(cd "$(dirname "$0")/.." && pwd)"
+MODEM_USER=$(python3 -c "import sys;sys.path.insert(0,'$_SC/lib');from settings import S;print(S.get('modem','user'))")
+MODEM_PASS=$(python3 -c "import sys;sys.path.insert(0,'$_SC/lib');from settings import S;print(S.require('modem','password'))")
+MODEM_IP=$(python3   -c "import sys;sys.path.insert(0,'$_SC/lib');from settings import S;print(S.get('modem','ip'))")
+M="sshpass -p $MODEM_PASS ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $MODEM_USER@$MODEM_IP"
 SP="$(cd "$(dirname "$0")" && pwd)"
 
 APP=/legato/systems/current/bin/app

@@ -703,9 +703,57 @@ def _ntfa_encode(payload):
     return ",".join('"%s"' % p for p in parts), len(parts)
 
 
+# Every test in group H is a statement about how one AT LINE survives the AT
+# parameter parser: quotes consumed, commas inside a quoted parameter, the
+# 128-byte per-parameter cap, ENC=1 restoring the substituted quote, and the
+# 30-second de-duplication of an identical retry. All of that needs the line to
+# arrive byte-exact, which means the direct AT channel.
+#
+# It cannot be tested through the camera's `mdm` tunnel. lwshell tokenises the
+# arguments of `mdm` and does not hand the rest of the line through verbatim,
+# so the quotes around the payload are gone by the time it reaches atServer and
+# the body's own commas split it into a dozen parameters — at which point
+# Handle_NtfA's "ENC is the last parameter" rule is reading the tail of the
+# JSON, not the ENC flag. The observable result is a datagram whose backticks
+# were never decoded, which looks exactly like a broken ENC=1 and is not.
+#
+# The product path is unaffected and is covered elsewhere: the camera composes
+# and sends its own AT+SDVRNTFA internally rather than through `mdm`, and E3
+# proves that end to end — a real detection arriving at the server as valid
+# JSON with real quotes.
+H_NEEDS_DIRECT = ("AT+SDVRNTFA parameter transport needs the direct AT "
+                  "channel — the FTDI adapter is unplugged, so AT+SDVR* is "
+                  "going over the camera's `mdm` tunnel, which tokenises the "
+                  "line and cannot deliver a quoted payload byte-exact. "
+                  "Plug the FTDI adapter in to run this group. The product "
+                  "path does not use `mdm` and is covered by E3.")
+
+H_TESTS = [
+    ("H1",  "legacy form (no ENC) delivers the payload verbatim"),
+    ("H2",  "explicit ENC=0 delivers the payload verbatim"),
+    ("H3",  "ENC=1 carries the §6 body byte-exact (100 B)"),
+    ("H4",  "the delivered body is valid JSON"),
+    ("H5",  "a body with a populated mod field survives"),
+    ("H6",  "a multi-chunk payload is rejoined byte-exact"),
+    ("H7",  "mod/bat/vol survive the chunk boundary"),
+    ("H8",  "a payload of exactly 128 B (one full chunk) arrives"),
+    ("H9",  "an out-of-range ENC is rejected"),
+    ("H10", "a non-numeric ENC is rejected"),
+    ("H11", "the command still works after the malformed ones"),
+    ("H12", "a fresh notification is delivered"),
+    ("H13", "an identical retry is re-acked but NOT re-sent"),
+    ("H14", "the same numerator with a DIFFERENT body is still sent"),
+]
+
+
 def g_h_ntfa_protocol(s, ctx):
     s.group("H — AT+SDVRNTFA payload transport (§5.2, §6)")
     mat = ctx["mat"]
+
+    if getattr(mat, "route", "direct") != "direct":
+        for tid, desc in H_TESTS:
+            s.skip(tid, desc, H_NEEDS_DIRECT)
+        return
 
     mat.send(f'AT+SDVRNTFHOST="{HOST_IP}"', 4.0)
     mat.send(f"AT+SDVRNTFPORT={NTF_PORT}", 4.0)

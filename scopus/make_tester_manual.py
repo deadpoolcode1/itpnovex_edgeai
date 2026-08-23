@@ -22,6 +22,13 @@ import os
 import pathlib
 import sys
 
+# ScopusQA #11 — site data (bench host, receiver address) is read from
+# scopus/bench.ini, which is untracked; bench.ini.template is the committed
+# copy and carries placeholders only. See scopus/lib/settings.py.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
+from settings import S as _S
+
 try:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -55,7 +62,7 @@ CD = f"cd {REPO} && "
 # the moment there is more than one, and a tester who runs these commands on
 # the wrong machine gets "no such device" for reasons no troubleshooting table
 # can explain.
-BENCH_HOST = "T7ARYZ0009769Z2"
+BENCH_HOST = _S.get("bench", "host") or "<your bench PC>"
 BENCH_ADDR = "100.115.215.6"
 BENCH_SSH_PORT = 4322
 BENCH_USER = "user"
@@ -78,10 +85,6 @@ RELAY_KEY = os.environ.get("SCOPUS_RELAY_KEY", "<ask-for-the-relay-key>")
 # Remote command channel (section 19). The broker runs on this same PC and is
 # reached on its public address, because that is the address the unit dials
 # from the mobile network — the LAN address is not routable from there.
-# ScopusQA #11 — site data, read from scopus/bench.ini (untracked).
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
-from settings import S as _S
 MQTT_HOST = _S.require("server", "host")
 MQTT_PORT = 5912
 MQTT_CERT_DIR = "/opt/sdvr-server/certs"

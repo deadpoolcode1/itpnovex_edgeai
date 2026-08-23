@@ -1122,9 +1122,20 @@ Tailscale. It is **not** the Cardo Windows box (`ilancardopc`, `100.103.139.65`)
 attached and no `/dev/ttyACM*` in WSL.
 
 ```bash
-ssh -p 4322 user@100.115.215.6          # login + sudo password: T7ARYZ0009769Z2
+# Host, port, user and password: scopus/bench.ini, [bench] section.
+# That file is untracked (ScopusQA #11); bench.ini.template beside it is the
+# committed copy and carries placeholders only. `python3 scopus/lib/settings.py`
+# prints what is in effect.
+eval "$(python3 - <<'EOF'
+import sys; sys.path.insert(0, "scopus/lib")
+from settings import S
+for k in ("host", "port", "user", "password"):
+    print(f'BENCH_{k.upper()}={S.require("bench", k)}')
+EOF
+)"
+ssh -p "$BENCH_PORT" "$BENCH_USER@$BENCH_HOST"
 # non-interactive:
-SSHPASS='T7ARYZ0009769Z2' sshpass -e ssh -p 4322 user@100.115.215.6 '<cmd>'
+SSHPASS="$BENCH_PASSWORD" sshpass -e ssh -p "$BENCH_PORT" "$BENCH_USER@$BENCH_HOST" '<cmd>'
 ```
 
 If every `100.x` host times out, Tailscale is probably blocked, not down: some
@@ -1138,7 +1149,7 @@ against the same call to google.com, then switch networks.
 | N6 CDC shell | `/dev/serial/by-id/usb-STMicroelectronics_N6Cam_DEADBEEF-if02` (ttyACM1 **or** ttyACM2 — it moves across reflashes, always resolve the by-id link) |
 | N6 trace UART | ST-Link VCP `-if01` → `/dev/ttyACM0` |
 | Modem SDVR AT | FTDI host UART `/dev/ttyUSB0` → `ttyHSL1` on the modem |
-| Modem SSH | `192.168.2.2`, root / `Ss123` |
+| Modem SSH | `192.168.2.2`, user and password from `scopus/bench.ini` `[modem]` |
 | Host on modem subnet | `192.168.2.3` (iface `enx6eb2448e9b14`) |
 | Repos on bench | `~/work/itpnovex/{edgeai,V20_SDVR}` — **edgeai there is an rsync copy, not a git repo.** Develop locally, ship artifacts. |
 | CubeProgrammer on bench | `~/stm32prog/bin/STM32_Programmer_CLI` (copied there 2026-08-05; needs `LD_LIBRARY_PATH=~/stm32prog/lib` and sudo for USB) |

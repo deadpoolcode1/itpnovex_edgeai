@@ -26,6 +26,13 @@ import datetime
 import pathlib
 import sys
 
+# ScopusQA #11 — site data (bench host, receiver address) is read from
+# scopus/bench.ini, which is untracked; bench.ini.template is the committed
+# copy and carries placeholders only. See scopus/lib/settings.py.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
+from settings import S as _S
+
 try:
     from docx import Document
     from docx.shared import Pt, RGBColor, Inches
@@ -46,7 +53,7 @@ CD = f"cd {REPO} && "
 # The machine the two devices are plugged into. Naming it matters: these
 # commands only work there, and running them on another PC gives "no such
 # device" for reasons no troubleshooting table can explain.
-BENCH_HOST = "T7ARYZ0009769Z2"
+BENCH_HOST = _S.get("bench", "host") or "<your bench PC>"
 BENCH_ADDR = "100.115.215.6"
 BENCH_SSH_PORT = 4322
 BENCH_USER = "user"
@@ -54,12 +61,6 @@ BENCH_USER = "user"
 # The customer's server. This address is the office public IP, and the
 # receiver, the broker and the certificates are already installed on it —
 # nothing in this document installs anything.
-# ScopusQA #11: the receiver address is site data. It is still printed into
-# the generated document — the tester needs it — but it is read from
-# scopus/bench.ini (untracked) rather than committed here.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
-from settings import S as _S
 SRV = _S.require("server", "host")
 SRV_HTTP_PORT = 8991          # ITP's receiver: /upload and /notify
 MQTT_PORT = 5912              # mosquitto, TLS + client certificate
