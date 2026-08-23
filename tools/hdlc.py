@@ -1,6 +1,6 @@
 """Host-side companion to vendor/.../hdlc.c.
 
-Identical wire format: 0x7E flags, 0x7D escape with XOR 0x20, CRC-16/XMODEM
+Identical wire format: 0x7E flags, 0x7D escape with XOR 0x20, CRC-16/CCITT-FALSE
 appended big-endian before the trailing flag.
 
 Used by:
@@ -19,7 +19,14 @@ HDLC_ESC_MASK = 0x20
 
 
 def crc16(data: bytes) -> int:
-    """CRC-16/XMODEM. Matches hdlc_crc16() in hdlc.c byte-for-byte."""
+    """CRC-16/CCITT-FALSE. Matches hdlc_crc16() in hdlc.c byte-for-byte.
+
+    Named XMODEM here and in hdlc.c until 2026-08-21, which was wrong: XMODEM
+    is the same polynomial (0x1021) seeded with 0x0000, and this seeds 0xFFFF.
+    Both ends implemented the same thing, so nothing ever mismatched on the
+    wire — but a third implementation written from the old name would have
+    disagreed on every frame.
+    """
     crc = 0xFFFF
     for b in data:
         crc ^= b << 8

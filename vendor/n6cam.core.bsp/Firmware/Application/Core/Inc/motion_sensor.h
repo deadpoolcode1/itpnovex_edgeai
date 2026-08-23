@@ -42,6 +42,16 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+/** Upper bound on the §4.5 no-motion timeout.
+ *
+ *  The poll compares `(now - _last_move) >= _timeout_s * TX_TIMER_TICKS_PER_SECOND`
+ *  in 32-bit tick arithmetic. At 1000 ticks/s anything above ~4,294,967 s
+ *  wraps, so a fat-fingered `motion sense 50 99999999` produced a *tiny*
+ *  effective timeout and fired motion-stop almost at once — the exact
+ *  opposite of what was asked for. A day is far past any real use and leaves
+ *  three orders of magnitude of headroom under the wrap. */
+#define MOTION_TIMEOUT_MAX_S    (86400UL)
+
 /** Sensor status, as reported by `motion query`. */
 typedef struct
 {

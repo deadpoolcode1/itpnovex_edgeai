@@ -66,8 +66,18 @@ static const uint16_t LSM6_ADDRS[2] = { 0xD6U, 0xD4U };
  * motion" instead of reporting for ever, and so that temperature drift never
  * looks like movement. Frozen while motion is in progress — tracking then
  * would chase the very signal being measured. 1/16 per poll at ~5 Hz is a
- * time constant of about three seconds. */
+ * time constant of about three seconds.
+ *
+ * Expressed as a multiply/divide rather than a shift pair. `a[i]` is signed
+ * milli-g and is negative on whichever axis faces down — about -1000 mg at
+ * rest — and left-shifting a negative signed value is undefined behaviour
+ * (C99 6.5.7p4), with the matching right-shift merely implementation-defined.
+ * GCC defines both the way this code wants, which is why it has always
+ * worked, but it is the kind of construct that changes under a new optimiser
+ * or a hardening flag, and this project has just moved from GCC 13 to 14.
+ * The compiler emits the same instructions for the power-of-two forms. */
 #define MOTION_REF_SHIFT      4U
+#define MOTION_REF_SCALE      (1 << MOTION_REF_SHIFT)
 
 /* Self-test: the datasheet's own pass band for the ±4 g range is wide, and
  * what matters here is that the mass moved at all rather than by how much. */
@@ -98,9 +108,43 @@ static uint32_t  _peak_dev_mg  = 0U;
 static uint32_t  _starts       = 0U;
 static uint32_t  _stops        = 0U;
 
+/* `rsd` on a motion start/stop notification is always 0 — ScopusQA #13.
+ *
+ * Both events used to carry a measurement: start sent the deviation in mg that
+ * opened the episode, stop sent how many seconds it lasted. That is genuinely
+ * useful on a bench and it is not what the field means. §4.2's `rsd` is
+ * "reason data", and for the detection reasons it is a *count of objects of
+ * that class* (nn_task.c::_nn_report_classes) — so a receiver that reads rsd
+ * uniformly saw `rsn=2, rsd=35` and had no way to know those 35 were
+ * milli-g and not 35 of something. One field cannot carry two units.
+ *
+ * The measurements are not lost: both still go to the trace log at the moment
+ * of the transition, and `motion query` reports last/peak deviation and the
+ * episode's still-time on demand.
+ *
+ * Note also that this whole module is single-threaded. `motion_sensor_poll()`
+ * runs from the shell loop (shell_task.c, next to the other notification
+ * producers) and `_motion_cmd` runs inside `lwshell_update()` on that same
+ * loop, so `force`/`config`/`status` cannot race the poll and the module state
+ * below needs no lock. Adding one would be free of contention and also free of
+ * effect; the single thread is the invariant, and it is worth keeping. */
+#define MOTION_RSD            0U
+
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------- */
+
+/** Sleep, without spinning. HAL_Delay() busy-waits on SysTick and never
+ *  yields, so the ~140 ms of settling time in motion_sensor_selftest() — and
+ *  the reset poll at init — were burned on the shell task with the scheduler
+ *  unable to run anything else. Everything in this module is called from a
+ *  ThreadX thread, so tx_thread_sleep is always legal here. */
+static void _sleep_ms(uint32_t ms)
+{
+  ULONG ticks = ((ULONG)ms * TX_TIMER_TICKS_PER_SECOND) / 1000UL;
+  if (ticks == 0U) { ticks = 1U; }
+  (void)tx_thread_sleep(ticks);
+}
 
 static int32_t _rd(uint16_t reg, uint8_t *buff, uint16_t size)
 {
@@ -130,6 +174,14 @@ static uint32_t _isqrt(uint32_t v)
     }
   }
   return root >> 1U;
+}
+
+/** Bound the no-motion timeout — see MOTION_TIMEOUT_MAX_S. The shell rejects
+ *  an out-of-range value with a message; this is the backstop for any other
+ *  caller, including a registry restored from an older firmware. */
+static uint32_t _clamp_timeout(uint32_t s)
+{
+  return (s > MOTION_TIMEOUT_MAX_S) ? (uint32_t)MOTION_TIMEOUT_MAX_S : s;
 }
 
 /** Sensitivity 0..100 → wake-up threshold. Linear in the sensor's own
@@ -173,8 +225,12 @@ bool motion_sensor_init(uint8_t sensitivity, uint32_t no_motion_timeout_s)
 {
   if (_probed) { return _present; }
   _probed      = true;
-  _sensitivity = sensitivity;
-  _timeout_s   = no_motion_timeout_s;
+  /* Clamp on this path too, not only in motion_sensor_config. _apply_threshold
+   * clamps internally so an out-of-range value never reached a register — but
+   * _sensitivity itself kept it, and `motion query` and the boot line then
+   * reported a sensitivity the detector was not using. */
+  _sensitivity = (sensitivity > 100U) ? 100U : sensitivity;
+  _timeout_s   = _clamp_timeout(no_motion_timeout_s);
 
   /* The sensors bus is only brought up by system_task when the ToF sensor is
    * compiled in, and it is not — so bring it up here. It is the same call with
@@ -215,7 +271,7 @@ bool motion_sensor_init(uint8_t sensitivity, uint32_t no_motion_timeout_s)
   for (uint32_t i = 0U; i < 20U; i++)
   {
     uint8_t c3 = 0U;
-    HAL_Delay(1);
+    _sleep_ms(1U);
     if ((_rd(LSM6_CTRL3_C, &c3, 1U) == BSP_OK) && ((c3 & 0x01U) == 0U)) { break; }
   }
 
@@ -257,7 +313,7 @@ bool motion_sensor_init(uint8_t sensitivity, uint32_t no_motion_timeout_s)
 void motion_sensor_config(uint8_t sensitivity, uint32_t no_motion_timeout_s)
 {
   _sensitivity = (sensitivity > 100U) ? 100U : sensitivity;
-  _timeout_s   = no_motion_timeout_s;
+  _timeout_s   = _clamp_timeout(no_motion_timeout_s);
   _apply_threshold();
   LINFO(TRACE_SHELL, "motion: sensitivity=%u (threshold %lu mg), "
         "no-motion timeout=%lu s",
@@ -287,15 +343,15 @@ void motion_sensor_force(bool active)
     _last_move   = now;
     _peak_dev_mg = 0U;
     _starts++;
-    shell_notify_emit(NOTIFY_RSN_MOTION_START, 0U);
+    shell_notify_emit(NOTIFY_RSN_MOTION_START, MOTION_RSD);
   }
   else if (!active && _active)
   {
     _active   = false;
     _ref_valid = false;
     _stops++;
-    shell_notify_emit(NOTIFY_RSN_MOTION_STOP,
-                      (now - _started) / TX_TIMER_TICKS_PER_SECOND);
+    /* rsd = 0 — see the note above shell_notify_emit's motion call sites. */
+    shell_notify_emit(NOTIFY_RSN_MOTION_STOP, MOTION_RSD);
   }
 }
 
@@ -311,9 +367,9 @@ int32_t motion_sensor_selftest(int32_t *delta_mg)
    * real wake-up event. Two settling times of ~100 ms bracket the reading —
    * the datasheet asks for the output to settle after the mode change. */
   (void)_wr(LSM6_CTRL5_C, 0x01U);          /* ST_XL = 01 */
-  HAL_Delay(120);
+  _sleep_ms(120U);
   int32_t rc = _read_axes(after);
-  HAL_Delay(20);
+  _sleep_ms(20U);
   (void)_wr(LSM6_CTRL5_C, 0x00U);
   if (rc != BSP_OK) { return BSP_ERROR_COMPONENT; }
 
@@ -349,14 +405,14 @@ void motion_sensor_poll(void)
 
   if (!_ref_valid)
   {
-    for (uint32_t i = 0U; i < 3U; i++) { _ref_q4[i] = a[i] << MOTION_REF_SHIFT; }
+    for (uint32_t i = 0U; i < 3U; i++) { _ref_q4[i] = a[i] * MOTION_REF_SCALE; }
     _ref_valid = true;
   }
 
   uint32_t sq = 0U;
   for (uint32_t i = 0U; i < 3U; i++)
   {
-    int32_t d = a[i] - (_ref_q4[i] >> MOTION_REF_SHIFT);
+    int32_t d = a[i] - (_ref_q4[i] / MOTION_REF_SCALE);
     sq += (uint32_t)(d * d);
   }
   uint32_t dev = _isqrt(sq);
@@ -377,9 +433,7 @@ void motion_sensor_poll(void)
       LINFO(TRACE_SHELL, "motion: started (%s, deviation %lu mg, "
             "threshold %lu mg)", wake ? "sensor wake-up" : "attitude change",
             (unsigned long)dev, (unsigned long)_ths_mg);
-      /* rsd carries the deviation that opened the episode, in mg — the one
-       * number a receiver can use to tell a nudge from a hard knock. */
-      shell_notify_emit(NOTIFY_RSN_MOTION_START, dev);
+      shell_notify_emit(NOTIFY_RSN_MOTION_START, MOTION_RSD);
     }
   }
   else if (_active)
@@ -393,8 +447,7 @@ void motion_sensor_poll(void)
       LINFO(TRACE_SHELL, "motion: stopped after %lu s still (episode %lu s, "
             "peak %lu mg)", (unsigned long)_timeout_s, (unsigned long)dur,
             (unsigned long)_peak_dev_mg);
-      /* rsd carries how long the episode lasted, in seconds. */
-      shell_notify_emit(NOTIFY_RSN_MOTION_STOP, dur);
+      shell_notify_emit(NOTIFY_RSN_MOTION_STOP, MOTION_RSD);
     }
   }
   else
@@ -402,7 +455,7 @@ void motion_sensor_poll(void)
     /* Still: let the reference follow the box. */
     for (uint32_t i = 0U; i < 3U; i++)
     {
-      _ref_q4[i] += ((a[i] << MOTION_REF_SHIFT) - _ref_q4[i]) >> MOTION_REF_SHIFT;
+      _ref_q4[i] += ((a[i] * MOTION_REF_SCALE) - _ref_q4[i]) / MOTION_REF_SCALE;
     }
   }
 }

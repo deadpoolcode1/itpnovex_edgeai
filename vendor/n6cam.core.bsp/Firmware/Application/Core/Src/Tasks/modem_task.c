@@ -166,16 +166,35 @@ static void _dispatch_frame(const uint8_t *frame, size_t len)
     if (line_end > i && frame[line_end - 1U] == '\r') line_end--;
     size_t line_len = line_end - i;
 
-    /* Stash in a small NUL-terminated scratch */
+    /* Stash in a small NUL-terminated scratch.
+     *
+     * A line longer than the scratch is cut and its tail is dropped on the
+     * floor by the `i = end + 1` below, so it arrives looking like a short,
+     * well-formed line — the worst shape for a truncation to have. Say so,
+     * once per occurrence, or the only evidence is a URC that quietly means
+     * something else. */
     char scratch[MODEM_URC_MAX];
     size_t copy = (line_len < sizeof(scratch) - 1U) ? line_len : (sizeof(scratch) - 1U);
+    if (copy < line_len)
+    {
+      _m.stats.rx_truncated++;
+      LWARNING(TRACE_MODEM, "rx: line of %u bytes truncated to %u — tail "
+               "discarded", (unsigned)line_len, (unsigned)copy);
+    }
     memcpy(scratch, &frame[i], copy);
     scratch[copy] = '\0';
 
-    if (_m.resp_active)
+    /* Test resp_active INSIDE resp_mtx. _send_at() clears it under the same
+     * lock from another task, so an unlocked test left a window in which a
+     * late reply to a command that had already timed out was appended to a
+     * response buffer just re-armed for the NEXT command — precisely the
+     * mix-up _send_at re-arms the collector to prevent. */
+    rtos_mutex_acquire(&_m.resp_mtx, true);
+    const bool active  = _m.resp_active;
+    bool       is_term = false;
+    if (active)
     {
-      rtos_mutex_acquire(&_m.resp_mtx, true);
-      bool is_term = _is_terminator(scratch, copy);
+      is_term      = _is_terminator(scratch, copy);
       bool is_urc  = _looks_like_urc(scratch, copy);
       if (is_urc && _m.urc_cb)
       {
@@ -198,7 +217,14 @@ static void _dispatch_frame(const uint8_t *frame, size_t len)
           rtos_raise_event(&_m.evt, MODEM_EVT_RESP_OVERFLOW);
         }
       }
-      rtos_mutex_acquire(&_m.resp_mtx, false);
+    }
+    rtos_mutex_acquire(&_m.resp_mtx, false);
+
+    /* Both of the following stay outside the lock, exactly as before: the
+     * event is raised after the release, and the no-command-in-flight URC has
+     * never been forwarded under resp_mtx. */
+    if (active)
+    {
       if (is_term)
       {
         rtos_raise_event(&_m.evt, MODEM_EVT_RESP_DONE);
@@ -257,15 +283,23 @@ static void _feed_chunk(const uint8_t *buf, size_t len)
       _m.stats.rx_stray++;
     }
 
-    if (!hdlc_decoder_feed(&_m.dec, buf[i], &finished))
+    t_hdlc_feed fr = hdlc_decoder_feed(&_m.dec, buf[i], &finished);
+    if (fr < 0)
     {
-      /* Bad CRC / overflow — decoder is already reset; just keep going. */
-      _m.stats.rx_bad++;
+      /* Decoder is already reset either way; keep going. The two are counted
+       * apart because they mean different things on a bench: a bad CRC is a
+       * noisy or half-latched wire, an overflow is a peer whose frames are
+       * simply bigger than MODEM_DEC_MAX. */
+      if (fr == HDLC_FEED_ERR_CAP) { _m.stats.rx_overflow++; }
+      else                         { _m.stats.rx_bad++;      }
       continue;
     }
-    if (finished > 0U)
+    if (fr == HDLC_FEED_FRAME)
     {
       _m.stats.rx_frames++;
+      /* `finished` may legitimately be 0 — a CRC-only frame. _dispatch_frame
+       * returns immediately on that, which is what we want; what matters is
+       * that it now counts as a frame rather than as nothing at all. */
       _dispatch_frame(_m.dec_out, finished);
       /* Re-arm decoder by re-init'ing — same buffer. */
       hdlc_decoder_init(&_m.dec, _m.dec_out, sizeof(_m.dec_out));
@@ -626,8 +660,17 @@ int32_t modem_send_binary(const char *prefix_line,
   rtos_mutex_acquire(&_m.tx_mtx, true);
 
   /* First frame: prefix + CRLF (mirrors the AT-line shape so the modem's
-   * SDVR+SENDBIN handler can parse parameters before binary starts). */
-  uint8_t pre[MODEM_FRAME_MAX];
+   * SDVR+SENDBIN handler can parse parameters before binary starts).
+   *
+   * Static, for the same reason and under the same guarantee as _send_at's
+   * payload buffer: MODEM_FRAME_MAX is a kilobyte, the only caller is
+   * snapshot_task's photo upload, and SNAPSHOT_TASK_STACK_SIZE is 2 KB — a
+   * kilobyte of that on one frame, under snapshot_task's own prefix[160] and
+   * the _tx_framed() frame below it, is the same big-frame-on-a-small-stack
+   * fault this codebase has already been bitten by twice. tx_mtx is held
+   * across every use, which is exactly what makes sharing the buffer safe,
+   * so this must not be "optimised" back into a local. */
+  static uint8_t pre[MODEM_FRAME_MAX];
   memcpy(pre, prefix_line, pre_len);
   pre[pre_len]      = _crlf[0];
   pre[pre_len + 1U] = _crlf[1];
@@ -657,11 +700,23 @@ int32_t modem_send_binary(const char *prefix_line,
   return 0;
 }
 
+/* ntf_dropped is incremented on paths that return before ntf_mtx is taken —
+ * or, for the queue-full case, just after it is released — while ntf_queued is
+ * incremented under it. Unsynchronised increments lose counts, and these two
+ * counters are what the bench reads to judge link health, so give the drop
+ * path the same lock as the enqueue path. */
+static void _ntf_drop(void)
+{
+  rtos_mutex_acquire(&_m.ntf_mtx, true);
+  _m.stats.ntf_dropped++;
+  rtos_mutex_acquire(&_m.ntf_mtx, false);
+}
+
 int32_t modem_notify_async(const char *at_line)
 {
   if ((at_line == NULL) || (at_line[0] == '\0'))
   {
-    _m.stats.ntf_dropped++;
+    _ntf_drop();
     return -1;
   }
 
@@ -673,7 +728,7 @@ int32_t modem_notify_async(const char *at_line)
      * that never left. */
     LERROR(TRACE_MODEM, "notify: line of %u bytes exceeds %u, dropped",
            (unsigned)len, (unsigned)(MODEM_NOTIFY_MAX - 1U));
-    _m.stats.ntf_dropped++;
+    _ntf_drop();
     return -1;
   }
 
@@ -686,7 +741,7 @@ int32_t modem_notify_async(const char *at_line)
      * events are the ones with a chance of still being sent. */
     LWARNING(TRACE_MODEM, "notify: queue full (%u), dropping",
              (unsigned)MODEM_NOTIFY_DEPTH);
-    _m.stats.ntf_dropped++;
+    _ntf_drop();
     return -2;
   }
 

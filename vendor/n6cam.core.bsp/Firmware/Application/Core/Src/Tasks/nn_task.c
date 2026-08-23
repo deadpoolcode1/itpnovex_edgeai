@@ -175,22 +175,33 @@ int32_t nn_task_start(void)
   );
 }
 
-uint32_t nn_get_detections(t_nn_box* box_buff)
+uint32_t nn_get_detections(t_nn_box* box_buff, uint32_t box_cap)
 {
   /* Validate */
-  if (!box_buff || (_pp_box_count == 0))
+  if (!box_buff || (box_cap == 0U))
   {
     return 0;
   }
 
-  /* Capture detections */
+  /* Capture detections.
+   *
+   * The count is re-read and bounded inside the lock against BOTH the
+   * destination's capacity and our own array. Trusting a global for the
+   * length of a memcpy into a caller's buffer is what made a bad
+   * `_pp_box_count` a memory-corruption bug rather than a wrong number. */
   rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
 
-  memcpy(box_buff, &_pp_box_buff, _pp_box_count * sizeof(t_nn_box));
+  uint32_t n = (uint32_t)_pp_box_count;
+  if (n > (uint32_t)NN_BOXES_MAX_NUM) { n = (uint32_t)NN_BOXES_MAX_NUM; }
+  if (n > box_cap)                    { n = box_cap; }
+  if (n > 0U)
+  {
+    memcpy(box_buff, &_pp_box_buff[0], (size_t)n * sizeof(t_nn_box));
+  }
 
   /* Release and return */
   rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
-  return _pp_box_count;
+  return n;
 }
 
 uint32_t nn_task_suspend_thread(void)
@@ -624,6 +635,16 @@ void nn_task_simulate_detection(uint32_t boxes)
 
 void nn_task_simulate_detection_class(uint32_t boxes, int32_t class_index)
 {
+  /* Clamp here and not only at the shell. `_pp_box_count` is the count every
+   * consumer copies out of a `_pp_box_buff[NN_BOXES_MAX_NUM]`, and the live
+   * inference path guarantees the invariant in `_pp_publish_objects`; this
+   * path used to publish the caller's number verbatim, so `detect simulate
+   * 1000` made `nn_get_detections` read ~24 KB out of a 480-byte array and
+   * write it into a 480-byte destination — on the shell task's 2 KB stack,
+   * and on every camera frame into display_task's `.bss`. Clamping in the
+   * setter fixes every caller at once. */
+  if (boxes > (uint32_t)NN_BOXES_MAX_NUM) { boxes = (uint32_t)NN_BOXES_MAX_NUM; }
+
   rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
   _pp_box_count = (size_t)boxes;
   if (boxes > 0U)

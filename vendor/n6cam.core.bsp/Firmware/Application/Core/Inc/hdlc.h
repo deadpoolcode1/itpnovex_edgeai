@@ -68,27 +68,44 @@ bool hdlc_encode(const uint8_t *payload, size_t payload_len,
  */
 void hdlc_decoder_init(t_hdlc_decoder *d, uint8_t *out, size_t out_cap);
 
+/** Result of one hdlc_decoder_feed() call.
+ *
+ *  This is an enum rather than a bool for two reasons the boolean could not
+ *  express. A frame carrying only a CRC is valid and has payload_len 0, which
+ *  as a `true` plus `*frame_out = 0` was indistinguishable from "byte
+ *  consumed, nothing finished". And a CRC mismatch and a buffer overflow both
+ *  returned `false`, so a caller could not tell a corrupted link from a peer
+ *  sending frames larger than this decoder — two faults with different cures,
+ *  counted together in one statistic. */
+typedef enum
+{
+  HDLC_FEED_OK       =  0,   /*!< byte consumed, no frame completed        */
+  HDLC_FEED_FRAME    =  1,   /*!< frame completed; *frame_out is its length
+                              *   (0 is legal: a CRC-only frame)           */
+  HDLC_FEED_ERR_CRC  = -1,   /*!< frame ended with a bad CRC; auto-reset   */
+  HDLC_FEED_ERR_CAP  = -2,   /*!< payload exceeded out_cap; auto-reset     */
+} t_hdlc_feed;
+
 /**
  * @brief Feed one wire byte into the decoder.
  *
  * @param  d            Decoder state.
  * @param  b            Next byte off the wire.
- * @param  frame_out    [out] When a complete, CRC-valid frame finishes,
- *                      *frame_out is set to the payload length (excluding
- *                      the trailing CRC). Caller reads `d->out` and resets
- *                      via hdlc_decoder_init() or another feed cycle.
- *                      Otherwise *frame_out stays 0.
- * @return true on success, false on overflow / bad CRC (decoder is auto-
- *         reset for the next frame either way).
+ * @param  frame_out    [out] Set to the payload length (excluding the
+ *                      trailing CRC) when HDLC_FEED_FRAME is returned;
+ *                      0 otherwise. Caller reads `d->out` and resets via
+ *                      hdlc_decoder_init() or another feed cycle.
+ * @return see t_hdlc_feed. The decoder is auto-reset on either error.
  */
-bool hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out);
+t_hdlc_feed hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out);
 
 /**
  * @brief Compute CCITT-CRC16 over a buffer. Useful for the host-side
  *        encoder + for unit-testing the framing in isolation.
  *
  *        Poly 0x1021, init 0xFFFF, no input/output reflection, no XOR-out.
- *        Standard "CRC-16/XMODEM" / "CRC-CCITT (XModem)".
+ *        That is "CRC-16/CCITT-FALSE" — *not* CRC-16/XMODEM, which uses the
+ *        same polynomial with init 0x0000.
  */
 uint16_t hdlc_crc16(const uint8_t *data, size_t len);
 

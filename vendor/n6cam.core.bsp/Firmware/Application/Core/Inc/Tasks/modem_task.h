@@ -71,6 +71,8 @@ typedef void (*t_modem_urc_cb)(const char *line, size_t len, void *user_ctx);
  *    rx_bytes > 0, rx_stray high    → bytes arrive but never frame: far end
  *                                     isn't speaking HDLC, or baud/levels are
  *                                     wrong enough to corrupt every flag byte
+ *    rx_overflow > 0                → frames arrive but are longer than the
+ *                                     decoder buffer: a wrong peer, not noise
  *    rx_bad > 0                     → flags found but CRC fails: framing is
  *                                     right, the line is corrupting payload
  *    uart_errors climbing           → ORE/FE/NE at the peripheral
@@ -80,8 +82,10 @@ typedef struct
 {
   uint32_t rx_bytes;      /*!< raw bytes read off USART2 */
   uint32_t rx_frames;     /*!< CRC-valid HDLC frames decoded */
-  uint32_t rx_bad;        /*!< frames dropped: bad CRC or decoder overflow */
+  uint32_t rx_bad;        /*!< frames dropped: bad CRC (see rx_overflow)   */
+  uint32_t rx_overflow;   /*!< frames dropped: payload exceeded the decoder */
   uint32_t rx_stray;      /*!< bytes seen outside any frame */
+  uint32_t rx_truncated;  /*!< lines cut to MODEM_URC_MAX, tail discarded   */
   uint32_t rx_errors;     /*!< bsp_uart_read() error returns */
   uint32_t rx_timeouts;   /*!< bsp_uart_read() timeouts (idle link) */
   uint32_t tx_frames;     /*!< HDLC frames written to USART2 */

@@ -620,7 +620,7 @@ static void _display_add_detections(void)
     return;
   }
 
-  size_t count = nn_get_detections(_display_box_buff);
+  size_t count = nn_get_detections(_display_box_buff, NN_BOXES_MAX_NUM);
 
   /* Display */
   uint32_t selected_count = 0;

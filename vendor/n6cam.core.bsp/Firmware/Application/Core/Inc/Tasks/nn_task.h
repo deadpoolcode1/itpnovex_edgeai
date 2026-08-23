@@ -112,7 +112,7 @@ int32_t nn_task_start(void);
  * @param box_buff   Detected object
  * @return Box count
  */
-uint32_t nn_get_detections(t_nn_box* box_buff);
+uint32_t nn_get_detections(t_nn_box* box_buff, uint32_t box_cap);
 
 /**
  * @brief Suspend the NN task. While suspended it stops consuming camera

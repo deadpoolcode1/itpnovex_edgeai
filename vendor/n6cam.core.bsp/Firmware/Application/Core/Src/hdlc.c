@@ -9,7 +9,11 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* CRC-16/XMODEM (poly 0x1021, init 0xFFFF, no reflection, no out-XOR).      */
+/* CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no out-XOR). */
+/* NOT CRC-16/XMODEM, which this used to be called: XMODEM is the same poly   */
+/* with init 0x0000. Both ends agree, so the name never caused an interop     */
+/* bug here — it would cause one for anyone writing a third implementation    */
+/* from the comment. tools/hdlc.py carries the same correction.               */
 /* Table-driven to keep per-byte cost at one XOR + one shift + one lookup.   */
 /* Table precomputed below — 512 B of flash for a meaningful TX/RX speedup.  */
 /* ------------------------------------------------------------------------- */
@@ -125,7 +129,7 @@ static void _reset_frame(t_hdlc_decoder *d)
   d->escape   = false;
 }
 
-bool hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out)
+t_hdlc_feed hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out)
 {
   if (frame_out != NULL) *frame_out = 0U;
 
@@ -146,15 +150,15 @@ bool hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out)
       if (ok && frame_out != NULL) *frame_out = payload_len;
       _reset_frame(d);
       d->in_frame = true;   /* the same flag also opens the next frame */
-      return ok;
+      return ok ? HDLC_FEED_FRAME : HDLC_FEED_ERR_CRC;
     }
     /* Empty / partial → just (re)arm. */
     _reset_frame(d);
     d->in_frame = true;
-    return true;
+    return HDLC_FEED_OK;
   }
 
-  if (!d->in_frame) return true;  /* discard inter-frame noise */
+  if (!d->in_frame) return HDLC_FEED_OK;  /* discard inter-frame noise */
 
   if (d->escape)
   {
@@ -164,15 +168,15 @@ bool hdlc_decoder_feed(t_hdlc_decoder *d, uint8_t b, size_t *frame_out)
   else if (b == HDLC_ESC)
   {
     d->escape = true;
-    return true;
+    return HDLC_FEED_OK;
   }
 
   if (d->out_len >= d->out_cap)
   {
     /* Overflow — abort this frame, wait for the next flag. */
     _reset_frame(d);
-    return false;
+    return HDLC_FEED_ERR_CAP;
   }
   d->out[d->out_len++] = b;
-  return true;
+  return HDLC_FEED_OK;
 }

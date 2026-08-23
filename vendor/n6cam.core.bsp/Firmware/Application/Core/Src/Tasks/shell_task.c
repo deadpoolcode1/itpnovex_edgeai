@@ -195,6 +195,7 @@ typedef struct
 static void     _shell_task_init(void);
 static void     _shell_task_run(uint32_t args);
 static void     _mdm_urc_forward(const char *line, size_t len, void *ctx);
+static void     _notify_drain_deferred(void);
 /* Remote command channel — see the block comment above the definitions. */
 static int32_t  _rcmd_stream_read(uint8_t *buff, size_t size, uint32_t timeout);
 static int32_t  _rcmd_stream_write(const uint8_t *buff, size_t size, uint32_t timeout);
@@ -259,6 +260,12 @@ static bool _frame_loaded = false;
  * CDC copy is suppressed, and only for the length of the transfer. */
 static volatile bool _shell_binary_rx = false;
 
+/* Upper bound on `notify period`, for the same reason as MOTION_TIMEOUT_MAX_S:
+ * the shell loop compares `(now - last) >= period * TX_TIMER_TICKS_PER_SECOND`
+ * in 32-bit ticks, so a large period wraps into a very short one and the unit
+ * reports far more often than asked, not less. */
+#define NOTIFY_PERIOD_MAX_S     (86400UL)
+
 /* Notification numerator (rolls over at 0xFFFF per SoW §6). */
 static uint32_t _notify_num = 0U;
 
@@ -287,6 +294,36 @@ static char     _notify_json[192];
 static char     _notify_line[256];
 static char     _notify_enc[192];
 static char     _notify_at[MODEM_NOTIFY_MAX];
+
+/* Deferred CDC copies of notifications composed on another thread.
+ *
+ * A single stream_write is already atomic — slib32 takes the stream's write
+ * lock and ux_device_cdc's _cdc_write takes _cdc_mtx_tx underneath it — so a
+ * `+SDVRNTF:` line has never been able to be cut in half by a concurrent
+ * write. What it CAN do is land *between* two lines of a multi-line command
+ * response: `camera status` and friends print a line per CMD_PRINTF, and the
+ * NN task emits notifications on its own thread, at any moment. The host
+ * protocol is line-oriented and reads a response as a block, so an unrelated
+ * line inside one desyncs the parser — the same failure `_shell_binary_rx`
+ * already prevents for bulk transfers, in its cheaper text form.
+ *
+ * So: a notification raised ON the shell thread is written inline, because
+ * the shell is by definition not part-way through printing something else;
+ * one raised on any other thread is parked here and written by the shell loop
+ * between two lwshell_update() calls, which is the same "drain where the
+ * shell is provably idle" split shell_notify_netreg and shell_remote_cmd_post
+ * already use. The modem leg is unaffected — it was already queued, and it is
+ * the leg that reaches the server.
+ *
+ * Four slots, because the ring only fills while a single command is printing;
+ * if it does overflow the line is written inline rather than dropped, since an
+ * interleaved line is a parser nuisance and a lost one is a missing event. */
+#define NOTIFY_DEFER_DEPTH   4U
+static char     _notify_defer[NOTIFY_DEFER_DEPTH][sizeof(_notify_line)];
+static uint16_t _notify_defer_len[NOTIFY_DEFER_DEPTH];
+static uint8_t  _notify_defer_head;
+static uint8_t  _notify_defer_count;
+static uint32_t _notify_defer_inline;   /* times the ring was full */
 
 /* One command line and its output. Sized against what the shell actually
  * prints: the longest single response, `commands`, is ~1.2 KB. Anything
@@ -701,6 +738,10 @@ static void _shell_task_run(uint32_t args)
       _shell.update = false;
       lwshell_stream_change(_shell.stream);
     }
+
+    /* Notifications another thread raised while a command was printing. Here,
+     * between two updates, is where they cannot split a response. */
+    _notify_drain_deferred();
 
     /* A command that arrived from the server, run here rather than on the
      * modem task's thread — lwshell belongs to this loop. Between updates
@@ -1302,9 +1343,31 @@ static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool force)
   {
     char *const buf = _notify_line;
     int n = snprintf(buf, sizeof(_notify_line), "+SDVRNTF: %s\r\n", json);
-    if ((n > 0) && (_shell.stream != NULL) && !_shell_binary_rx)
+    /* snprintf returns what it WOULD have written, so an over-long body would
+     * have handed stream_write a length past the end of the buffer. The JSON
+     * is bounded well under this, but the length that reaches a write must
+     * come from the buffer and not from the formatter. */
+    if ((n > 0) && ((size_t)n < sizeof(_notify_line)) &&
+        (_shell.stream != NULL) && !_shell_binary_rx)
     {
-      stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+      if (tx_thread_identify() == &_shell.thread)
+      {
+        /* Our own thread: nothing of ours is half-printed. */
+        stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+      }
+      else if (_notify_defer_count < NOTIFY_DEFER_DEPTH)
+      {
+        uint8_t slot = (uint8_t)((_notify_defer_head + _notify_defer_count) %
+                                 NOTIFY_DEFER_DEPTH);
+        memcpy(_notify_defer[slot], buf, (size_t)n);
+        _notify_defer_len[slot] = (uint16_t)n;
+        _notify_defer_count++;
+      }
+      else
+      {
+        _notify_defer_inline++;
+        stream_write(_shell.stream, (uint8_t*)buf, (size_t)n, 100U);
+      }
     }
 
     if ((size_t)jn > NOTIFY_JSON_MAX)
@@ -1372,6 +1435,33 @@ static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool force)
 static void _notify_emit(uint32_t rsn, uint32_t rsd)
 {
   _notify_emit_ex(rsn, rsd, false);
+}
+
+/* Write out any notification parked by another thread. Shell thread only:
+ * this is the point the deferral exists to reach. */
+static void _notify_drain_deferred(void)
+{
+  for (;;)
+  {
+    rtos_mutex_acquire(&_notify_mtx, true);
+    if (_notify_defer_count == 0U)
+    {
+      rtos_mutex_acquire(&_notify_mtx, false);
+      return;
+    }
+    uint8_t slot = _notify_defer_head;
+    size_t  n    = (size_t)_notify_defer_len[slot];
+    /* Written under _notify_mtx, exactly as the inline path is: the lock is
+     * what keeps the slot from being refilled while it is on the wire, and
+     * emitters already serialise on it for the whole compose. */
+    if ((n > 0U) && (_shell.stream != NULL) && !_shell_binary_rx)
+    {
+      stream_write(_shell.stream, (uint8_t*)_notify_defer[slot], n, 100U);
+    }
+    _notify_defer_head = (uint8_t)((slot + 1U) % NOTIFY_DEFER_DEPTH);
+    _notify_defer_count--;
+    rtos_mutex_acquire(&_notify_mtx, false);
+  }
 }
 
 /* Public entry point for producers outside this file — today the NN task's
@@ -1776,7 +1866,7 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 
     uint32_t boxes = nn_task_get_box_count();
     t_nn_box  buf[NN_BOXES_MAX_NUM];
-    uint32_t  got = nn_get_detections(buf);
+    uint32_t  got = nn_get_detections(buf, NN_BOXES_MAX_NUM);
     float nn_ms = stat_value(STAT_TIME_NN_TOTAL);
     CMD_PRINTF(stream, "frame run: %lu detection(s), NN %.1fms%s",
                (unsigned long)boxes, nn_ms, lwshell_eol());
@@ -2044,7 +2134,7 @@ static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
       n_infer++;
 
       t_nn_box buf[NN_BOXES_MAX_NUM];
-      uint32_t got = nn_get_detections(buf);
+      uint32_t got = nn_get_detections(buf, NN_BOXES_MAX_NUM);
       for (uint32_t i = 0U; i < got; i++)
       {
         n_raw++;
@@ -2582,7 +2672,12 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   if ((strcmp(sub, "period") == 0) && (argc >= 3U))
   {
     long s = atol((char*)argv[2]);
-    if (s < 0) return LWSHELL_ERROR_SYNTAX_CMD;
+    if ((s < 0) || (s > (long)NOTIFY_PERIOD_MAX_S))
+    {
+      CMD_PRINTF(stream, "notify period: seconds must be 0..%lu%s",
+                 (unsigned long)NOTIFY_PERIOD_MAX_S, lwshell_eol());
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
     t_registry_data *reg = registry_acquire();
     if (reg) { reg->notify_period_s = (uint32_t)s; registry_release(); registry_request_save(); }
     CMD_PRINTF(stream, "notify period: %lds%s", s, lwshell_eol());
@@ -2636,12 +2731,22 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   }
   if (strcmp(sub, "simulate") == 0)
   {
-    /* default to 1 box if no count given */
+    /* default to 1 box if no count given.
+     *
+     * The count is bounded here as well as in nn_task_simulate_detection_class:
+     * the published set can never exceed NN_BOXES_MAX_NUM, so a larger number
+     * is an operator mistake and saying so is more use than silently clamping
+     * it and then reporting a count the unit did not accept. */
     uint32_t boxes = 1U;
     if (argc >= 3U)
     {
       long n = atol((char*)argv[2]);
-      if (n < 0) return LWSHELL_ERROR_SYNTAX_CMD;
+      if ((n < 0) || (n > (long)NN_BOXES_MAX_NUM))
+      {
+        CMD_PRINTF(stream, "detect simulate: N must be 0..%u%s",
+                   (unsigned)NN_BOXES_MAX_NUM, lwshell_eol());
+        return LWSHELL_ERROR_SYNTAX_CMD;
+      }
       boxes = (uint32_t)n;
     }
     /* Optional class: `detect simulate 2 vehicle`. The detector is
@@ -2862,8 +2967,10 @@ static int32_t _motion_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   {
     int  s = atoi((char*)argv[2]);
     long t = atol((char*)argv[3]);
-    if ((s < 0) || (s > 100) || (t < 0))
+    if ((s < 0) || (s > 100) || (t < 0) || (t > (long)MOTION_TIMEOUT_MAX_S))
     {
+      CMD_PRINTF(stream, "motion sense: sensitivity 0..100, timeout 0..%lu s%s",
+                 (unsigned long)MOTION_TIMEOUT_MAX_S, lwshell_eol());
       return LWSHELL_ERROR_SYNTAX_CMD;
     }
 
@@ -4383,11 +4490,13 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     t_modem_stats st;
     modem_get_stats(&st);
     CMD_PRINTF(stream,
-      "rx: bytes=%lu frames=%lu badcrc=%lu stray=%lu err=%lu timeouts=%lu%s"
+      "rx: bytes=%lu frames=%lu badcrc=%lu overflow=%lu trunc=%lu "
+      "stray=%lu err=%lu timeouts=%lu%s"
       "tx: frames=%lu err=%lu retries=%lu   usart2 err(ORE/FE/NE)=%lu%s",
-      (unsigned long)st.rx_bytes, (unsigned long)st.rx_frames,
-      (unsigned long)st.rx_bad,   (unsigned long)st.rx_stray,
-      (unsigned long)st.rx_errors,(unsigned long)st.rx_timeouts, lwshell_eol(),
+      (unsigned long)st.rx_bytes,     (unsigned long)st.rx_frames,
+      (unsigned long)st.rx_bad,       (unsigned long)st.rx_overflow,
+      (unsigned long)st.rx_truncated, (unsigned long)st.rx_stray,
+      (unsigned long)st.rx_errors,    (unsigned long)st.rx_timeouts, lwshell_eol(),
       (unsigned long)st.tx_frames,(unsigned long)st.tx_errors,
       (unsigned long)st.tx_retries,
       (unsigned long)st.uart_errors, lwshell_eol());
@@ -4494,8 +4603,10 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       for (size_t i = 0U; i < wire_len; i++)
       {
         size_t finished = 0U;
-        hdlc_decoder_feed(&d, test_wire[i], &finished);
-        if (finished) got = finished;
+        if (hdlc_decoder_feed(&d, test_wire[i], &finished) == HDLC_FEED_FRAME)
+        {
+          got = finished;
+        }
       }
       CMD_PRINTF(stream,
         "mdm test echo: wire=%u bytes, decoded=%u bytes, match=%s%s",

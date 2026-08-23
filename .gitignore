@@ -26,6 +26,11 @@ out/
 *.obj
 *.d
 *.a
+# ...but not ST's prebuilt AI runtime. That is a vendored source input, not
+# build output: nothing in this tree can produce it, and without it the
+# firmware does not link. The blanket *.a above silently excluded it from
+# every delivery until 2026-08-21.
+!vendor/n6cam.core.bsp/Firmware/Lib/AI_Runtime/Lib/GCC/ARMCortexM55/*.a
 *.list
 *.su
 *.cyclo
@@ -96,3 +101,7 @@ vendor/n6cam.core.bsp/Firmware/Model/_backup_*/
 # Scopus whole-system + integration suite reports — regenerated per run
 scopus/results/
 scopus/**/__pycache__/
+
+# ScopusQA #11 — this site's addresses, ports and passwords. The committed
+# copy is scopus/bench.ini.template, which carries placeholders only.
+scopus/bench.ini

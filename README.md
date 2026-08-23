@@ -2,7 +2,7 @@
 
 Custom firmware for the SIANA N6Cam (STM32N657, IMX335 5MP camera + Neural-Art NPU) per the Scopus PoC SoW. Streams H.264 over USB-C UVC, runs on-device **person detection** (NN at ~17 ms / frame on the ATON NPU), captures JPEGs to SD, and (when wired) tunnels alerts + photos to a WP76 modem over UART.
 
-**Detection status:** the firmware-side wiring supports both people and vehicle classes (bitmask filter, COCO classes 0/2/3/5/7). The model currently in flash is the vendor's `yolov8n_192_quant_pc_uf_od_coco-person-st.tflite` (person-only). Multi-class deployment is mechanism-complete — `update model` over UART works end-to-end — but blocked on a production-grade multi-class quantized model for STM32N6 (see [§6 Detection model](#6-detection-model)).
+**Detection status:** people **and** vehicles, both live. The model in flash is a person+vehicle YOLOv8n at 256×256 (`gen_best.onnx`, 80-class COCO output), and `_class_passes_mask()` in `nn_task.c` maps COCO 0 to the people bit and COCO 1–8 (bicycle, car, motorcycle, airplane, bus, train, truck, boat) to the vehicle bit. Each class is reported under its own SoW §4.2 reason code — `0x10` people, `0x20` vehicles. See [§6 Detection model](#6-detection-model), and `vendor/n6cam.core.bsp/Firmware/Model/README.md` for exactly which model is committed and how to rebuild it.
 
 | Property | Value |
 |---|---|
@@ -136,6 +136,38 @@ To build the FSBL too, use `-import vendor/.../STM32CubeIDE/FSBL -build "FSBL/Re
 
 The scripts open the kit's CDC port, trigger the `update [app|model]` shell command, stream the signed payload (auto-converting Intel HEX → binary on the host if needed), and the kit reboots. App = ~5 s, model = ~30–60 s (large erase). Both targets work without SWD or the boot switch.
 
+#### What the update path does and does not protect against
+
+**Physical access to the USB-C port is equivalent to firmware-write access.**
+This is a deliberate property of the development build, not an oversight, and
+it is worth stating plainly rather than leaving to be discovered.
+
+The shell has no authentication. `update app|model` accepts an image guarded by
+a 4-byte magic and a **CRC32**, which is an integrity check against a corrupted
+transfer — not an authenticity check against someone choosing the bytes. The
+UART recovery listener likewise triggers on the plain string `recovery`
+arriving on USART1.
+
+The two slots are not equally exposed:
+
+- **App slot** — the STM32N6 boot ROM verifies the signed image header, so a
+  forged application does not execute; it bricks the unit into recovery. The
+  signature is what protects this slot, and it is outside the shell's control.
+- **Model slot** — has **no** such check. `update model` writes the supplied
+  bytes to `SLOT1_WEIGHTS` and the NPU subsequently executes them as a network
+  description.
+
+The bounds handling itself is sound in both cases: the size is validated
+against `max_size` before the payload is read, the read is a fixed-count
+`_stream_read_exact()`, and the CRC32 is verified before anything is erased.
+
+For a deployed product where USB-C is reachable by someone untrusted, the
+options are to sign the model blob the same way the application is signed and
+verify before the erase, or to gate `update`, `recovery` and `sd format`
+behind a build-time `CONFIG_ALLOW_FIELD_UPDATE` so production images can drop
+them entirely. Neither is done here: on this bench the port is the intended
+way to load firmware, and removing it would remove the daily workflow above.
+
 ### Recovery / FSBL path: SWD via STLink-V3 (boot switch needed)
 
 Only required when changing the FSBL itself, or when the Application is bricked enough that USB-C won't enumerate.
@@ -168,9 +200,11 @@ Per-image inference tests (groups 9 + 11) embed the 192×192 source frame next t
 
 ## 6. Detection model
 
-The model in flash today is `yolov8n_relu30` — 80-class COCO YOLOv8n, lightly fine-tuned on COCO128, INT8 on the ATON NPU at 192×192 input, ~42 ms / inference. People and vehicle classes both fire end-to-end via the firmware's expanded class filter (`nn_task.c::_class_passes_mask` treats COCO 2/3/4/5/6/7/8 — car/motorcycle/airplane/bus/train/truck/boat — as one transport bucket because the 192×192 quantised model frequently misclassifies vehicles into adjacent categories). The historical 1-class model (`yolov8n_192_quant_pc_uf_od_coco-person-st.tflite`, 17 ms / frame) is preserved at `vendor/n6cam.core.bsp/Firmware/Model/_backup_person_only/` if you ever need a smaller / faster single-class baseline.
+The model in flash today is **`gen_best.onnx`** — a genuine-ReLU YOLOv8n retrained for person+vehicle, INT8 on the ATON NPU at **256×256** input, output `(84, 1344)` = 4 box coordinates + 80 COCO classes, ~90 ms / inference. `stai_network.h` records it as `STAI_NETWORK_ORIGIN_MODEL_NAME "gen_best_OE_3_3_1"`, and that header is the authority on what is committed — **`generate.sh` and `network_generate_report.txt` both name earlier models and are stale**. The full provenance, the exact `stedgeai` invocation, and the rebuild procedure are in [`vendor/n6cam.core.bsp/Firmware/Model/README.md`](vendor/n6cam.core.bsp/Firmware/Model/README.md).
 
-The firmware-side wiring is multi-class capable — `detect profile <det_msk> <act_msk>` filters by class bitmask (bit 0 = people, bit 1 = vehicles → COCO 2/3/5/7), and the regression suite already understands `car=N` / `truck=N` / etc. The moment a multi-class quantized model lands in `vendor/.../Model/network_data.hex`, vehicles light up automatically with no firmware code changes — just bump `AI_OD_YOLOV8_PP_NB_CLASSES` from 1 to N and re-run `./modular-tools.sh build && ./modular-tools.sh update` + `./modular-tools.sh update model`.
+People and vehicle classes both fire end-to-end via `nn_task.c::_class_passes_mask`, which treats COCO 1–8 — bicycle/car/motorcycle/airplane/bus/train/truck/boat — as one transport bucket, because a quantised model of this size frequently misclassifies vehicles into adjacent categories. Two earlier models are preserved beside it: `_backup_person_only/` (the vendor's single-class `yolov8n_192_quant_pc_uf_od_coco-person-st.tflite`, 17 ms / frame, if you ever want a smaller/faster baseline) and `_backup_relu30/` (the 192×192 multi-class experiment it replaced).
+
+`detect profile <det_msk> <act_msk>` filters by class bitmask (bit 0 = people, bit 1 = vehicles). `AI_OD_YOLOV8_PP_NB_CLASSES` in `app_config.h` is already 80; a different model needs that number changed to match, then `./modular-tools.sh build && ./modular-tools.sh update` + `./modular-tools.sh update model`.
 
 The full pipeline for producing a custom model is committed under `tools/quantize_yolov8n.py` (ONNX Runtime static quantization with COCO128 calibration). What's blocking production multi-class today is **model accuracy after PTQ** — Ultralytics' post-training quantization on `yolov8n.pt` collapses confidence scores when fed through `stedgeai → ATON → vendor's app_postprocess_od_yolov8`. Production-grade accuracy requires either QAT (quantization-aware training on a GPU) or a vendor-blessed multi-class N6 model from ST. See `tests/README.md` for the experimental results and what each variant produced.
 
