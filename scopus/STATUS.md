@@ -7,8 +7,22 @@ Last updated: 2026-08-23. Everything below was measured on the bench, not inferr
 ## 2026-08-23 — ScopusQA #10 – #15 closed
 
 Camera build `Aug 23 2026 19:46:30`, modem app **1.14.0** (Legato system 63,
-marked good). System suite after the work: **49 total, 32 PASS / 0 FAIL /
-17 SKIP**.
+marked good). Both suites after the work, on a bench whose FTDI adapter is
+unplugged:
+
+| Suite | Result |
+|---|---|
+| `run_scopus_tests.py` | **49 total — 32 PASS / 0 FAIL / 17 SKIP** |
+| `run_integration_tests.py` | **64 total — 48 PASS / 0 FAIL / 1 GAP / 15 SKIP** |
+
+Every skip names its bench condition on the line. The integration suite needs
+the device in **UDP notification mode** (`AT+SDVRNTFPROTO=0`); in HTTP mode
+groups E, H and K5 have no datagram to observe and fail for that reason alone.
+Put it back to `PROTO=1` with the customer's host afterwards.
+
+The one GAP is C7 and is unchanged from previous sessions: the live inference
+loop fires an SD snapshot on the 0→N edge but does not raise `+SDVRNTF` from
+that path — `detect simulate` does, which is what C6 covers.
 
 ### The bench is missing its FTDI adapter today, and that is what every SKIP is
 
