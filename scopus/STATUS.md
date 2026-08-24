@@ -1448,6 +1448,43 @@ redoes GPIO + peripheral and leaves the RTOS objects alone.
 Still true: a hardware translator with a direction GPIO would remove the
 failure rather than recover from it. This makes the failure survivable.
 
+**2026-08-24 — the camera-side recovery does not clear the real latch, and the
+modem now clears it from its end (ScopusQA #9).** Omer power-cycled the unit and
+could not bring the system up. The modem was entirely healthy — system 63 good,
+`sdvrApp` running, `AT+SDVRVER` answering 1.14.0 on its own port — and only the
+camera→modem direction was dead: camera `tx frames=32 err=0 retries=31`,
+`rx frames=6`, `ntf queued=1 sent=0`, against **zero** `HdlcChannel RX` in the
+modem's log after 16:05:51, seven seconds into the boot. Sending three commands
+through the camera moved its `tx frames` 32 → 38 and produced no RX on the modem
+at all. That is the latch, in the direction §3 describes.
+
+Two things came out of it that were not known before:
+
+* **`mdm relink` does not fix it.** It ran six times against the real latch and
+  changed nothing. Every previous proof of the camera-side recovery was against
+  the *injected* fault (`mdm test wedge`, wrong line rate), which the camera can
+  clear because the fault is its own. The real latch is not its own.
+* **Closing and reopening `/dev/ttyHS0` on the modem clears it immediately.**
+  `app restart sdvrApp` brought the link straight back and the camera delivered
+  its stuck notification within seconds.
+
+That matches the mechanism already written down in `edgeai/CLAUDE.md`: whoever
+drives the line first sets the direction, and on this boot the modem drove first
+— `+SDVRRDY`, `+SDVRMQTT: ERROR 99`, `+SDVRNET: UP` all went out before the
+camera had anything to say. So the release has to come from the modem, and
+sdvrApp 1.15.0 does it itself: `hdlc_channel.c` stamps a monotonic clock on every
+CRC-valid frame and, after `HDLC_SILENCE_REOPEN_MS` (90 s) with none, closes the
+UART, waits 150 ms and reopens it — repeating every window until traffic returns,
+because the release has never been shown to be deterministic. It stays disarmed
+until the camera has been heard once (a unit with no camera on CN805 must not
+churn its port) and never fires mid-photo.
+
+Proven both ways on the bench, 2026-08-24: a reopen on a *healthy* idle link is
+invisible (`reopen #1` logged, link still answering after it), and a modem-side
+wedge injected with `stty -F /dev/ttyHS0 9600` — which `mdm relink` cannot touch —
+recovered on its own 90 s later with no human action. Suite group I now covers
+both ends: I2–I5 the camera's, **I6–I7** the modem's.
+
 ### 4.2 The photo is assembled but the upload has nowhere to go
 `UploadFile_FromMemory` runs and fails — no provisioned certs, no data session.
 That is the same prerequisite T13.1 skips on, not a defect in the transfer.

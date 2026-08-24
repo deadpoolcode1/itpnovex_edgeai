@@ -78,7 +78,7 @@ Env: `SCOPUS_IMAGES` (default `edgeai/images`), `HOST_IP`, `NTF_PORT`,
 | F photo upload | JPEG → SENDBIN → modem ingests it (not discards) |
 | G state hygiene | LiveBin arm/reject/release is repeatable |
 | H NTFA payload transport | the §6 JSON survives the AT channel byte-exact — see below — and a retry is idempotent |
-| I CN805 link recovery | a deliberately wedged link is recovered without rebooting the camera |
+| I CN805 link recovery | a wedge injected at either end is recovered without rebooting either board — the camera relinks its own UART, and the modem reopens its own when the camera goes silent |
 | J `mdm` pass-through | a quoted AT parameter reaches the modem intact |
 | K motion sensor | the LSM6DSO32 reads gravity, its self-test moves the mass, and that produces motion start/stop at the server — and a detection produces neither |
 

@@ -148,6 +148,8 @@ def main() -> int:
 
     # ── the devices actually answer ────────────────────────────────────
     ver = ""
+    modem_answered = False
+    modem_ver = []
     if modem_tty:
         from devices import ModemAt
         at = ModemAt(modem_tty)
@@ -161,6 +163,8 @@ def main() -> int:
         # against it (ScopusQA #9). A missing app has to say so.
         m = re.search(r"\+SDVRVER:\s*([0-9]+(?:\.[0-9]+)+)", ver)
         num = m.group(1) if m else "-"
+        modem_answered = bool(m)
+        modem_ver = [int(x) for x in num.split(".")] if m else []
         login = any(w in ver.lower() for w in ("login:", "password:",
                                                "login incorrect"))
         check("Modem SDVR app answers", bool(m),
@@ -193,12 +197,33 @@ def main() -> int:
         if alive:
             r = sh.send("mdm AT", "ok", 6.0)
             link = "mdm AT ok" in r or "OK" in r.split("mdm AT", 1)[-1]
+            # A dead camera->modem link with a perfectly healthy modem is a
+            # specific fault, not a mystery: the CN805 level translator has
+            # latched direction and the camera's frames are not reaching the
+            # modem's UART at all. `mdm relink` is the camera-side recovery
+            # and does NOT clear that one — it was watched failing six times
+            # running on 2026-08-24 (ScopusQA #9). The modem clears it from
+            # its own end, by itself, within the silence window; the tester's
+            # job is to wait rather than to start unplugging things.
+            latched = (not link) and modem_answered
+            has_watchdog = modem_ver >= [1, 15, 0]
             check("Camera can reach the modem", link,
                   "internal cable carries commands" if link else "no reply",
-                  "This is the link the whole product depends on. If it is\n"
-                  "down, nothing later in the test can pass. Try\n"
-                  '  python3 scopus/cam.py "mdm relink"\n'
-                  "and if that does not fix it, report it — do not carry on.")
+                  ("The modem itself is healthy — it answered AT+SDVRVER on\n"
+                   "its own port — so this is the CN805 translator latched in\n"
+                   "the camera->modem direction. Do not unplug anything.\n"
+                   + ("The modem clears this on its own: wait 2 minutes and\n"
+                      "run preflight again. If it is still down after that,\n"
+                      "report it — that is a real fault.\n"
+                      if has_watchdog else
+                      f"This modem is {num}; the self-clearing watchdog\n"
+                      "arrived in 1.15.0. Update it, or power-cycle the unit.\n")
+                   + 'A camera-side "mdm relink" does NOT fix this one.'
+                   if latched else
+                   "This is the link the whole product depends on. If it is\n"
+                   "down, nothing later in the test can pass. Try\n"
+                   '  python3 scopus/cam.py "mdm relink"\n'
+                   "and if that does not fix it, report it — do not carry on."))
         sh.close()
 
     # ── the test image is there ────────────────────────────────────────

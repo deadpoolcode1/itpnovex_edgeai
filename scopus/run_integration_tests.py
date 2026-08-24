@@ -939,6 +939,54 @@ def g_i_link_recovery(s, ctx):
     s.ok("I5", "`mdm relink` recovers a wedged link by hand",
          "re-initialised" in r and ok >= 2, note=f"{ok}/3 answered after")
 
+    # ── the same fault from the other end, which is the one that bit ──────
+    # I1-I5 wedge the *camera's* UART, and the camera clears that itself by
+    # re-initialising USART2. The latch on 2026-08-24 (ScopusQA #9) was the
+    # mirror image: not one byte reached the modem's UART, `mdm relink` ran
+    # six times without shifting it, and only closing and reopening
+    # /dev/ttyHS0 on the modem brought the link back. Nothing on the camera
+    # can do that, which is why the camera-side recovery had never actually
+    # been seen to fix a real latch. The modem now watches for its own
+    # silence and bounces the port; these two tests are that path, injected
+    # from the modem where the real fault lives.
+    ssh = ctx["ssh"]
+    if not ssh.reachable():
+        for tid, desc in (("I6", "the camera cannot clear a modem-side wedge"),
+                          ("I7", "the modem reopens its own UART unaided")):
+            s.skip(tid, desc, "no ssh to the modem — this fault has to be "
+                              "injected on the modem, not the camera")
+        return
+
+    HS0 = "/dev/ttyHS0"
+    ssh.run(f"stty -F {HS0} 9600")
+    wedged = "9600" in ssh.run(f"stty -F {HS0}")[1]
+
+    failed = sum(1 for _ in range(3) if "OK" not in cam.send("mdm AT", "ok", 12.0))
+    cam.send("mdm relink", "relink", 10.0)
+    still_failed = sum(1 for _ in range(2) if "OK" not in cam.send("mdm AT", "ok", 12.0))
+    s.ok("I6", "the camera cannot clear a modem-side wedge",
+         wedged and failed >= 2 and still_failed >= 1,
+         note=f"{failed}/3 failed, {still_failed}/2 still failing after relink",
+         failnote="either the injector did not take, or the camera cleared a "
+                  "fault it has no way to reach — check what actually broke")
+
+    # The window is HDLC_SILENCE_REOPEN_MS in hdlc_channel.c. Poll rather than
+    # sleep it out: each wedged `mdm AT` already costs its own timeout, so the
+    # loop paces itself and stops the moment the link answers.
+    deadline, recovered = time.time() + 150.0, False
+    while time.time() < deadline:
+        if "OK" in cam.send("mdm AT", "ok", 12.0):
+            recovered = True
+            break
+        time.sleep(2.0)
+    reopened = "reopened after" in ssh.run(
+        "/sbin/logread | grep 'reopened after' | tail -n 1")[1]
+    s.ok("I7", "the modem reopens its own UART unaided",
+         recovered and reopened,
+         note=f"link back={recovered}, modem logged the reopen={reopened}",
+         failnote="the silence watchdog did not bounce /dev/ttyHS0 — a real "
+                  "latch would still need a power cycle")
+
 
 def g_j_tunnel_fidelity(s, ctx):
     """A tunnelled AT command must reach the modem exactly as typed."""
