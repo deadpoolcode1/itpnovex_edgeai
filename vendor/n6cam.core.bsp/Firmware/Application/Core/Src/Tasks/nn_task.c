@@ -524,6 +524,23 @@ void nn_task_det_set(uint8_t mask)
   _nn_people_rep = _nn_vehicles_rep = 0U;
 }
 
+uint8_t nn_task_det_get(void)
+{
+  return _nn_det_mask;
+}
+
+void nn_task_counts_get(uint32_t *people, uint32_t *vehicles)
+{
+  if (people != NULL)
+  {
+    *people = _nn_people_now;
+  }
+  if (vehicles != NULL)
+  {
+    *vehicles = _nn_vehicles_now;
+  }
+}
+
 /* Test-frame override: when non-NULL, the NN loop reads inference input
  * from this buffer instead of the camera's ancillary buffer. Useful for
  * bench-testing the algorithm against a known scene without depending on
@@ -555,10 +572,24 @@ static bool _nn_test_frame_expired(void)
   return (int32_t)(tx_time_get() - _nn_test_frame_deadline) >= 0;
 }
 
+/* Opt-in: let an injected frame drive the action path. See the note on
+ * nn_task_test_frame_report_set() in the header. */
+static volatile bool _nn_test_frame_report = false;
+
 void nn_task_set_test_frame(uint8_t *frame)
 {
   _nn_test_frame_deadline = tx_time_get() + NN_TEST_FRAME_TTL_TICKS;
   _nn_test_frame_override = frame;
+}
+
+void nn_task_test_frame_report_set(bool enable)
+{
+  _nn_test_frame_report = enable;
+}
+
+bool nn_task_test_frame_report_get(void)
+{
+  return _nn_test_frame_report;
 }
 
 bool nn_task_test_frame_active(void)
@@ -578,6 +609,10 @@ uint32_t nn_task_test_frame_remaining_s(void)
 }
 
 uint32_t nn_task_get_box_count(void)        { return (uint32_t)_pp_box_count; }
+
+/* Inferences completed on the injected frame. See nn_task_test_frame_seq(). */
+static volatile uint32_t _nn_test_frame_seq = 0U;
+uint32_t nn_task_test_frame_seq(void)       { return _nn_test_frame_seq; }
 
 /* Debug: snapshot of the model's most recent output tensor. The NN loop
  * memcpy's a small head/tail of _nn_out[0] into here after each inference;
@@ -776,9 +811,15 @@ static void _nn_task_run(uint32_t args)
     }
     if (_nn_frame != NULL)
     {
+      bool on_test_frame = (_nn_frame == _nn_test_frame_override) &&
+                           (_nn_test_frame_override != NULL);
       stat_time_start(STAT_TIME_NN_TOTAL);
       _nn_frame_process();
       stat_time_stop(STAT_TIME_NN_TOTAL);
+      if (on_test_frame)
+      {
+        _nn_test_frame_seq++;
+      }
 
       /* SoW §4.2 W5/W6: filter detections by class against det_msk.
        * Holds the box-buffer mutex briefly so consumers see a consistent
@@ -828,7 +869,8 @@ static void _nn_task_run(uint32_t args)
        * actually reads, and `detect simulate` is still the explicit way to
        * exercise this path on purpose. */
       if (count_changed && (_nn_action_mask != 0U)
-          && (_nn_test_frame_override != NULL))
+          && (_nn_test_frame_override != NULL)
+          && !_nn_test_frame_report)
       {
         LWARNING(TRACE_NN, "%lu detection(s) from the injected test frame — "
                            "not reported (use 'detect simulate' to test the "

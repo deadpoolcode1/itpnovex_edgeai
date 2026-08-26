@@ -229,6 +229,7 @@ static int32_t  _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 static int32_t  _sd_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
 /* NN test-frame injection (for algorithm validation when camera optics are subpar) */
 static int32_t  _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
+static bool     _nn_run_on_buffer(uint8_t *buf, uint32_t timeout_ms);
 /* Tiled inference: upload one large frame, crop it into a grid of tiles, run the
  * (unchanged 256x256 yolov8n) NN on each, remap + NMS-merge across tiles. */
 static int32_t  _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc);
@@ -464,7 +465,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
-  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | clear | query] - inject test frame into NN" },
+  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | report on|off | clear | query] - inject test frame into NN" },
   {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | relink | test wedge [baud] | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
@@ -1739,6 +1740,10 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   if (strcmp(sub, "clear") == 0)
   {
     nn_task_set_test_frame(NULL);
+    /* The opt-in goes with the frame. Leaving it armed would mean the next
+     * tester's injected image reports as a real detection, which is the one
+     * thing the mute exists to prevent. */
+    nn_task_test_frame_report_set(false);
     _frame_loaded = false;
     CMD_PRINTF(stream, "frame: cleared (NN back to live camera)%s", lwshell_eol());
     _cmd_ack(stream, argv, argc);
@@ -1846,6 +1851,39 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     return LWSHELL_OK;
   }
 
+  /* `frame report on|off|query` — let the NEXT injected frame drive the §4.2
+   * actions (snapshot / upload / notification) instead of being muted.
+   *
+   * Off by default and reset with every `frame clear`, because an injected
+   * picture reaching the customer's server as a real event is worse than an
+   * untested path. See nn_task_test_frame_report_set(). */
+  if (strcmp(sub, "report") == 0)
+  {
+    const char *arg = (argc > 2) ? argv[2] : "query";
+    if (strcmp(arg, "on") == 0)
+    {
+      nn_task_test_frame_report_set(true);
+    }
+    else if (strcmp(arg, "off") == 0)
+    {
+      nn_task_test_frame_report_set(false);
+    }
+    else if (strcmp(arg, "query") != 0)
+    {
+      CMD_PRINTF(stream, "frame report: expected on | off | query%s",
+                 lwshell_eol());
+      return LWSHELL_OK;
+    }
+    CMD_PRINTF(stream, "frame report: %s%s",
+               nn_task_test_frame_report_get() ? "on — injected frames DO "
+                                                 "notify and upload"
+                                               : "off — injected frames are "
+                                                 "not reported",
+               lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
   if (strcmp(sub, "run") == 0)
   {
     if (!_frame_loaded)
@@ -1859,10 +1897,27 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       return LWSHELL_OK;
     }
 
-    /* Route NN input to our test buffer and give it ~2 camera ticks
-     * (~90 ms at 22 Hz) for at least one full inference to complete. */
-    nn_task_set_test_frame(_frame_test_buf);
-    HAL_Delay(100);
+    /* Route NN input to our test buffer and wait for an inference that
+     * actually consumed it.
+     *
+     * This used to be `HAL_Delay(100)` and then read the box buffer. The NN
+     * loop is driven by the camera's frame event, not by this call, and one
+     * inference is ~100 ms on its own — so the read frequently landed on the
+     * boxes from the LIVE scene and reported them as the injected image's
+     * result. A sweep of 36 test images produced the same two detections at
+     * the same two confidences for image after image: it was reporting the
+     * lab, not the pictures. A test that quietly measures the wrong thing is
+     * worse than one that fails.
+     *
+     * Two inferences, not one: the first may already have been in flight on
+     * the live buffer when the override was armed. */
+    if (!_nn_run_on_buffer(_frame_test_buf, 3000U))
+    {
+      CMD_PRINTF(stream, "frame run: no inference on the injected frame "
+                         "within 3s — is the camera pipeline running?%s",
+                 lwshell_eol());
+      return LWSHELL_OK;
+    }
 
     uint32_t boxes = nn_task_get_box_count();
     t_nn_box  buf[NN_BOXES_MAX_NUM];
@@ -2094,6 +2149,32 @@ static void _tile_nms(uint32_t n, float iou_th)
   }
 }
 
+/* Arm the NN at `buf` and block until an inference has actually run on it.
+ *
+ * Every caller here used to do `nn_task_set_test_frame(buf); HAL_Delay(100);`
+ * and then read the box buffer. The NN loop runs off the camera's frame
+ * event, not off the arming call, and one inference takes ~100 ms by itself
+ * — so the read routinely returned the boxes from whatever the NN had last
+ * finished, which on a live pipeline is the room the camera is pointed at.
+ * That turned a 36-image sweep into 36 copies of the lab.
+ *
+ * Waits for TWO completions, because the first may have been in flight on
+ * the previous buffer when this one was armed. Returns false on timeout,
+ * which means the camera pipeline is not producing frames at all.
+ */
+static bool _nn_run_on_buffer(uint8_t *buf, uint32_t timeout_ms)
+{
+  uint32_t seq0 = nn_task_test_frame_seq();
+  nn_task_set_test_frame(buf);
+  uint32_t waited = 0U;
+  while (((nn_task_test_frame_seq() - seq0) < 2U) && (waited < timeout_ms))
+  {
+    HAL_Delay(10);
+    waited += 10U;
+  }
+  return (nn_task_test_frame_seq() - seq0) >= 2U;
+}
+
 /* `tile run` core: crop -> resize -> NN -> remap -> accumulate -> NMS. */
 /* Core sweep, shared by `tile run` (uploaded frame) and `tile live` (live
  * camera snapshot): crop each grid tile from `frame` (RGB888, fw x fh),
@@ -2128,9 +2209,14 @@ static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
       _tile_resize_crop(frame, fw, fh, xs[c], ys[r], crop, _frame_test_buf);
       SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
 
-      /* Route the NN at this tile and wait ~2 camera ticks for one inference. */
-      nn_task_set_test_frame(_frame_test_buf);
-      HAL_Delay(100);
+      /* Route the NN at this tile and wait for it to actually run on it. */
+      if (!_nn_run_on_buffer(_frame_test_buf, 3000U))
+      {
+        CMD_PRINTF(stream, "tile %s: no inference on tile (%u,%u) within 3s "
+                           "— is the camera pipeline running?%s",
+                   label, (unsigned)c, (unsigned)r, lwshell_eol());
+        return LWSHELL_OK;
+      }
       n_infer++;
 
       t_nn_box buf[NN_BOXES_MAX_NUM];

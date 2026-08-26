@@ -401,6 +401,71 @@ def _modem_guard(c: Ctx, s: Suite, tids):
     return True
 
 
+# ─────────────────── the device's settings are not ours ───────────────────
+#
+# Groups 8, 9 and 12 are round-trip tests: they set a value and read it back.
+# Setting is the test, but LEAVING it set is not — AT+SDVRHOST/PORT are the
+# unit's real upload endpoint, and a run used to end with the device pointed
+# at "scopus.test":8443. Every photo after that failed to resolve a host that
+# does not exist, on a bench nobody had touched since the tests "passed".
+#
+# So: read what the unit is configured with before touching it, and put it
+# back afterwards, whatever the run did in between.
+_SRVGET_RE = re.compile(
+    r'\+SDVRSRVGET:\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*"([^"]*)"'
+    r'(?:\s*,\s*(\w+))?')
+
+
+def snapshot_device(c: Ctx) -> dict:
+    """Capture the settings the suite is about to overwrite. Missing values
+    come back absent rather than guessed — restore then leaves them alone."""
+    if not c.mat or not c.mat_is_sdvr:
+        return {}
+    snap = {}
+    m = _SRVGET_RE.search(c.mat.send("AT+SDVRSRVGET", 3.0))
+    if m:
+        snap["srv_ip"], snap["srv_url"] = m.group(1), m.group(2)
+        snap["srv_port"], snap["srv_path"] = int(m.group(3)), m.group(4)
+    for key, cmd, pat in (
+            ("ntf_host",  "AT+SDVRNTFHOST?",  r'\+SDVRNTFHOST:\s*"([^"]*)"'),
+            ("ntf_port",  "AT+SDVRNTFPORT?",  r"\+SDVRNTFPORT:\s*(\d+)"),
+            ("ntf_proto", "AT+SDVRNTFPROTO?", r"\+SDVRNTFPROTO:\s*(\d+)(?:\s*,\s*\"([^\"]*)\")?")):
+        m = re.search(pat, c.mat.send(cmd, 3.0))
+        if m:
+            snap[key] = m.groups() if key == "ntf_proto" else m.group(1)
+    return snap
+
+
+def restore_device(c: Ctx, snap: dict):
+    """Put back everything snapshot_device captured. Best effort and silent:
+    a restore failure must not turn into a test result — there is no test
+    here, only the courtesy of leaving the bench as we found it."""
+    if not snap or not c.mat or not c.mat_is_sdvr:
+        return
+    try:
+        # Host is one field on the device with two setters. Whichever of the
+        # two SRVGET reported non-empty is the one that was in use.
+        if snap.get("srv_ip"):
+            c.mat.expect(f'AT+SDVRHOSTIP="{snap["srv_ip"]}"', "OK", 3.0)
+        elif snap.get("srv_url"):
+            c.mat.expect(f'AT+SDVRHOST="{snap["srv_url"]}"', "OK", 3.0)
+        if snap.get("srv_port"):
+            c.mat.expect(f'AT+SDVRPORT={snap["srv_port"]}', "OK", 3.0)
+        if snap.get("srv_path"):
+            c.mat.expect(f'AT+SDVRSRVRPATH="{snap["srv_path"]}"', "OK", 3.0)
+        if snap.get("ntf_host"):
+            c.mat.expect(f'AT+SDVRNTFHOST="{snap["ntf_host"]}"', "OK", 3.0)
+        if snap.get("ntf_port"):
+            c.mat.expect(f'AT+SDVRNTFPORT={snap["ntf_port"]}', "OK", 3.0)
+        proto = snap.get("ntf_proto")
+        if proto:
+            num, path = proto[0], (proto[1] or "")
+            arg = f'{num},"{path}"' if path else num
+            c.mat.expect(f"AT+SDVRNTFPROTO={arg}", "OK", 3.0)
+    except Exception:
+        pass
+
+
 def g8_modem_control(c: Ctx, s: Suite):
     s.group("GROUP 8 — Modem SDVR control channel, existing (§5.2)")
     tids = [("T8.1", "AT → OK (§5.1)"), ("T8.2", "AT+SDVRPING=N echoes +SDVRPING:N (§5.2)"),
@@ -462,6 +527,21 @@ def g10_modem_sd(c: Ctx, s: Suite):
     if _modem_guard(c, s, tids):
         return
     m, ssh = c.mat, c.ssh
+
+    # No card in the modem's slot is a bench condition, not a product fault.
+    # These three used to go red for it, which reads as "SD management is
+    # broken" — the same misdiagnosis the FTDI cable produced in group 8.
+    # AT+SDVRMOUNTSD answers +SDVRERR: 3 because there is nothing to mount.
+    if ssh and ssh.reachable():
+        _, devs, _ = ssh.run("ls /dev/mmcblk0 2>/dev/null | wc -l")
+        if devs.strip().splitlines()[0] == "0":
+            for tid, desc in tids:
+                s.skip(tid, desc,
+                       "no SD card in the MODEM's slot (/dev/mmcblk0 absent) — "
+                       "this is the modem's own card, separate from the N6's; "
+                       "insert one to exercise §3.2 SD management")
+            return
+
     _, r = m.expect("AT+SDVRMOUNTSD", "OK", 8.0)
     mounted = False
     if ssh and ssh.reachable():
@@ -516,6 +596,13 @@ def g12_e2e_notify(c: Ctx, s: Suite):
     try:
         c.mat.expect(f'AT+SDVRNTFHOST="{host}"', "OK", 3.0)
         c.mat.expect(f"AT+SDVRNTFPORT={port}", "OK", 3.0)
+        # This test watches for a datagram, so the unit has to be in datagram
+        # mode. A unit left in HTTP or MQTT notification mode — which is how a
+        # deployed unit is normally configured — delivered the notification
+        # perfectly well to its server and this test still went red, reporting
+        # "no datagram within 6s" against a working product. Set the transport
+        # the test needs; main() puts the configured one back at the end.
+        c.mat.expect("AT+SDVRNTFPROTO=0", "OK", 3.0)
         c.mat.expect('AT+SDVRNTFA=2,11,"scopus-e2e"', "SDVRNTF", 6.0)
         data = b""
         try:
@@ -529,20 +616,123 @@ def g12_e2e_notify(c: Ctx, s: Suite):
         sock.close()
 
 
+class _TlsSink:
+    """A mutual-TLS receiver the suite runs itself, for the duration of one
+    test, on the modem's own link to this PC.
+
+    Standing this up here rather than requiring an external server is the
+    difference between T13.1 being a test and being a permanent SKIP. It also
+    keeps the assertion honest: the bytes are checked in this process, so a
+    PASS means a JPEG arrived over a TLS connection that presented the
+    device's client certificate — not that a file appeared in a directory.
+    """
+
+    def __init__(self, certs: Path):
+        import http.server, ssl, threading
+
+        self.received = []          # (name, body, peer_cn)
+
+        sink = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(n) if n else b""
+                cn = ""
+                try:
+                    cert = self.connection.getpeercert() or {}
+                    cn = "/".join("=".join(x) for rdn in cert.get("subject", ())
+                                  for x in rdn)
+                except Exception:
+                    pass
+                sink.received.append(
+                    (self.headers.get("X-Filename") or "", body, cn))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), H)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(certs / "server.crt"),
+                            keyfile=str(certs / "server.key"))
+        ctx.load_verify_locations(cafile=str(certs / "ca.crt"))
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
+        self.port = self.srv.socket.getsockname()[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        try:
+            self.srv.shutdown()
+            self.srv.server_close()
+        except Exception:
+            pass
+
+
 def g13_e2e_upload(c: Ctx, s: Suite):
     s.group("GROUP 13 — End-to-end HTTPS file upload (§8)")
-    tid, desc = "T13.1", "SD file uploads to HTTPS server, X-Timestamp/X-Ref headers (§8)"
-    # This needs the local HTTPS file server + device certs provisioned and a
-    # data session. Detect the upload sink; skip with a precise reason if absent.
-    sink = Path.home() / "sdvr-uploads-tls"
-    if not c.mat:
-        s.skip(tid, desc, "modem AT channel unavailable")
+    tid, desc = "T13.1", "camera photo uploads over HTTPS/mutual-TLS, arrives as a JPEG (§8)"
+
+    if not c.mat or not c.mat_is_sdvr:
+        s.skip(tid, desc, "modem SDVR AT channel unavailable")
         return
-    if not sink.is_dir():
-        s.skip(tid, desc, f"no HTTPS upload sink at {sink} (server not provisioned on this host)")
+    if c.n6_mode != "edgeai-app":
+        s.skip(tid, desc, "needs the N6 edgeai app — `photo upload` is what "
+                          "drives the §8.2 in-memory upload")
         return
-    s.skip(tid, desc, "E2E HTTPS upload requires provisioned certs + active data "
-                      "session; run V20_SDVR server-establish first (out of scope here)")
+    certs = Path(os.environ.get("SDVR_CERTS_DIR")
+                 or S.get("server", "certs_dir") or "/opt/sdvr-server/certs")
+    missing = [f for f in ("server.crt", "server.key", "ca.crt")
+               if not (certs / f).is_file()]
+    if missing:
+        s.skip(tid, desc, f"no server PKI at {certs} (missing {', '.join(missing)}) "
+                          "— generate one with /opt/sdvr-server/gencerts.sh")
+        return
+    if c.ssh and c.ssh.reachable():
+        _, n, _ = c.ssh.run("ls /data/sdvr/certs/client.key 2>/dev/null | wc -l")
+        if n.strip().splitlines()[0] == "0":
+            s.skip(tid, desc, "no client certificate on the modem — import one "
+                              "with AT+SDVRCERTIMPORT (needs the SD card)")
+            return
+
+    host = S.get("modem", "host_ip")
+    try:
+        sink = _TlsSink(certs)
+    except Exception as e:
+        s.skip(tid, desc, f"cannot start the TLS sink: {e}")
+        return
+    try:
+        c.mat.expect(f'AT+SDVRHOSTIP="{host}"', "OK", 3.0)
+        c.mat.expect(f"AT+SDVRPORT={sink.port}", "OK", 3.0)
+        c.mat.expect('AT+SDVRSRVRPATH="/upload"', "OK", 3.0)
+        c.n6.send("photo upload", "photo upload ok", 25.0)
+
+        deadline = time.time() + 30.0
+        while not sink.received and time.time() < deadline:
+            time.sleep(0.5)
+
+        if not sink.received:
+            s.ok(tid, desc, False,
+                 reason=f"nothing arrived at https://{host}:{sink.port}/upload "
+                        "within 30s")
+            return
+        name, body, cn = sink.received[0]
+        # JPEG, over TLS, presenting a client certificate: all three, or the
+        # test has not shown what it claims to.
+        is_jpeg = body[:2] == b"\xff\xd8"
+        s.ok(tid, desc, is_jpeg and bool(cn),
+             reason=("body is not a JPEG" if not is_jpeg
+                     else "no client certificate on the TLS session"),
+             extra=f"{name} {len(body)} bytes, client_cn={cn or '-'}")
+    finally:
+        sink.close()
 
 
 def _oneline(s: str) -> str:
@@ -559,8 +749,10 @@ def main() -> int:
     c = Ctx()
     s = Suite()
     t0 = time.time()
+    snap = {}
     try:
         g0_prereq(c, s)
+        snap = snapshot_device(c)
         g1_n6_control(c, s)
         g2_n6_detect(c, s)
         g3_n6_notify(c, s)
@@ -575,6 +767,7 @@ def main() -> int:
         g12_e2e_notify(c, s)
         g13_e2e_upload(c, s)
     finally:
+        restore_device(c, snap)
         if c.n6:
             c.n6.close()
 

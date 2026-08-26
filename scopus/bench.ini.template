@@ -36,6 +36,12 @@ mqtt_port   = 5912
 notify_path = /notify
 upload_path = /upload
 
+# Where this PC keeps the server-side PKI (ca.crt / server.crt / server.key)
+# used by the HTTPS tests. The suite stands up its own mutual-TLS receiver
+# from these for T13.1; without them that test skips instead of running.
+# Generate a set with /opt/sdvr-server/gencerts.sh.
+certs_dir   = /opt/sdvr-server/certs
+
 [test_server]
 # Ports the bundled scopus/test_server.py binds when you run a receiver on this
 # PC instead of a real server. Local only; change if something else owns them.

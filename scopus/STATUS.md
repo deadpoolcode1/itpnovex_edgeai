@@ -1,6 +1,143 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-23. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-25. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-25 — both suites green, and the injection tests stopped lying
+
+Camera build `Aug 25 2026 16:59:14`, modem app **1.16.0** (Legato system
+marked good), FTDI adapter plugged back in.
+
+| Suite | Result |
+|---|---|
+| `run_scopus_tests.py` | **49 total — 42 PASS / 0 FAIL / 7 SKIP** |
+| `run_integration_tests.py` | **66 total — 65 PASS / 0 FAIL / 0 GAP / 1 SKIP** |
+
+Every remaining SKIP is a card that is not in a slot: four for the N6's SD, three
+for the modem's. There are no GAPs left — C7, the last one, was never a firmware
+gap at all (below).
+
+### `frame run` was reporting the room, not the picture
+
+This is the one to read. `frame run` armed the test-frame override, slept
+`HAL_Delay(100)` and read the box buffer. The NN loop runs off the camera's
+frame event, not off that call, and a single inference is ~90 ms on its own —
+so the read routinely returned the boxes from the **live scene**.
+
+It shows up the moment you look for it. A sweep of the 36 ScopusQA test images
+came back with `{"car": 0.71, "person": 0.81}` for image after image —
+a night-time crowd, a photo of an office, a street: the same two boxes at the
+same two confidences. Those were the lab monitor, which happened to be showing
+a cyclist and a car. Re-run after the fix, every image reports its own content.
+
+`frame run` and the `tile` sweep now wait for an inference that actually
+consumed the injected buffer (`nn_task_test_frame_seq()`), with a 3 s timeout
+that says so plainly if the camera pipeline is dead. Anything measured through
+injection before 2026-08-25 is suspect — including group B's people counts.
+
+### C7 — the live NN path does notify, and now proves it
+
+C7 was recorded as a firmware gap: "the live loop only fires an SD snapshot and
+never calls `_notify_emit`". That was wrong. `nn_task.c` calls
+`_nn_report_classes()` on the action mask's report bit like it should — but it
+deliberately mutes the whole action path when the input came from the test-frame
+override, because an injected `3_people.jpg` must not put three people on the
+customer's server. The one path the product exists for could therefore not be
+tested without walking real people in front of the lens.
+
+`frame report on` lifts that mute for one frame, and `frame clear` puts it back
+(so does `frame upload`, which begins with a clear — arm it **after** the
+injection, not before). C7 now passes with a real detection raising a real
+`+SDVRNTF`.
+
+### The suites put the device back the way they found it
+
+Both suites are round-trip tests: they set a value and read it back. Setting is
+the test; leaving it set is not. A run used to end with the unit's upload
+endpoint pointed at `"scopus.test":8443` — every photo after that failing to
+resolve a host that does not exist, on a bench nobody had touched since the
+tests "passed". `snapshot_device()` / `restore_device()` now bracket the run.
+
+The integration suite additionally forces UDP notification mode for its own run
+and restores the configured transport afterwards. It watches for datagrams; a
+unit in HTTP or MQTT mode delivers its events perfectly and this suite saw
+nothing and called it fourteen failures. The "switch to `AT+SDVRNTFPROTO=0`
+first" instruction in the previous entry is obsolete — it is done for you.
+
+### T13.1 is a real HTTPS upload now, not a permanent SKIP
+
+The suite stands up its own mutual-TLS receiver on an ephemeral port from the
+PKI at `[server] certs_dir`, points the unit at it, runs `photo upload` and
+asserts three things about what arrives: it is a JPEG, it came over TLS, and
+the session presented the device's client certificate.
+
+### Modem 1.16.0 — notifications follow the upload leg's scheme
+
+`notify.c` hardcoded `http://`. Importing a certificate moves *uploads* to
+https and persists it, so against a TLS-only receiver photos arrived and events
+did not — or the reverse against a plain one. That asymmetry is the whole of
+ScopusQA #19. Both legs now resolve the scheme the same way and both install the
+same client-certificate set.
+
+`AT+SDVRCERTIMPORT` and `AT+SDVRCERTDEL` also now say what they just changed:
+
+```
++SDVRCERT: DELOK
++SDVRCERT: SCHEME,"http://192.168.2.3:8992/upload"
+```
+
+### The receiver on 8991 speaks TLS
+
+Per ITP on #19: certificates on both channels. `sdvr-https.service` moved from
+5912 (taken by mosquitto) to **8991**, `sdvr-http.service` disabled. Measured
+end to end over cellular, from the modem's public source address:
+
+```
+17:10:35  POST /notify  ntf_...033.json     101 B  tls=TLSv1.2 client_cn="…sdvr-device-client"
+17:10:49  POST /upload  4194336_…171034.rdy 127485 B  tls=TLSv1.2 client_cn="…sdvr-device-client"
+```
+
+The `.rdy` is a valid 800×600 JPEG. MQTT/TLS on 5912 is up alongside it.
+Way back: `AT+SDVRCERTDEL` on the unit and `systemctl enable --now sdvr-http`
+on the server.
+
+### #16 — the live view says what the profile counts
+
+The `E2IP Technologies / Edge AI Sensing Kit` banner is gone. The left block is
+now driven by `det_msk`: `People: N` alone, `Vehicles: N` alone, or both. The
+single `Objects: N` total is gone with it — it could only ever disagree with the
+two numbers the §4.2 notifications carry, and it said "People Detection" while
+the unit was counting cars.
+
+### #17 — the yellow car, measured
+
+`scopus/qa_sweep.py` runs a directory of images through the device's NN and
+reports what it saw by COCO class. On `1_yellow_car.jpeg` injected directly:
+`truck 0.63`. The class is *truck*, not car — a large sedan seen from near
+overhead reads as one — but both map to the §4.2 vehicle bit, so the event is
+`rsn=0x20` either way.
+
+It is apparent size, not angle, that loses it. The same image composited at
+decreasing size in the frame:
+
+| car fills | detected |
+|---|---|
+| 100 % | truck 0.63 |
+| 70 % | truck 0.55 |
+| 50 % | truck 0.50 |
+| 35 % | — |
+| 25 % | — |
+| 15 % | — |
+
+In the #17 screenshot the car is roughly a third of the frame, below that
+cliff. The network is COCO-2017 yolov8n at 256×256 (see
+`vendor/n6cam.core.bsp/Firmware/Model/README.md`); the confidence floor is
+`AI_OD_YOLOV8_PP_CONF_THRESHOLD = 0.30`.
+
+Across the whole QA set the vehicle classes that do fire are car, truck, bus,
+motorcycle and bicycle. A towed trailer is not a COCO class and has no reason
+code of its own — a truck towing one is detected as the truck.
 
 ---
 

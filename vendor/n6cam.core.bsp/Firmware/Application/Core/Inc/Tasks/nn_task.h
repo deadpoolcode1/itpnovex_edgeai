@@ -172,6 +172,26 @@ void nn_task_upload_stats(uint32_t *skipped, uint32_t *busy);
 void nn_task_det_set(uint8_t mask);
 
 /**
+ * @brief Read back the SoW §4.2 'det_msk' set by nn_task_det_set().
+ *        The live-view overlay uses it to decide which counts to show:
+ *        a vehicles-only profile has no business printing a people count
+ *        (ScopusQA #16).
+ */
+uint8_t nn_task_det_get(void);
+
+/**
+ * @brief Current debounced per-class counts — the same two numbers the
+ *        §4.2 notifications carry in 'rsd'. Either pointer may be NULL.
+ *
+ *        Exposed so the overlay and the notification cannot disagree: they
+ *        now read one source. Before this the screen printed a single
+ *        "Objects: N" total, so a frame with two people and a car showed 3
+ *        and the events said 2 and 1, and there was no way to tell from
+ *        the picture which number the receiver would get.
+ */
+void nn_task_counts_get(uint32_t *people, uint32_t *vehicles);
+
+/**
  * @brief Set how long a new detection count must hold before it is believed
  *        and reported (SoW §4.2).
  *
@@ -238,6 +258,45 @@ void nn_task_simulate_detection_class(uint32_t boxes, int32_t class_index);
  * @param frame Buffer pointer, or NULL to revert to live camera.
  */
 void nn_task_set_test_frame(uint8_t *frame);
+
+/**
+ * @brief Count of inferences that have actually run ON the injected frame.
+ *
+ *        `frame run` used to arm the override, sleep 100 ms and read the box
+ *        buffer. 100 ms is one inference at best, and the loop is driven by
+ *        the camera's frame event, not by the arming — so the read landed on
+ *        whatever the NN had last produced, which on a busy lens is the LIVE
+ *        SCENE. A sweep of 36 test images came back with the same two boxes
+ *        at the same two confidences for image after image: the lab monitor,
+ *        not the pictures. An injection test that silently reports the room
+ *        is worse than no injection test.
+ *
+ *        Sample this before arming and wait for it to move.
+ */
+uint32_t nn_task_test_frame_seq(void);
+
+/**
+ * @brief Let an injected test frame drive the §4.2 actions (snapshot, photo
+ *        upload, notification) the same way a live detection does.
+ *
+ *        Off by default, and that default is the safe one: a test frame is
+ *        not the scene, and a bench injecting `3_people.jpg` must not put
+ *        three people on the customer's server. So the live loop mutes the
+ *        action path whenever the input came from the override.
+ *
+ *        The consequence was that the one path the product exists for —
+ *        the NN sees objects and an event leaves the device unaided — could
+ *        not be tested at all without walking real people in front of the
+ *        lens. `detect simulate` reaches the notification but skips the
+ *        detector; `notify trigger` skips both. This switch closes that,
+ *        deliberately and for one test at a time.
+ *
+ *        It is cleared whenever the test-frame override is set or cleared,
+ *        so it cannot outlive the test that asked for it — same reasoning
+ *        as the override's own TTL.
+ */
+void nn_task_test_frame_report_set(bool enable);
+bool nn_task_test_frame_report_get(void);
 
 /**
  * @brief Whether a test frame is currently driving the NN.

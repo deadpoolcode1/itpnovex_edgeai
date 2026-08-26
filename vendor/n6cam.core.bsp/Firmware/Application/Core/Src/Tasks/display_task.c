@@ -89,12 +89,20 @@
 #define FONT_INFO             _draw_f16
 #define FONT_DEBUG            _draw_f12
 
-#define HEADER_LEFT_TITLE     "People Detection"
+/* ScopusQA #16 — what the live view says at the top of the screen.
+ *
+ * The left block is the only caption now, and it reports what the configured
+ * §4.2 detection profile actually asks for: a people-only profile prints one
+ * line, a vehicles-only profile prints the other, both prints both. It used
+ * to be a fixed "People Detection" title over a single "Objects: N" total,
+ * which was wrong in two ways at once — it said "People" while the unit was
+ * counting cars, and one total could not be reconciled with the two numbers
+ * the §4.2 notifications carry.
+ *
+ * The right block ("E2IP Technologies / Edge AI Sensing Kit") is gone. It is
+ * a vendor banner on a customer's video feed and it was asked for by name.
+ */
 #define HEADER_LEFT_WIDTH     270U
-
-#define HEADER_RIGHT_TITLE    "E2IP Technologies"
-#define HEADER_RIGHT_SUBTITLE "Edge AI Sensing Kit"
-#define HEADER_RIGHT_WIDTH    270U
 
 #define STATISTICS_WIDTH      270U
 #define STATISTICS_LABEL_COLS 18U
@@ -149,7 +157,6 @@ static volatile bool    _uvc_flying = false;
 
 /* Drawing */
 static volatile uint8_t _show_header_left  = 1;
-static volatile uint8_t _show_header_right = 1;
 static volatile uint8_t _show_statistics   = 1;
 
 #if ENABLE_NN == 1U
@@ -188,7 +195,6 @@ static void     _frame_stream(void);
 static uint32_t _update_h264_bps(int32_t size_inc);
 
 static void     _display_add_header_left(void);
-static void     _display_add_header_right(void);
 static void     _display_add_statistics(void);
 static void     _display_print_statistics(t_stat_id id, const char *label, uint32_t width, size_t line, size_t lcols, size_t icols);
 
@@ -345,7 +351,6 @@ static void _display_frame(void)
     #endif /* ENABLE_NN */
     _display_add_statistics();
     _display_add_header_left();
-    _display_add_header_right();
     stat_time_stop(STAT_TIME_DISPLAY_DRAW);
 
     /* Encode frame */
@@ -443,6 +448,24 @@ static uint32_t _update_h264_bps(int32_t size_inc)
 /**
  * @brief Add left header to display.
  */
+/* How tall the counts block is, in pixels, for whatever the profile asks for.
+ *
+ * Both the block itself and the test-frame warning that sits under it need
+ * this. Deriving it from the mask rather than remembering what was drawn
+ * keeps them in step within a single frame — the two are drawn in the
+ * opposite order to the one they appear in on screen. */
+static uint32_t _header_left_height(void)
+{
+#if ENABLE_NN == 1U
+  uint8_t  mask  = nn_task_det_get();
+  uint32_t lines = (((mask & 0x01U) != 0U) ? 1U : 0U)
+                 + (((mask & 0x02U) != 0U) ? 1U : 0U);
+  return lines * FONT_TITLE.height;
+#else
+  return 0U;
+#endif
+}
+
 static void _display_add_header_left(void)
 {
   /* Validate: Check if required */
@@ -451,29 +474,31 @@ static void _display_add_header_left(void)
     return;
   }
 
-  /* Display */
-  draw_printf_hw(&_draw, &FONT_TITLE, BORDER_PADDING, BORDER_PADDING, HEADER_LEFT_WIDTH, HEADER_LEFT_TITLE);
-}
+#if ENABLE_NN == 1U
+  uint8_t  mask     = nn_task_det_get();
+  uint32_t people   = 0U;
+  uint32_t vehicles = 0U;
+  nn_task_counts_get(&people, &vehicles);
 
-/**
- * @brief Add right header to display.
- */
-static void _display_add_header_right(void)
-{
-  /* Validate: Check if required */
-  if (!_show_header_right)
-  {
-    return;
-  }
-
-  uint32_t xpos = _draw.width - HEADER_RIGHT_WIDTH - BORDER_PADDING;
   uint32_t ypos = BORDER_PADDING;
 
-  /* Display */
-  draw_printf_hw(&_draw, &FONT_TITLE, xpos, ypos, HEADER_RIGHT_WIDTH, HEADER_RIGHT_TITLE);
-
-  ypos += FONT_TITLE.height;
-  draw_printf_hw(&_draw, &FONT_INFO, xpos, ypos, HEADER_RIGHT_WIDTH, HEADER_RIGHT_SUBTITLE);
+  /* A mask of zero counts nothing, so print nothing rather than a pair of
+   * zeroes that look like a working detector seeing an empty room. */
+  if ((mask & 0x01U) != 0U)
+  {
+    draw_printf_hw(&_draw, &FONT_TITLE, BORDER_PADDING, ypos,
+                   HEADER_LEFT_WIDTH, "People:   %2lu ",
+                   (unsigned long)people);
+    ypos += FONT_TITLE.height;
+  }
+  if ((mask & 0x02U) != 0U)
+  {
+    draw_printf_hw(&_draw, &FONT_TITLE, BORDER_PADDING, ypos,
+                   HEADER_LEFT_WIDTH, "Vehicles: %2lu ",
+                   (unsigned long)vehicles);
+    ypos += FONT_TITLE.height;
+  }
+#endif /* ENABLE_NN */
 }
 
 /**
@@ -637,13 +662,11 @@ static void _display_add_detections(void)
     selected_count += _display_detection(&det, &_draw, &FONT_INFO);
   }
 
-  /* Draw detections number */
-  uint32_t ypos = BORDER_PADDING + (_show_header_left? FONT_TITLE.height: 0U);
-  draw_printf_hw(
-    &_draw, &FONT_INFO,
-    BORDER_PADDING, ypos, HEADER_LEFT_WIDTH,
-    "Objects: %2d ", selected_count
-  );
+  /* No "Objects: N" line any more — ScopusQA #16. The header block prints
+   * People / Vehicles from the same counters the notifications use, and a
+   * single total next to them could only ever disagree with them. */
+  (void)selected_count;
+  uint32_t ypos = BORDER_PADDING + (_show_header_left ? _header_left_height() : 0U);
 
   /* Say when these boxes are not the live scene.
    *
@@ -656,7 +679,7 @@ static void _display_add_detections(void)
   {
     draw_printf_hw(
       &_draw, &FONT_INFO,
-      BORDER_PADDING, ypos + FONT_INFO.height, HEADER_LEFT_WIDTH,
+      BORDER_PADDING, ypos, HEADER_LEFT_WIDTH,
       "TEST PICTURE - NOT THE LENS (%lus)",
       (unsigned long)nn_task_test_frame_remaining_s()
     );

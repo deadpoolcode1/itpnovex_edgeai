@@ -233,6 +233,49 @@ class UdpWatch:
         self.sock.close()
 
 
+# ───────────── the notification transport this suite needs ─────────────
+#
+# Every "did the server see it?" assertion in groups E, H and K watches for a
+# UDP datagram. A unit configured for HTTP or MQTT notifications — which is
+# how a DEPLOYED unit is configured — delivers those same events perfectly to
+# its real server, and this suite saw nothing and reported fourteen failures.
+# That is the suite testing its own assumption, not the product.
+#
+# So the suite sets the transport it needs, and puts the configured one back
+# when it is done. The alternative, documenting "run this AT command first",
+# was tried: it is a step to forget, and forgetting it looks like a broken
+# product.
+def snapshot_notify(mat):
+    snap = {}
+    m = re.search(r'\+SDVRNTFPROTO:\s*(\d+)(?:\s*,\s*"([^"]*)")?',
+                  mat.send("AT+SDVRNTFPROTO?", 4.0))
+    if m:
+        snap["proto"], snap["path"] = m.group(1), m.group(2) or ""
+    m = re.search(r'\+SDVRNTFHOST:\s*"([^"]*)"', mat.send("AT+SDVRNTFHOST?", 4.0))
+    if m:
+        snap["host"] = m.group(1)
+    m = re.search(r"\+SDVRNTFPORT:\s*(\d+)", mat.send("AT+SDVRNTFPORT?", 4.0))
+    if m:
+        snap["port"] = m.group(1)
+    return snap
+
+
+def restore_notify(mat, snap):
+    if not snap:
+        return
+    try:
+        if "host" in snap:
+            mat.send(f'AT+SDVRNTFHOST="{snap["host"]}"', 4.0)
+        if "port" in snap:
+            mat.send(f'AT+SDVRNTFPORT={snap["port"]}', 4.0)
+        if "proto" in snap:
+            arg = (f'{snap["proto"]},"{snap["path"]}"' if snap.get("path")
+                   else snap["proto"])
+            mat.send(f"AT+SDVRNTFPROTO={arg}", 4.0)
+    except Exception:
+        pass
+
+
 def modem_log_marker(ssh):
     rc, out, _ = ssh.run("wc -l < /data/sdvr/sdvr.log", timeout=15)
     try:
@@ -436,21 +479,49 @@ def g_c_camera_notify(s, ctx):
     else:
         cam.send("detect profile 0x01 0x03", "ok", 4.0)
         cam.send("detect start", "detect", 4.0)
-        cam.n6.drain(0.3)
-        cam.inject(path)
-        count, raw = cam.run_nn()
-        if "+SDVRNTF" in raw:
-            s.ok("C7", f"a real NN detection raises +SDVRNTF (detected {count})",
-                 True, note=_one(raw, 90))
-        elif count:
-            s.gap("C7", f"a real NN detection raises +SDVRNTF (detected {count})",
-                  "inference found people but emitted nothing: the live loop in "
-                  "nn_task.c only fires an SD snapshot on the 0→N edge and never "
-                  "calls _notify_emit — only 'notify trigger' and 'detect "
-                  "simulate' do")
-        else:
-            s.ok("C7", "a real NN detection raises +SDVRNTF", False,
-                 failnote=f"no detections to notify on (count={count})")
+        # The live loop deliberately mutes the action path for an injected
+        # frame — an injected picture must not reach a customer's server as a
+        # real event. That mute is also why this used to be recorded as a
+        # firmware gap: the path was never broken, it was refusing to run for
+        # the one input a bench can supply. `frame report on` lifts it for
+        # this test, and `frame clear` puts it back.
+        try:
+            cam.n6.drain(0.3)
+            cam.inject(path)
+            # AFTER the injection, never before: inject() opens with a
+            # `frame clear`, and `frame clear` disarms this on purpose so an
+            # opt-in cannot outlive the frame that asked for it.
+            rep = cam.send("frame report on", "frame report", 4.0)
+            if "on —" not in rep:
+                s.skip("C7", "a real NN detection raises +SDVRNTF (rsn=0x10)",
+                       "camera firmware predates `frame report` — an injected "
+                       "frame cannot drive the action path, so this cannot be "
+                       "tested without people in front of the lens")
+                return
+            count, raw = cam.run_nn()
+            # `frame run` returns after ~100 ms — two camera ticks, enough to
+            # read a count off one inference. The count the ACTIONS fire on is
+            # the debounced one, and that needs a full `detect debounce`
+            # window (1 s by default) of agreeing frames before it is
+            # believed. The override is still armed while that runs, so the
+            # notification arrives a second or so after the command has
+            # already answered. Waiting for it here is the difference between
+            # testing the reporting path and testing the shell's latency.
+            raw += cam._read_until((b"+SDVRNTF",), 6.0)
+            if "+SDVRNTF" in raw:
+                s.ok("C7", f"a real NN detection raises +SDVRNTF (detected {count})",
+                     True, note=_one(raw, 90))
+            elif count:
+                s.ok("C7", f"a real NN detection raises +SDVRNTF (detected {count})",
+                     False,
+                     failnote="inference found objects and the action path "
+                              "emitted nothing — check `detect profile` bit1 "
+                              "(report) and `notify enable`")
+            else:
+                s.ok("C7", "a real NN detection raises +SDVRNTF", False,
+                     failnote=f"no detections to notify on (count={count})")
+        finally:
+            cam.send("frame clear", "frame", 4.0)
 
 
 def g_d_tunnel(s, ctx):
@@ -1206,6 +1277,7 @@ def main():
 
     s = Suite(args.verbose)
     ctx = {}
+    ntf_snap = {}
     try:
         ctx["cam"] = Camera()
     except Exception as e:
@@ -1228,6 +1300,18 @@ def main():
             print(f"{C['fail']}note: {ctx['mat'].tty} does not carry AT+SDVR* "
                   f"and no camera tunnel is available{C['0']}")
         ctx["ssh"] = ModemSsh(MODEM_IP, S.require("modem", "password"))
+
+        # Take the unit's configured notification transport, then put it in
+        # datagram mode for the run. See snapshot_notify above.
+        ntf_snap = snapshot_notify(ctx["mat"])
+        ctx["mat"].send(f'AT+SDVRNTFHOST="{HOST_IP}"', 4.0)
+        ctx["mat"].send(f"AT+SDVRNTFPORT={NTF_PORT}", 4.0)
+        ctx["mat"].send("AT+SDVRNTFPROTO=0", 4.0)
+        if ntf_snap.get("proto") not in (None, "0"):
+            print(f"{C['skip']}note: unit is configured for "
+                  f"{'http' if ntf_snap['proto'] == '1' else 'mqtt'} "
+                  f"notifications; switched to UDP for this run and it will be "
+                  f"put back at the end{C['0']}")
 
         # Start from a stopped detector, and leave one behind.
         #
@@ -1252,6 +1336,10 @@ def main():
                 s.ok(fn.__name__, f"group {fn.__name__} completed", False,
                      failnote=f"harness exception: {e!r}")
     finally:
+        try:
+            restore_notify(ctx.get("mat"), ntf_snap)
+        except Exception:
+            pass
         try:
             quiesce_detector(ctx["cam"])
         except Exception:
