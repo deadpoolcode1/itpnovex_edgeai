@@ -73,10 +73,6 @@ class _Settings:
         except ValueError:
             raise SystemExit(self._bad(section, key, f"{v!r} is not a number"))
 
-    def getpath(self, section, key, default=None):
-        v = self.get(section, key, default)
-        return os.path.expanduser(v) if v else v
-
     # ── a value the caller cannot proceed without ───────────────────────
     def require(self, section, key):
         v = self.get(section, key)

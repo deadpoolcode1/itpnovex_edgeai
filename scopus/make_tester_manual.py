@@ -31,7 +31,6 @@ from settings import S as _S
 
 try:
     from docx import Document
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt, RGBColor, Inches
 except ImportError:
     sys.exit("python-docx is required:  pip install python-docx")
@@ -47,16 +46,6 @@ BLUE = RGBColor(0x1F, 0x3D, 0x7A)
 REPO = "~/work/itpnovex/edgeai"
 CD = f"cd {REPO} && "
 
-# The public relay used by the cellular procedure (section 18). The address is
-# fixed infrastructure and belongs in the document; the key is a secret and
-# does not belong in this repository, so it comes from the environment at
-# generation time. Generate the tester's copy with:
-#
-#     SCOPUS_RELAY_KEY=... python3 scopus/make_tester_manual.py
-#
-# Without it the document still builds, with a placeholder the tester will
-# obviously have to replace — which is better than a wrong key that looks right.
-
 # The machine this document is written for: the one the camera and the modem
 # are physically plugged into. Naming it matters — "the bench PC" is ambiguous
 # the moment there is more than one, and a tester who runs these commands on
@@ -71,18 +60,7 @@ BENCH_USER = "user"
 # cannot complete, and the wrong APN is indistinguishable from a dead SIM.
 BENCH_APN = "internet"
 
-RELAY_IP = "165.22.181.245"
-RELAY_HTTP_PORT = 80
-RELAY_PATH = "/scopus/upload"
-RELAY_BASE = f"http://{RELAY_IP}/scopus"
-RELAY_UDP_PORT = 39999
-# Where notifications are POSTed on the cellular procedure. They ride the same
-# web port as the photos rather than a datagram port, so they cross whatever
-# the relay's host already allows through for the uploads.
-RELAY_NOTIFY_PATH = "/scopus/notify"
-RELAY_KEY = os.environ.get("SCOPUS_RELAY_KEY", "<ask-for-the-relay-key>")
-
-# Remote command channel (section 19). The broker runs on this same PC and is
+# Remote command channel (section 18). The broker runs on this same PC and is
 # reached on its public address, because that is the address the unit dials
 # from the mobile network — the LAN address is not routable from there.
 MQTT_HOST = _S.require("server", "host")
@@ -223,11 +201,10 @@ def build():
           [["Cable", "Over the USB cable to this PC, which plays the part of "
                      "the customer's server. Nothing leaves the room.",
             "Steps 1 to 12, in order — this is the default"],
-           ["Cellular", "Over the mobile network to a server on the internet, "
+           ["Cellular", "Over the mobile network to the customer's server, "
                         "which this PC then reads. This is what a deployed "
                         "unit does.",
-            "Section 18. It replaces Steps 3 and 4; everything else is "
-            "identical"]])
+            "Scopus_QA_Flow.docx, Part 2 — a document of its own"]])
     doc.add_paragraph(
         "Run the cable mode first, even if cellular is what you were asked "
         "to test. It uses the same camera, the same modem and the same "
@@ -289,10 +266,7 @@ def build():
                           "it sends)"],
            ["Internal cable", "Camera to modem. This is the link the product "
                               "depends on and the one this test exercises"],
-           ["Software", f"Already installed at {REPO}"],
-           ["Relay", f"For the cellular test only (section 18): a server at "
-                     f"{RELAY_IP} that receives what the modem sends over the "
-                     f"mobile network. Already running; nothing to start"]])
+           ["Software", f"Already installed at {REPO}"]])
     doc.add_paragraph()
     doc.add_paragraph(
         "Every command in this document is typed on that PC. Sit at it if "
@@ -824,10 +798,9 @@ def build():
            ["10", "No event was delivered twice", "Step 11"],
            ["11", "The closing summary shows all events valid and all "
                   "uploads complete", "Step 12"]])
-    note(doc, "Running the cellular mode (section 18)? The same eleven apply "
-              "unchanged, with one substitution: criterion 2 becomes “all "
-              "four flags of AT+SDVRNET? are 1”, which is Step C1 rather "
-              "than Step 4. Say in your report which mode each result came "
+    note(doc, "Testing over the mobile network instead? That is "
+              "Scopus_QA_Flow.docx, Part 2, and it carries its own pass "
+              "criteria. Say in your report which mode each result came "
               "from — “the event arrived” means something different over the "
               "cable than it does over the mobile network.")
 
@@ -980,242 +953,12 @@ def build():
         "since the suite starts its own.")
     cmd(doc, f"{CD}python3 scopus/run_integration_tests.py")
     expected(doc)
-    code(doc, "  TOTAL: 57   PASS: 56   FAIL: 0   GAP: 0   SKIP: 1")
-    doc.add_paragraph("The one skip is the SD card slot being empty.")
+    code(doc, "  TOTAL: 66   PASS: 65   FAIL: 0   GAP: 0   SKIP: 1")
+    doc.add_paragraph("The one skip is the N6's SD card slot being empty.")
 
-    # ── Cellular ───────────────────────────────────────────────────────
+    # ── 18. Remote commands over MQTT ────────────────────────────────
     doc.add_page_break()
-    doc.add_heading("18. Testing over the cellular network", level=1)
-    doc.add_paragraph(
-        "Everything above runs over the USB cable between this PC and the "
-        "modem. This section runs the same test with the cable carrying "
-        "nothing: the modem sends over its own cellular connection, to a "
-        "server on the internet, and this PC watches what arrives there. It "
-        "is the configuration a deployed unit actually uses.")
-
-    doc.add_heading("Why it needs a server in the middle", level=2)
-    doc.add_paragraph(
-        "On cellular the modem is given a private address by the mobile "
-        "operator, so nothing on the internet can open a connection to it. "
-        "This PC is behind an office router, so nothing can open a "
-        "connection to this PC either. Neither end can reach the other, and "
-        "no amount of configuration changes that.")
-    doc.add_paragraph(
-        "So a third machine holds the middle. It has a fixed public address; "
-        "the modem sends to it, and this PC asks it what arrived. Both ends "
-        "make outgoing connections only, which is why this works from any "
-        "network — the office, a hotspot, a customer site — with nothing to "
-        "set up on the router.")
-    table(doc, ["Piece", "Where it runs", "What it does"],
-          [["cloud_relay.py", f"the public server, {RELAY_IP}",
-            "receives the notifications and the photos, and keeps them"],
-           ["relay_pull.py", "this PC",
-            "asks the relay what arrived and saves it here, exactly as "
-            "test_server.py did in Step 3"],
-           ["the modem", "the bench",
-            "sends to the relay's public address over cellular"]])
-    note(doc, "The relay is already installed and running as a service. "
-              "Nothing in this section starts or stops it.")
-
-    doc.add_heading("Step C0 — Check the modem can use cellular at all",
-                    level=2)
-    doc.add_paragraph(
-        "Two minutes here saves an hour of blaming the product. Run these "
-        "three, in Window B, before anything else.")
-    note(doc, "These four use --raw, which asks the modem's own AT parser "
-              "instead of the product's command channel. Questions about the "
-              "SIM and the radio have to go there: sent the ordinary way the "
-              "reply comes back as unreadable rubbish, which looks like a "
-              "broken modem and is not one. --raw needs the USB cable, even "
-              "though what you are testing is cellular.")
-    doc.add_paragraph(
-        "First: which SIM is the modem actually using? This board has room "
-        "for two — the plastic card you can see, and a second one soldered "
-        "onto it — and the modem uses whichever it was last told to. Ask it:")
-    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRSIM?"')
-    expected(doc)
-    code(doc, '  AT+SDVRSIM?\n'
-              '      +SDVRSIM:1,1,"<ICCID>","<IMSI>"\n'
-              "      OK")
-    doc.add_paragraph(
-        "The first two numbers must match: the first is the card the product "
-        "is configured to use, the second is the one it is on. The ICCID is "
-        "the long number printed on the SIM itself — check it is the card you "
-        "put in.")
-    note(doc, "Do not skip this. On the wrong card everything below still "
-              "passes — the SIM reads, the modem registers, the link reports "
-              "all four numbers as 1, an address is issued — and then nothing "
-              "is ever delivered, because that card has no data service. It "
-              "cost a full day of chasing the network before anyone looked at "
-              "the ICCID. If the two numbers differ, set it and try again:",
-         warn=True)
-    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRSIM=1"')
-    doc.add_paragraph("1 is the plastic holder, 2 the second holder, 0 the "
-                      "soldered one.")
-
-    doc.add_paragraph()
-    doc.add_paragraph("Is the SIM being read?")
-    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT+CPIN?"')
-    expected(doc)
-    code(doc, "[modem /dev/ttyAT]\n      AT+CPIN?\n      +CPIN: READY\n      OK")
-    note(doc, "“+CME ERROR: SIM failure” does NOT mean the holder is "
-              "empty. On this bench the SIM was present the whole time and "
-              "the modem was reading the wrong slot — this one line was the "
-              "difference between “no SIM” and a working LTE connection. "
-              "Check the slot before touching the hardware:", warn=True)
-    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT!UIMS?"')
-    doc.add_paragraph(
-        "If that answers 0 and there is a card in the holder, switch it to "
-        "the other slot and ask AT+CPIN? again. These two are the fix that "
-        "made this bench work:")
-    cmd(doc, f'{CD}python3 scopus/at.py --raw \'AT!ENTERCND="A710"\'')
-    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT!UIMS=1"')
-
-    doc.add_paragraph()
-    doc.add_paragraph("Is there coverage?")
-    cmd(doc, f'{CD}python3 scopus/at.py --raw "AT+COPS?"')
-    expected(doc)
-    code(doc, '[modem /dev/ttyAT]\n      AT+COPS?\n'
-              '      +COPS: 0,0,"<operator name>",7\n      OK')
-    doc.add_paragraph(
-        "A named operator is what you want. An empty name, or an answer of "
-        "just +COPS: 0, means the modem has not found a network — move the "
-        "bench or its antenna before going on.")
-
-    doc.add_heading("Step C1 — Point the modem at the relay", level=2)
-    doc.add_paragraph(
-        "This replaces Step 4. It sets the same five endpoints, but at the "
-        "relay instead of this PC, sets the APN, switches the modem to its "
-        "cellular connection, and then waits until the modem actually has a "
-        "route out before reporting success.")
-    cmd(doc, f"{CD}python3 scopus/at.py --point-cloud {RELAY_IP} "
-             f"--http-port {RELAY_HTTP_PORT} --udp-port {RELAY_UDP_PORT} "
-             f"--path {RELAY_PATH} --apn {BENCH_APN}")
-    note(doc, f"{BENCH_APN} is the APN for the SIM in this bench. A different "
-              f"SIM needs a different one, and the wrong APN looks exactly "
-              f"like a dead SIM — so if you were given one, use it here "
-              f"rather than assuming this line still applies.")
-    expected(doc)
-    code(doc, f'  AT+SDVRNTFHOST="{RELAY_IP}"\n'
-              "      OK\n"
-              "  …\n"
-              "  AT+SDVRNET?\n"
-              f'      +SDVRNET: 1,1,1,1,"<operator>","LTE","<apn>",'
-              f'"rmnet_data0","10.x.x.x","10.x.x.x",0\n'
-              "      OK\n\n"
-              f"OK — cellular link up. Notifications to "
-              f"http://{RELAY_IP}:{RELAY_HTTP_PORT}{RELAY_NOTIFY_PATH}, "
-              f"photos to http://{RELAY_IP}:{RELAY_HTTP_PORT}{RELAY_PATH}")
-    note(doc, f"Over cellular both the events and the photos travel as web "
-              f"traffic, on port {RELAY_HTTP_PORT} — the same port your "
-              f"browser uses. Over the cable (Steps 3 and 4) the events go a "
-              f"different way, as datagrams on port {RELAY_UDP_PORT}. That is "
-              f"deliberate: a datagram gets no answer, so nothing can tell you "
-              f"whether it arrived, and out on a mobile network it is the part "
-              f"most likely to be discarded silently on the way. A web request "
-              f"is answered, so the modem records for every event whether it "
-              f"landed. The command above switches this for you; you do not "
-              f"have to set it.")
-    doc.add_paragraph("The four numbers after +SDVRNET: are the whole story:")
-    table(doc, ["Position", "Means", "If it is 0"],
-          [["1st", "cellular mode is switched on",
-            "the command did not take — run Step C1 again"],
-           ["2nd", "the modem is registered on a mobile network",
-            "no coverage, or the SIM is not being read — see the table below"],
-           ["3rd", "a data session is established",
-            "the APN is wrong, or the SIM has no data service"],
-           ["4th", "the modem has a route out",
-            "the session came up but nothing can be sent — report this, it "
-            "is a fault rather than a setup problem"]])
-    note(doc, "All four must be 1. A modem can be registered on LTE and show "
-              "a healthy signal while the 4th is 0, and in that state every "
-              "notification fails and every status screen looks fine. That "
-              "is why this step waits for the 4th and not for the signal.",
-         warn=True)
-
-    doc.add_heading("Step C2 — Watch the relay (Window A)", level=2)
-    doc.add_paragraph(
-        "This replaces Step 3. Leave it running for the rest of the test; it "
-        "prints the same lines the local server printed, and saves into the "
-        "same folder.")
-    cmd(doc, f"{CD}python3 scopus/relay_pull.py --relay {RELAY_BASE} "
-             f"--key {RELAY_KEY} --fresh")
-    expected(doc)
-    code(doc, "Scopus relay viewer\n"
-              f"  relay    {RELAY_BASE}\n"
-              "  receiving into /home/user/scopus-received\n"
-              "  relay holds 0 notifications, 0 photos (seq 0)\n"
-              "  watching from seq 0. Ctrl-C to stop.")
-    note(doc, "If it says it cannot reach the relay, stop here and report "
-              "that — nothing later in this section can pass.")
-
-    doc.add_heading("Step C3 — Run the test", level=2)
-    doc.add_paragraph(
-        "Steps 5 to 12 are unchanged. Run them exactly as written. Every "
-        "event and every photo now travels over the mobile network and comes "
-        "back to you through the relay, and the pass criteria in section 13 "
-        "apply word for word.")
-    doc.add_paragraph(
-        "One difference worth knowing: over cellular an event takes a second "
-        "or two longer to appear in Window A than it did over the cable. "
-        "Anything beyond about ten seconds is worth reporting.")
-
-    doc.add_heading("Step C4 — Put it back on the cable", level=2)
-    doc.add_paragraph(
-        "To go back to the cable procedure, point the modem at this PC again "
-        "and turn the cellular mode off:")
-    cmd(doc, f"{CD}python3 scopus/at.py --point-here")
-    cmd(doc, f'{CD}python3 scopus/at.py "AT+SDVRNET=0"')
-    note(doc, "--point-here also puts events back on the cable's datagram "
-              "port, which is what the server in Step 3 listens on. If you "
-              "skip it and go straight back to Step 3, the events have "
-              "nowhere to land and Step 8 fails for a reason nothing on "
-              "screen explains.")
-    note(doc, "AT+SDVRNET=0 stops the modem maintaining the mobile "
-              "connection; it does not cut a transfer that is in progress.")
-
-    doc.add_heading("If the cellular test fails", level=2)
-    table(doc, ["What you see", "What it means and what to do"],
-          [["Step C1: 2nd number is 0 (not registered)",
-            "Either there is no coverage where the bench is, or the modem is "
-            "reading the wrong SIM slot. Both are covered by Step C0 — go "
-            "back and run it; it takes two minutes and answers this "
-            "question directly."],
-           ["Step C1: 3rd number is 0 (no data session)",
-            "The APN is the first suspect — pass the right one with --apn. "
-            "If several APNs all give the same result, the SIM's data "
-            "service is the suspect, not the APN."],
-           ["Step C1 passes, but nothing ever arrives in Window A",
-            "The modem has a route and is sending; the packets are being "
-            "dropped somewhere between it and the relay. Report it with the "
-            f"output of  {CD}python3 scopus/at.py \"AT+SDVRNET?\"  attached. "
-            "Two known causes: a SIM whose data service is not actually "
-            "active (it registers, gets an address, and carries nothing), "
-            "and the relay's UDP port being closed by the server's firewall."],
-           ["Any --raw command says it cannot reach the modem",
-            "That path goes over the USB Ethernet link, not the serial one, "
-            "so it fails when the modem has dropped off USB — which also "
-            "makes the ordinary commands answer with unreadable characters. "
-            "Check both cables at the modem board, then re-run Step 2. If "
-            "the modem does not reappear within a minute, it needs someone "
-            "to re-seat it; nothing in this document can be run until it "
-            "does."],
-           ["Photos arrive but events do not",
-            "On this procedure both travel the same way, over port "
-            f"{RELAY_HTTP_PORT}, so one arriving and not the other is not a "
-            "network problem. Check the modem is set to send events as web "
-            f"requests:  {CD}python3 scopus/at.py \"AT+SDVRNTFPROTO?\"  — it "
-            f"should answer 1 and \"{RELAY_NOTIFY_PATH}\". If it answers 0 "
-            "the modem is still sending datagrams, which the relay's host "
-            "does not accept; re-run Step C1."],
-           ["Everything passes but nothing is ever delivered",
-            "Check which SIM the modem is on — Step C0. On the wrong card "
-            "every check in this section passes and no data crosses. That is "
-            "the single most likely cause of this exact symptom."]])
-
-    # ── 19. Remote commands over MQTT ────────────────────────────────
-    doc.add_page_break()
-    doc.add_heading("19. Driving the unit from the server (remote commands)",
+    doc.add_heading("18. Driving the unit from the server (remote commands)",
                     level=1)
     doc.add_paragraph(
         "Everything up to here is the unit talking outwards: it sees "
@@ -1267,8 +1010,9 @@ def build():
     note(doc, "If the second number is 0, the unit is not connected. Give it "
               "half a minute and look again: it retries on its own, waiting "
               "5 seconds then 10, 20 and so on up to a minute between "
-              "attempts. If it stays 0, run Step C0 first — with no mobile "
-              "data there is nothing for it to connect over.")
+              "attempts. If it stays 0, check the mobile side first "
+              "(Scopus_QA_Flow.docx, Part 2, Step 1) — with no mobile data "
+              "there is nothing for it to connect over.")
     doc.add_paragraph("If it is switched off, switch it on with:")
     cmd(doc, f'{CD}python3 scopus/at.py '
              f'"AT+SDVRMQTTSRV=\\"{MQTT_HOST}\\",{MQTT_PORT}"')
@@ -1364,7 +1108,8 @@ def build():
     table(doc, ["What you see", "What it means and what to do"],
           [["AT+SDVRMQTT? shows 1,0 and stays there",
             "Switched on but not connecting. Almost always no mobile data "
-            "rather than anything to do with this channel — run Step C0. If "
+            "rather than anything to do with this channel — check the mobile "
+            "side (Scopus_QA_Flow.docx, Part 2). If "
             "the mobile side is healthy, the certificates are the next "
             "suspect: the modem must have all three files under "
             "/data/sdvr/certs."],
@@ -1390,7 +1135,7 @@ def build():
             "1.8 KB. Ask for less at a time."]])
 
     # ── 20. the motion sensor ────────────────────────────────────────────
-    doc.add_heading("20. Checking the motion sensor (the unit being moved)",
+    doc.add_heading("19. Checking the motion sensor (the unit being moved)",
                     level=1)
     doc.add_paragraph(
         "This is a different thing from people walking in front of the "
@@ -1468,9 +1213,6 @@ def build():
 
     doc.save(OUT)
     print(f"wrote {OUT}")
-    if RELAY_KEY.startswith("<"):
-        print("NOTE: SCOPUS_RELAY_KEY was not set, so section 18 carries a "
-              "placeholder instead of the relay key.")
 
 
 if __name__ == "__main__":

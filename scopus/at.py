@@ -23,7 +23,6 @@ fail with "network unreachable" while every status screen looks healthy.
 import argparse
 import os
 import socket
-import subprocess
 import sys
 import time
 
@@ -36,6 +35,9 @@ from devices import ModemAt, ModemSsh                        # noqa: E402
 # (untracked; scopus/bench.ini.template is the committed placeholder copy)
 # or from the matching environment variable. See scopus/lib/settings.py.
 MODEM_IP = S.get("modem", "ip")
+# Where the server takes HTTP notifications. The default belongs with the
+# rest of the site values, not in an argparse literal.
+NOTIFY_PATH = S.get("server", "notify_path") or "/notify"
 
 
 def raw_at(cmd, timeout=8.0):
@@ -144,11 +146,11 @@ def point_here(at, http_port, udp_port, path):
 
 
 def point_cloud(at, ip, http_port, udp_port, path, apn, auth, user, pwd,
-                notify_proto="http", notify_path="/scopus/notify"):
-    """Aim the modem at a public relay and switch the backhaul to cellular.
+                notify_proto="http", notify_path=NOTIFY_PATH):
+    """Aim the modem at a public server and switch the backhaul to cellular.
 
     The cable version of this (--point-here) can work out the address by
-    asking the routing table. Nothing can work this one out: the relay is
+    asking the routing table. Nothing can work this one out: the server is
     wherever you put it, and over cellular the modem has no route to this PC
     at all — the whole point is that both ends talk to a third machine.
 
@@ -284,10 +286,11 @@ def main() -> int:
     ap.add_argument("--notify-proto", choices=("http", "udp"), default="http",
                     help="how --point-cloud sends notifications (default "
                          "http: rides the same TCP port the photos already "
-                         "use, and the relay answers with a status code)")
-    ap.add_argument("--notify-path", default="/scopus/notify",
-                    help="request path for HTTP notifications "
-                         "(default /scopus/notify)")
+                         "use, and the server answers with a status code)")
+    ap.add_argument("--notify-path", default=NOTIFY_PATH,
+                    help=f"request path for HTTP notifications "
+                         f"(default {NOTIFY_PATH}, from bench.ini "
+                         f"[server] notify_path)")
     ap.add_argument("--timeout", type=float, default=4.0)
     args = ap.parse_args()
 
@@ -303,7 +306,7 @@ def main() -> int:
         out = raw_at(" ".join(args.command), args.timeout)
         if out is None:
             return 2
-        print(f"[modem /dev/ttyAT]")
+        print("[modem /dev/ttyAT]")
         for line in out.replace("\r", "").splitlines():
             if line.strip():
                 print(f"      {line.strip()}")

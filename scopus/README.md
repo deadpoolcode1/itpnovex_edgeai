@@ -47,12 +47,13 @@ from FAIL so a missing feature can never be mistaken for a passing one — the
 GAP count is the honest distance to a working product.
 
 ```bash
-python3 scopus/run_integration_tests.py     # ~90 s, writes results/integration-<ts>.json
+python3 scopus/run_integration_tests.py     # ~250 s, writes results/integration-<ts>.json
 ```
 
-**Current: 56 PASS / 0 FAIL / 0 GAP / 1 SKIP**, identical over three
-consecutive runs. The SKIP is the physically absent SD card. Point the camera
-at people and the modem sends the event.
+**Current (2026-08-26): 66 total — 65 PASS / 0 FAIL / 0 GAP / 1 SKIP**,
+identical over consecutive runs. The SKIP is the physically absent SD card in
+the N6's slot. Point the camera at people and the modem sends the event.
+`run_scopus_tests.py` alongside it: **49 total — 45 PASS / 0 FAIL / 4 SKIP**.
 
 Every test restores what it changed, so back-to-back runs give identical
 results. That is load-bearing rather than decorative: the suite stops live
@@ -106,7 +107,7 @@ Two documents, both generated, for two different readers:
 | Document | For | Covers |
 |---|---|---|
 | `Scopus_QA_Flow.docx` | the run QA repeats | the flow and nothing else: the product on the cable, then the same product over cellular through the customer's server, including driving it from there over MQTT |
-| `Scopus_Tester_Manual.docx` | the first walk-through, and anything that goes wrong | what each step proves, per-step troubleshooting, the public relay, and the parts you only reach when something fails |
+| `Scopus_Tester_Manual.docx` | the first walk-through, and anything that goes wrong | what each step proves, per-step troubleshooting, and the parts you only reach when something fails |
 
 `Scopus_QA_Flow.docx` is the short one — two parts, one command per line,
 a pass-criteria table at the end of each and a cheat sheet of the whole thing
@@ -139,27 +140,21 @@ python3 scopus/test_server.py --http-port 8080 --udp-port 9999 \
         --dir ~/scopus-received --from-modem 192.168.2.2
 ```
 
-### Over cellular (section 18 of the manual)
+### Over cellular (Part 2 of `Scopus_QA_Flow.docx`)
 
 `test_server.py` only works while the cable is attached. On cellular the modem
-has a carrier-NAT address and your PC has no public address, so neither end can
-open a connection to the other — a third machine has to hold the middle.
-
-`cloud_relay.py` runs on a host with a public address and receives exactly what
-`test_server.py` receives; `relay_pull.py` runs on your PC and pulls it down
-over an ordinary outbound request. Both ends dial out, so it works from any
-network with nothing to configure on a router.
+has a carrier-NAT address and dials out to the customer's receiver — the one at
+`[server] host` in `bench.ini`, which is reachable from the bench, so the same
+machine both drives the test and reads what landed.
 
 ```bash
-# on the public host (already installed as the systemd unit scopus-relay)
-python3 scopus/cloud_relay.py --key <secret> --udp-port 39999 --http-port 38080
+# aim the unit at the customer's server and switch the radio on
+python3 scopus/at.py --point-cloud 213.8.185.180 --http-port 8991 \
+        --path /upload --notify-path /notify --apn <apn>
+python3 scopus/at.py "AT+SDVRNET?"     # 1,1,1,1 = attached with a route
 
-# on the bench: aim the modem there and switch it to cellular
-python3 scopus/at.py --point-cloud 165.22.181.245 --http-port 80 \
-        --udp-port 39999 --path /scopus/upload --apn <apn>
-
-# on your PC: watch what arrives
-python3 scopus/relay_pull.py --relay http://165.22.181.245/scopus --key <secret>
+# on the server: watch both legs land
+sudo journalctl -fu sdvr-https
 ```
 
 Two things bite here, both documented in `STATUS.md`: the notification host
@@ -168,7 +163,7 @@ names), and the modem needs `AT+SDVRNET=1` — being registered on LTE is not
 the same as having a route, and the difference is invisible unless you look at
 the fourth flag of `AT+SDVRNET?`.
 
-### Remote commands (section 19 of the manual)
+### Remote commands (section 18 of the manual)
 
 Everything above is the unit talking outwards. The command channel is the
 other direction: type a command on the server and the unit carries it out,
@@ -432,7 +427,7 @@ python3 scopus/at.py --raw "AT+CPIN?"              # ask the modem itself
 |---|---|---|
 | `command…` | — | the AT command, quoted |
 | `--point-here` | — | set all five endpoints to this PC's address on the modem's subnet, then read them back. This is the whole of Step 2 of the manual |
-| `--point-cloud IP` | — | same, but aimed at a public relay, and switch the modem to its cellular backhaul (sets the APN, turns `AT+SDVRNET=1` on, and waits for a **route**, not just registration) |
+| `--point-cloud IP` | — | same, but aimed at a public address, and switch the modem to its cellular backhaul (sets the APN, turns `AT+SDVRNET=1` on, and waits for a **route**, not just registration) |
 | `--apn APN` | — | APN to set alongside `--point-cloud` |
 | `--apn-auth` | `none` | `none` \| `pap` \| `chap` |
 | `--apn-user` / `--apn-pass` | empty | APN credentials |
@@ -440,7 +435,7 @@ python3 scopus/at.py --raw "AT+CPIN?"              # ask the modem itself
 | `--udp-port N` | 9999 | notification port to program |
 | `--path P` | `/upload` | upload URL path |
 | `--notify-proto` | `http` | how `--point-cloud` sends notifications: `http` rides the same TCP port the photos use and gets a status code back; `udp` is the §5.2 default |
-| `--notify-path P` | `/scopus/notify` | request path for HTTP notifications |
+| `--notify-path P` | `bench.ini` `[server] notify_path` | request path for HTTP notifications |
 | `--raw` | — | send to the **modem's own** AT parser over SSH (`/dev/ttyAT`) instead of the SDVR channel — the only way to ask SIM, slot and radio questions; needs the USB Ethernet link even when testing over cellular |
 | `--timeout SEC` | 4.0 | reply timeout |
 
@@ -483,33 +478,6 @@ python3 scopus/test_server.py --http-port 8080 --udp-port 9999 \
 | `--from-modem IP` | any | only accept datagrams from this address |
 | `--fresh` | — | start empty, moving an earlier run to `<dir>-old-<ts>` |
 
-```bash
-# on the public host (installed as the systemd unit scopus-relay)
-python3 scopus/cloud_relay.py --key <secret> --udp-port 39999 --http-port 38080
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--key K` | **required** | shared secret the pull client must present |
-| `--http-port` / `--udp-port` | 8080 / 9999 | device-facing ports |
-| `--dir PATH` | `scopus-relay-data` | storage |
-| `--device-token T` | — | also require the device's `X-Token` header (set with `AT+SDVRTOK`) |
-| `--max-photos N` | 500 | ring size |
-
-```bash
-# on your PC, over cellular
-python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--relay URL` | **required** | base URL of the relay |
-| `--key K` | **required** | the relay's shared secret |
-| `--dir PATH` | `scopus-received` | same layout as `test_server.py`, deliberately |
-| `--from-start` | — | replay everything the relay still holds, ignoring the remembered position in `<dir>/.relay-seq` |
-| `--fresh` | — | start empty, keeping an earlier run in `<dir>-old-<ts>` |
-| `--timeout SEC` | 40.0 | long-poll timeout |
-
 ### Suites and manuals
 
 | Command | Options |
@@ -543,7 +511,7 @@ python3 scopus/relay_pull.py --relay http://165.22.181.245:38080 --key <secret>
 The **remote command channel** (`AT+SDVRMQTT*`, `AT+SDVRCMDR`, `+SDVRCMD`) is
 not in the automated suite: proving it needs a broker with the device's client
 certificate, which is server-side state the suite does not own. It is covered
-by hand instead, in section 19 of the tester manual, with its own pass
+by hand instead, in section 18 of the tester manual, with its own pass
 criteria — including "every command is answered exactly ONCE", which is there
 because the lossy-ack retry published every response twice on the first
 end-to-end run.
@@ -562,14 +530,15 @@ scopus/
   run_scopus_tests.py        # per-command/per-seam suite (HTML+PDF report)
   run_integration_tests.py   # whole-product chain, hop by hop (JSON report)
   inference_test.py          # NN only: known image in, people count out
+  qa_sweep.py                # a directory of images through the NN, by COCO class
+  modem_restore.py           # put sdvrApp back after Legato reinstalls its
+                             #   factory system (see STATUS.md 2026-08-19)
   test_server.py             # the "server" end: receives notifications (UDP)
                              #   and photo uploads (HTTP), on your PC
-  cloud_relay.py             # the same receiver, on a public host, for the
-                             #   cellular test — plus a pull API
-                             # (remote commands need no script here: the
-                             #   server end is mosquitto_pub/_sub, section 19)
-  relay_pull.py              # pulls from the relay onto your PC (no inbound
-                             #   port needed anywhere)
+                             # (over cellular the unit posts to the
+                             #   customer's server directly; remote commands
+                             #   need no script here either — the server end
+                             #   is mosquitto_pub/_sub, section 18)
   Scopus_QA_Flow.docx        # the short flow QA repeats: cable, then cellular
                              #   + MQTT against the customer's server
   make_qa_flow.py            # regenerates it — edit this, not the docx
@@ -577,9 +546,9 @@ scopus/
   make_tester_manual.py      # regenerates the .docx — edit this, not the docx
   make_tracked_manual.py     # + a tracked-changes copy for review in Word
   STATUS.md                  # RESUME HERE: bench access, build/deploy, what's open
-  bench-tools/               # link probes and soak tools (see STATUS.md §6)
   lib/devices.py             # N6Shell, ModemAt, ModemSsh (raw termios + sshpass; no pyserial)
   lib/report.py              # Suite/TestResult + HTML/PDF writer (shared style)
+  lib/settings.py            # every site value, read from the untracked bench.ini
   results/                   # generated reports (gitignored)
 ```
 

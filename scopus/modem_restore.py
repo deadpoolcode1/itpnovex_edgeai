@@ -88,7 +88,7 @@ def find_bundle():
 
 def diagnose(m):
     """What state is the modem in? Returns (app_present, note)."""
-    rc, idx, _ = m.run(f"cat /legato/systems/current/index")
+    rc, idx, _ = m.run("cat /legato/systems/current/index")
     rc2, props, _ = m.run("cat /legato/systems/current/info.properties")
     rc3, status, _ = m.run(f"{APP} status")
 

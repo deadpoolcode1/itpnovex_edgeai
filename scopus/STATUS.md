@@ -1,6 +1,62 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-25. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-26. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-26 — the obsolete half of the harness is gone
+
+Nothing here changes what the product does. This is `scopus/` losing the
+tooling that belonged to problems that are now closed, so that what is left is
+what a person should actually run.
+
+| Removed | Why |
+|---|---|
+| `bench-tools/` (12 files) | one-off probes for the N6↔modem link: `idle_gap.py`, `who_drops2.py`, `wire_test.sh`, `link_map.py`, `hdlc_probe.py`, `probe.py`, `trace.py`, `modem_console.py`, `burst.py`, `soak.py`, `n6.py`, `fullpath.py`. Every fault they were written to chase is fixed (§3, §5) and groups I and J of the integration suite assert the fixes. Nothing imported them, the README pointed at a `STATUS.md §6` that does not exist, and they still hardcoded `/dev/serial/by-id/…-if02` and `/home/ilan/…` |
+| `cloud_relay.py`, `relay_pull.py` | the droplet relay was the way round two external blockers — a SIM with no data and a closed UDP 39999 on DigitalOcean (2026-08-09). The customer's own receiver at `[server] host` has carried both legs over cellular since 2026-08-17, and it runs on the office address the bench is already on, so there is nothing left for a machine in the middle to do |
+| tester manual section 18 | the same relay, as a procedure. Cellular is covered in full by `Scopus_QA_Flow.docx` Part 2, against the customer's server. Sections 19 and 20 became 18 and 19; the manual and its tracked copy are regenerated |
+| `ModemAt.send_raw()`, `Settings.getpath()` | uncalled. `send_raw` fed the binary tail of `AT+SDVRSENDBIN`, which the harness stopped doing when T9.4 was cut back to asserting the arm (the AT channel cannot deliver SIZE bytes); callers of `getpath` expand paths themselves |
+| `scopus_e2e/` at the repo root | an untracked July prototype of the chain test — `bridge.py`, `hdlc_test.py`, `ntfa.py`, `udpsrv.py`. `run_integration_tests.py` is the version that survived |
+
+`RELAY_IP` was the last site address still hardcoded in a generator, so
+ScopusQA #11 — every site value in one untracked file — is now true of the
+whole directory. `python3 -m pyflakes scopus/*.py scopus/lib/*.py` is clean.
+
+Both suites were run before and after, on the same firmware, to prove the
+removal changed nothing:
+
+| Suite | Before | After |
+|---|---|---|
+| `run_integration_tests.py` | 66 — 65 PASS / 0 FAIL / 0 GAP / 1 SKIP | **identical** |
+| `run_scopus_tests.py` | 49 — 45 PASS / 0 FAIL / 4 SKIP | **identical** |
+
+The four skips are the two empty SD slots (four N6 tests) and nothing else.
+`Scopus_Tester_Manual.docx` said the integration suite prints `TOTAL: 57` —
+that was true in June; it now says 66.
+
+### The modem-SD group ate itself, and had been doing so for a while
+
+The two runs disagreed on the first attempt — 45 PASS / 4 SKIP, then 42 / 7 —
+and the three that moved were T10.1–T10.3, the modem's own card. Nothing above
+touches SD. `AT+SDVRUNMOUNTSD` does not just unmount: `SD_Unmount(releaseCard)`
+in `sd_manager.c` **unbinds** the card from the mmcblk driver on purpose, so
+the host MCU can drive the shared SD bus, and `/dev/mmcblk0` disappears with
+it. T10.3 asserts that and then leaves it that way; the guard at the top of
+group 10 reads the absent node as "no card in the slot", so **the run after any
+successful run silently skipped all three**. Every recorded 7-SKIP score is
+this, not an empty slot.
+
+Group 10 now re-mounts after the assertion, which is the same courtesy
+`snapshot_device()` / `restore_device()` pay everywhere else. Proven with two
+back-to-back runs: 45 / 4 both times, where the second used to be 42 / 7.
+
+### One thing the pre-flight found first
+
+`/dev/ttyACM1` was held by a VS Code serial monitor on the bench (pid in
+`code`, open for 26 hours), which is the trap `preflight.py` check 3 exists
+for: the camera looks silent and healthy at the same time. Killing that one
+process took the run from 10/12 to **12/12 PASS**. The desktop session had
+been idle for two days.
 
 ---
 

@@ -559,6 +559,14 @@ def g10_modem_sd(c: Ctx, s: Suite):
     s.ok("T10.3", "AT+SDVRUNMOUNTSD unmounts (/proc/mounts) (§3.2)",
          "OK" in r and unmounted, extra=_oneline(r))
 
+    # AT+SDVRUNMOUNTSD does not just unmount: it unbinds the card from the
+    # mmcblk driver, by design, so the host MCU can drive the shared SD bus
+    # (sd_manager.c, SD_Unmount releaseCard). /dev/mmcblk0 therefore vanishes
+    # — and the guard above reads that as "no card in the slot", so the run
+    # after this one silently skips all three of these. Put the card back,
+    # after the assertion, the same way snapshot/restore does elsewhere.
+    m.expect("AT+SDVRMOUNTSD", "OK", 8.0)
+
 
 # ─────────────────────── cross-device groups ──────────────────────────
 def g11_tunnel(c: Ctx, s: Suite):

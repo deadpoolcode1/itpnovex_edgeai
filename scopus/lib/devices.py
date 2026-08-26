@@ -19,7 +19,7 @@ import glob
 import os
 import subprocess
 import time
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 from settings import S
 
@@ -236,31 +236,6 @@ class ModemAt:
             if os.path.exists(c) and cls._probe(c):
                 return c
         return None
-
-    def send_raw(self, data: bytes, settle=0.5) -> str:
-        """Write raw bytes with no AT terminator.
-
-        Used to satisfy the payload of a command that has entered binary data
-        mode (AT+SDVRSENDBIN), which must be fed exactly SIZE bytes.
-        """
-        fd = os.open(self.tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        try:
-            n = 0
-            while n < len(data):
-                try:
-                    n += os.write(fd, data[n:])
-                except BlockingIOError:
-                    time.sleep(0.005)
-            end = time.time() + settle
-            buf = b""
-            while time.time() < end:
-                try:
-                    buf += os.read(fd, 8192)
-                except BlockingIOError:
-                    time.sleep(0.02)
-            return buf.decode(errors="replace")
-        finally:
-            os.close(fd)
 
     def send(self, cmd: str, timeout=3.0) -> str:
         """Send an AT command, over whichever wire actually carries it.
