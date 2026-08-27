@@ -53,7 +53,7 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        6U
+#define REGISTRY_VERSION        7U
 
 /** Notification reason bits — SoW §4.2.
  *
@@ -183,6 +183,15 @@ typedef struct
    * migration has bytes to copy and the default actually arrives. */
   uint32_t  detect_debounce_ms;
 
+  /* V6 — main-path detection mode (ScopusQA #22). 0 = default (one inference
+   * on the whole downscaled frame), 1 = tile (a 4x3 sweep of the live main
+   * pipe, merged across tiles, ~1 detection per second).
+   *
+   * uint32 for the same reason detect_debounce_ms is — see the note above.
+   * A uint8 here would sit in the previous struct's trailing padding, leave
+   * sizeof unchanged, and come up as whatever that padding held. */
+  uint32_t  detect_tile_mode;
+
 } t_registry_data;
 
 /*-------------------------------------------------------------------------*//**
@@ -232,6 +241,12 @@ const t_registry_data registry_defaults =
   .motion_no_motion_timeout_s  = 30U,
   .boot_count                  = 0U,
   .detect_debounce_ms          = 1000U,  /* a change must hold for 1 s */
+
+  /* Tiling is the main path (ScopusQA #22): the whole-frame downscale loses
+   * anything smaller than about half the frame, which is the ScopusQA #17
+   * cliff. The cost is the detection rate — ~1.1 s a sweep instead of ~90 ms
+   * — and that was specified as acceptable. */
+  .detect_tile_mode            = 1U,
 
   /* Wifi */
   .wifi_mode            = 0U,

@@ -46,6 +46,7 @@
 #include "modem_task.h"
 #include "motion_sensor.h"
 #include "nn_task.h"
+#include "tile_detect.h"
 #include "snapshot_task.h"
 #include "fx_app.h"
 #include "camera_task.h"   /* CAMERA_ANCILLARY_BUFFER_SIZE */
@@ -461,12 +462,12 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "Board movement: [sense <0..100> <timeout_s>] | [query] | [read] | [selftest] | [simulate 0|1]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | mode default|tile|query | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | report on|off | clear | query] - inject test frame into NN" },
-  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
+  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|fullpass on|off|edgedrop on|off|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | relink | test wedge [baud] | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
@@ -689,6 +690,7 @@ void _shell_task_init(void)
       nn_task_det_set(reg->detect_det_mask);
       nn_task_action_set(reg->detect_action_mask);
       nn_task_debounce_set(reg->detect_debounce_ms);
+      nn_task_tile_set(reg->detect_tile_mode != 0U);
       motion_sens    = reg->motion_sensitivity;
       motion_timeout = reg->motion_no_motion_timeout_s;
       registry_release();
@@ -1974,50 +1976,22 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
  * remapped to full-frame coordinates and merged with IoU-NMS so a person
  * straddling two adjacent tiles is reported once.
  *
- * This first cut is the UART-testable engine: the "full frame" is uploaded
- * over CDC (any WxH RGB888, up to the 16 MB model-update buffer we reuse as
- * scratch) rather than grabbed live off the DCMIPP. That keeps the live
- * camera / ATON path untouched while letting us validate tiling geometry +
- * NMS end-to-end with real photos via `n6cam-tile.py`.
+ * The geometry, crop/resize and NMS now live in tile_detect.c, because the
+ * live NN loop runs the same sweep on a different clock — one tile per camera
+ * frame instead of one blocking command. What is left here is the shell: the
+ * synchronous drive, the configuration verbs, and the printing.
  *
- * Buffers reused (no new PSRAM):
- *   _fwupd_model_buf  (16 MB) - holds the uploaded full frame. Only ever
- *                     used during `update model`, never concurrent with tiling.
+ * Buffers:
+ *   _fwupd_model_buf  (16 MB) - holds the frame pushed in by `tile upload`.
+ *                     Only ever used during `update model`, never concurrent.
  *   _frame_test_buf   (256x256x3) - per-tile resized crop = the NN override.
+ *   tile_detect.c owns the live RGB888 snapshot, so `tile live` no longer
+ *                     clobbers an uploaded frame.
  * ======================================================================== */
 
-#define TILE_MAX_AXIS       12U     /* max cols or rows                        */
-#define TILE_MAX_DETS       256U    /* pre-NMS accumulation cap                */
-#define TILE_NN_SIDE        CAMERA_ANCILLARY_WIDTH   /* 256 - NN input side    */
-
-/* Factory defaults, mirroring the I.T.P. Novex 90-deg-FOV example: 5x4 grid,
- * 576 px square crops over a 2592x1944 sensor frame, auto overlap, conf 0.45,
- * IoU 0.40. `tile default` restores exactly these. */
-#define TILE_DEF_COLS       5U
-#define TILE_DEF_ROWS       4U
-#define TILE_DEF_CROP       576U
-#define TILE_DEF_OVL_H      0U       /* 0 = auto (even distribution)           */
-#define TILE_DEF_OVL_V      0U
-#define TILE_DEF_FW         2592U
-#define TILE_DEF_FH         1944U
-#define TILE_DEF_CONF       0.45f
-#define TILE_DEF_IOU        0.40f
-
-/* Tiling configuration (persisted between commands). */
-static uint16_t _tile_cols     = TILE_DEF_COLS;
-static uint16_t _tile_rows     = TILE_DEF_ROWS;
-static uint16_t _tile_crop     = TILE_DEF_CROP;   /* square crop side, px       */
-static uint16_t _tile_ovl_h    = TILE_DEF_OVL_H;
-static uint16_t _tile_ovl_v    = TILE_DEF_OVL_V;
-static uint16_t _tile_fw       = TILE_DEF_FW;     /* uploaded full-frame width  */
-static uint16_t _tile_fh       = TILE_DEF_FH;     /* uploaded full-frame height */
-static float    _tile_conf     = TILE_DEF_CONF;   /* keep detections >= conf    */
-static float    _tile_iou      = TILE_DEF_IOU;    /* NMS suppression IoU        */
-static bool     _tile_loaded   = false;  /* a full frame is in _fwupd_model_buf*/
-
-/* Post-remap detection in full-frame normalized [0,1] corner coordinates. */
-typedef struct { float x1, y1, x2, y2, conf; int32_t cls; bool keep; } _tile_det_t;
-static _tile_det_t _tile_dets[TILE_MAX_DETS];
+static bool _tile_loaded = false;   /* a full frame is in _fwupd_model_buf   */
+static uint16_t _tile_fw = 2592U;   /* uploaded full-frame width             */
+static uint16_t _tile_fh = 1944U;   /* uploaded full-frame height            */
 
 /* Human-readable name for the COCO classes we care about (person + vehicles);
  * everything else prints as its numeric index. */
@@ -2032,120 +2006,6 @@ static const char *_tile_class_name(int32_t c)
     case 5:  return "bus";
     case 7:  return "truck";
     default: return "class";
-  }
-}
-
-/* Compute the `n` tile origins along one axis of length `span`, given a square
- * `crop` and an optional explicit `ovl` overlap (0 = auto). Origins slide from
- * 0 to (span-crop); auto mode distributes them evenly so the grid always
- * covers the whole span with automatic overlap when crop*n > span. Returns the
- * effective stride via *stride_out. */
-static void _tile_axis_origins(uint16_t n, uint16_t span, uint16_t crop,
-                               uint16_t ovl, uint16_t *origins, uint16_t *stride_out)
-{
-  uint16_t c = (crop > span) ? span : crop;
-  uint16_t last = (uint16_t)(span - c);
-  if (n <= 1U)
-  {
-    origins[0] = 0U;
-    *stride_out = 0U;
-    return;
-  }
-  uint32_t stride;
-  if (ovl > 0U)
-  {
-    stride = (c > ovl) ? (uint32_t)(c - ovl) : 1U;
-  }
-  else
-  {
-    stride = (uint32_t)last / (uint32_t)(n - 1U);
-    if (stride == 0U) stride = 1U;
-  }
-  for (uint16_t i = 0U; i < n; i++)
-  {
-    uint32_t o = (uint32_t)i * stride;
-    if (o > last) o = last;
-    origins[i] = (uint16_t)o;
-  }
-  origins[n - 1U] = last;   /* guarantee the last tile reaches the far edge   */
-  *stride_out = (uint16_t)stride;
-}
-
-/* Bilinear-resize the square region [cx,cy, crop x crop] of the uploaded RGB888
- * full frame into the 256x256x3 NN input buffer `dst`. Source coordinates are
- * clamped so we never read outside the frame. */
-static void _tile_resize_crop(const uint8_t *src, uint16_t fw, uint16_t fh,
-                              uint16_t cx, uint16_t cy, uint16_t crop, uint8_t *dst)
-{
-  const uint32_t N = TILE_NN_SIDE;
-  const float step = (crop > 1U) ? (float)(crop - 1U) / (float)(N - 1U) : 0.0f;
-  for (uint32_t oy = 0U; oy < N; oy++)
-  {
-    float    fy = (float)cy + (float)oy * step;
-    uint32_t y0 = (uint32_t)fy;
-    if (y0 > (uint32_t)(fh - 2U)) y0 = fh - 2U;
-    float wy = fy - (float)y0;
-    for (uint32_t ox = 0U; ox < N; ox++)
-    {
-      float    fx = (float)cx + (float)ox * step;
-      uint32_t x0 = (uint32_t)fx;
-      if (x0 > (uint32_t)(fw - 2U)) x0 = fw - 2U;
-      float wx = fx - (float)x0;
-
-      const uint8_t *p00 = src + ((size_t)y0 * fw + x0) * 3U;
-      const uint8_t *p01 = p00 + 3U;
-      const uint8_t *p10 = p00 + (size_t)fw * 3U;
-      const uint8_t *p11 = p10 + 3U;
-      uint8_t *d = dst + ((size_t)oy * N + ox) * 3U;
-      for (uint32_t ch = 0U; ch < 3U; ch++)
-      {
-        float top = (float)p00[ch] * (1.0f - wx) + (float)p01[ch] * wx;
-        float bot = (float)p10[ch] * (1.0f - wx) + (float)p11[ch] * wx;
-        float v   = top * (1.0f - wy) + bot * wy;
-        d[ch] = (uint8_t)(v + 0.5f);
-      }
-    }
-  }
-}
-
-/* IoU of two normalized corner boxes. */
-static float _tile_iou_of(const _tile_det_t *a, const _tile_det_t *b)
-{
-  float ix1 = (a->x1 > b->x1) ? a->x1 : b->x1;
-  float iy1 = (a->y1 > b->y1) ? a->y1 : b->y1;
-  float ix2 = (a->x2 < b->x2) ? a->x2 : b->x2;
-  float iy2 = (a->y2 < b->y2) ? a->y2 : b->y2;
-  float iw = ix2 - ix1, ih = iy2 - iy1;
-  if (iw <= 0.0f || ih <= 0.0f) return 0.0f;
-  float inter = iw * ih;
-  float ua = (a->x2 - a->x1) * (a->y2 - a->y1)
-           + (b->x2 - b->x1) * (b->y2 - b->y1) - inter;
-  return (ua > 0.0f) ? (inter / ua) : 0.0f;
-}
-
-/* Greedy class-aware NMS over the first `n` entries of _tile_dets. Marks the
- * survivors keep=true. O(n^2), n <= TILE_MAX_DETS. */
-static void _tile_nms(uint32_t n, float iou_th)
-{
-  for (uint32_t i = 0U; i < n; i++) _tile_dets[i].keep = true;
-  for (uint32_t i = 0U; i < n; i++)
-  {
-    if (!_tile_dets[i].keep) continue;
-    for (uint32_t j = i + 1U; j < n; j++)
-    {
-      if (!_tile_dets[j].keep) continue;
-      if (_tile_dets[j].cls != _tile_dets[i].cls) continue;
-      if (_tile_iou_of(&_tile_dets[i], &_tile_dets[j]) > iou_th)
-      {
-        /* keep the higher-confidence one */
-        if (_tile_dets[j].conf > _tile_dets[i].conf)
-        {
-          _tile_dets[i].keep = false;
-          break;                 /* i is gone; stop comparing it              */
-        }
-        _tile_dets[j].keep = false;
-      }
-    }
   }
 }
 
@@ -2175,12 +2035,10 @@ static bool _nn_run_on_buffer(uint8_t *buf, uint32_t timeout_ms)
   return (nn_task_test_frame_seq() - seq0) >= 2U;
 }
 
-/* `tile run` core: crop -> resize -> NN -> remap -> accumulate -> NMS. */
 /* Core sweep, shared by `tile run` (uploaded frame) and `tile live` (live
- * camera snapshot): crop each grid tile from `frame` (RGB888, fw x fh),
- * bilinear-resize it to the 256x256 NN input, run the detector, remap boxes to
- * full-frame normalized coords, accumulate, then class-aware IoU-NMS. `label`
- * tags the report line ("run"/"live"). */
+ * camera snapshot): step the tile_detect cursor, driving each crop through the
+ * NN synchronously, then print the merged result. `label` tags the report line
+ * ("run"/"live"). */
 static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
                                 uint16_t fw, uint16_t fh, const char *label)
 {
@@ -2189,87 +2047,71 @@ static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
     CMD_PRINTF(stream, "tile %s: NN stopped - run 'detect start' first%s", label, lwshell_eol());
     return LWSHELL_OK;
   }
-  uint16_t crop = _tile_crop;               /* clamp so a crop can't exceed the */
-  if (crop > fw) crop = fw;                  /* frame (whole-axis = 1 region)    */
-  if (crop > fh) crop = fh;
-
-  uint16_t xs[TILE_MAX_AXIS], ys[TILE_MAX_AXIS], sx = 0U, sy = 0U;
-  _tile_axis_origins(_tile_cols, fw, crop, _tile_ovl_h, xs, &sx);
-  _tile_axis_origins(_tile_rows, fh, crop, _tile_ovl_v, ys, &sy);
-
-  const float inv_fw = 1.0f / (float)fw;
-  const float inv_fh = 1.0f / (float)fh;
-  uint32_t n_acc = 0U, n_infer = 0U, n_raw = 0U;
-  uint32_t t0 = HAL_GetTick();
-
-  for (uint16_t r = 0U; r < _tile_rows; r++)
+  /* One sweep at a time — the accumulator is a single static. The live loop
+   * owns it whenever main-path tiling is on, and a command that quietly
+   * interleaved with it would corrupt both answers. */
+  if (nn_task_tile_get())
   {
-    for (uint16_t c = 0U; c < _tile_cols; c++)
-    {
-      _tile_resize_crop(frame, fw, fh, xs[c], ys[r], crop, _frame_test_buf);
-      SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
-
-      /* Route the NN at this tile and wait for it to actually run on it. */
-      if (!_nn_run_on_buffer(_frame_test_buf, 3000U))
-      {
-        CMD_PRINTF(stream, "tile %s: no inference on tile (%u,%u) within 3s "
-                           "— is the camera pipeline running?%s",
-                   label, (unsigned)c, (unsigned)r, lwshell_eol());
-        return LWSHELL_OK;
-      }
-      n_infer++;
-
-      t_nn_box buf[NN_BOXES_MAX_NUM];
-      uint32_t got = nn_get_detections(buf, NN_BOXES_MAX_NUM);
-      for (uint32_t i = 0U; i < got; i++)
-      {
-        n_raw++;
-        if (buf[i].conf < _tile_conf) continue;
-        if (n_acc >= TILE_MAX_DETS) continue;
-        /* box is normalized [0,1] within the tile -> tile px -> full-frame px
-         * -> full-frame normalized. */
-        float bx = (float)xs[c] + buf[i].x_center * (float)crop;
-        float by = (float)ys[r] + buf[i].y_center * (float)crop;
-        float bw = buf[i].width  * (float)crop;
-        float bh = buf[i].height * (float)crop;
-        _tile_det_t *d = &_tile_dets[n_acc++];
-        d->x1   = (bx - bw * 0.5f) * inv_fw;
-        d->y1   = (by - bh * 0.5f) * inv_fh;
-        d->x2   = (bx + bw * 0.5f) * inv_fw;
-        d->y2   = (by + bh * 0.5f) * inv_fh;
-        d->conf = buf[i].conf;
-        d->cls  = buf[i].class_index;
-        d->keep = true;
-      }
-    }
+    CMD_PRINTF(stream, "tile %s: main-path tiling is on and owns the engine — "
+                       "'detect mode default' first%s", label, lwshell_eol());
+    return LWSHELL_OK;
   }
 
-  _tile_nms(n_acc, _tile_iou);
+  uint16_t cols = 0U, rows = 0U, crop = 0U;
+  tile_cfg_get(&cols, &rows, &crop, NULL, NULL, NULL, NULL);
+  if (crop > fw) crop = fw;
+  if (crop > fh) crop = fh;
+
+  uint32_t n_tiles = tile_sweep_begin(frame, fw, fh);
+  uint32_t t0 = HAL_GetTick();
+
+  for (uint32_t i = 0U; i < n_tiles; i++)
+  {
+    tile_sweep_crop(i, _frame_test_buf);
+    SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
+
+    /* Route the NN at this tile and wait for it to actually run on it. */
+    if (!_nn_run_on_buffer(_frame_test_buf, 3000U))
+    {
+      CMD_PRINTF(stream, "tile %s: no inference on tile %lu within 3s "
+                         "— is the camera pipeline running?%s",
+                 label, (unsigned long)i, lwshell_eol());
+      return LWSHELL_OK;
+    }
+
+    t_nn_box buf[NN_BOXES_MAX_NUM];
+    uint32_t got = nn_get_detections(buf, NN_BOXES_MAX_NUM);
+    tile_sweep_collect(i, buf, got);
+  }
+
+  uint32_t kept = tile_sweep_finish();
   uint32_t elapsed = HAL_GetTick() - t0;
 
-  uint32_t kept = 0U;
-  for (uint32_t i = 0U; i < n_acc; i++) if (_tile_dets[i].keep) kept++;
+  uint32_t n_raw = 0U, n_acc = 0U;
+  tile_sweep_stats(&n_raw, &n_acc);
 
   CMD_PRINTF(stream,
     "tile %s: %lu tiles (%ux%u) crop %u over %ux%u, %lu raw -> %lu over-thresh -> %lu after NMS, %lu ms%s",
-    label, (unsigned long)n_infer, (unsigned)_tile_cols, (unsigned)_tile_rows,
+    label, (unsigned long)n_tiles, (unsigned)cols, (unsigned)rows,
     (unsigned)crop, (unsigned)fw, (unsigned)fh,
     (unsigned long)n_raw, (unsigned long)n_acc, (unsigned long)kept,
     (unsigned long)elapsed, lwshell_eol());
-  if (n_acc >= TILE_MAX_DETS)
+  if (tile_sweep_saturated())
   {
     CMD_PRINTF(stream, "  (warning: accumulation capped at %u; some tiles truncated)%s",
                (unsigned)TILE_MAX_DETS, lwshell_eol());
   }
+
+  uint32_t n_dets = 0U;
+  const t_tile_det *dets = tile_sweep_dets(&n_dets);
   uint32_t shown = 0U;
-  for (uint32_t i = 0U; i < n_acc; i++)
+  for (uint32_t i = 0U; i < n_dets; i++)
   {
-    if (!_tile_dets[i].keep) continue;
-    _tile_det_t *d = &_tile_dets[i];
+    if (!dets[i].keep) continue;
     CMD_PRINTF(stream,
       "  [%lu] %s(%ld) conf=%.2f bbox=(%.3f,%.3f,%.3f,%.3f)%s",
-      (unsigned long)shown, _tile_class_name(d->cls), (long)d->cls, d->conf,
-      d->x1, d->y1, d->x2, d->y2, lwshell_eol());
+      (unsigned long)shown, _tile_class_name(dets[i].cls), (long)dets[i].cls,
+      dets[i].conf, dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2, lwshell_eol());
     if (++shown >= 32U) { CMD_PRINTF(stream, "  ... (%lu more)%s",
         (unsigned long)(kept - shown), lwshell_eol()); break; }
   }
@@ -2287,12 +2129,13 @@ static int32_t _tile_run(const t_stream *stream)
   return _tile_run_source(stream, _fwupd_model_buf, _tile_fw, _tile_fh, "run");
 }
 
-/* `tile live [n]` - bring tiling to the LIVE camera. The DCMIPP main pipe
- * already carries the full FOV at 800x600 (higher-res than the 256x256 NN
- * ancillary), so we snapshot it, expand RGB565->RGB888, and run the same
- * tiling engine on it. This recovers small/distant targets that the single
- * ancillary downscale loses, without touching the DCMIPP crop / ATON path.
- * `n` back-to-back sweeps (default 1). */
+/* `tile live [n]` - bring tiling to the LIVE camera, one sweep per command.
+ * The DCMIPP main pipe carries the full FOV at a higher resolution than the
+ * 256x256 NN ancillary, so tiling it recovers small/distant targets that the
+ * single downscale loses, without touching the DCMIPP crop / ATON path.
+ *
+ * This is the one-shot version. `detect mode tile` is the same sweep running
+ * continuously on the main path, with its result driving notifications. */
 static int32_t _tile_live(const t_stream *stream, uint32_t sweeps)
 {
   if (!nn_task_detect_get())
@@ -2300,36 +2143,19 @@ static int32_t _tile_live(const t_stream *stream, uint32_t sweeps)
     CMD_PRINTF(stream, "tile live: NN stopped - run 'detect start' first%s", lwshell_eol());
     return LWSHELL_OK;
   }
-  const uint16_t mw = (uint16_t)CAMERA_MAIN_WIDTH;
-  const uint16_t mh = (uint16_t)CAMERA_MAIN_HEIGHT;
-  uint8_t *rgb = _fwupd_model_buf;    /* RGB888 snapshot dest (mw*mh*3 bytes)   */
 
-  for (uint32_t s = 0U; s < sweeps; s++)
+  for (uint32_t s_i = 0U; s_i < sweeps; s_i++)
   {
-    uint8_t *src = camera_get_buffer(DCMIPP_PIPE1);   /* live main RGB565       */
-    if (src == NULL)
+    uint16_t fw = 0U, fh = 0U;
+    uint8_t *rgb = tile_capture_live(&fw, &fh);
+    if (rgb == NULL)
     {
       CMD_PRINTF(stream, "tile live: no camera buffer (camera not streaming?)%s", lwshell_eol());
       return LWSHELL_OK;
     }
-    /* Snapshot + expand RGB565 -> RGB888 so the unchanged resize/NN path sees
-     * the same layout as an uploaded frame. Invalidate first: the pipe is
-     * DMA'd into PSRAM by the camera behind the D-cache. */
-    SCB_InvalidateDCache_by_Addr((uint32_t*)src, (int32_t)((uint32_t)mw * mh * 2U));
-    for (uint32_t p = 0U; p < (uint32_t)mw * mh; p++)
-    {
-      uint16_t px = (uint16_t)src[p * 2U] | ((uint16_t)src[p * 2U + 1U] << 8);
-      uint8_t r5 = (uint8_t)((px >> 11) & 0x1FU);
-      uint8_t g6 = (uint8_t)((px >> 5)  & 0x3FU);
-      uint8_t b5 = (uint8_t)( px        & 0x1FU);
-      rgb[p * 3U + 0U] = (uint8_t)((r5 << 3) | (r5 >> 2));
-      rgb[p * 3U + 1U] = (uint8_t)((g6 << 2) | (g6 >> 4));
-      rgb[p * 3U + 2U] = (uint8_t)((b5 << 3) | (b5 >> 2));
-    }
-    _tile_run_source(stream, rgb, mw, mh, "live");
+    _tile_run_source(stream, rgb, fw, fh, "live");
   }
-  _tile_loaded = false;             /* the live snapshot clobbered upload scratch */
-  nn_task_set_test_frame(NULL);     /* hand the NN back to the live camera        */
+  nn_task_set_test_frame(NULL);     /* hand the NN back to the live camera   */
   return LWSHELL_OK;
 }
 
@@ -2350,11 +2176,9 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                  (unsigned)TILE_MAX_AXIS, lwshell_eol());
       return LWSHELL_OK;
     }
-    _tile_cols = (uint16_t)c;
-    _tile_rows = (uint16_t)r;
+    tile_cfg_set_grid((uint16_t)c, (uint16_t)r);
     CMD_PRINTF(stream, "tile: grid %ux%u (%u tiles)%s",
-               (unsigned)_tile_cols, (unsigned)_tile_rows,
-               (unsigned)(_tile_cols * _tile_rows), lwshell_eol());
+               (unsigned)c, (unsigned)r, (unsigned)(c * r), lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2369,8 +2193,8 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                  (unsigned)TILE_NN_SIDE, lwshell_eol());
       return LWSHELL_OK;
     }
-    _tile_crop = (uint16_t)px;
-    CMD_PRINTF(stream, "tile: crop %u px%s", (unsigned)_tile_crop, lwshell_eol());
+    tile_cfg_set_crop((uint16_t)px);
+    CMD_PRINTF(stream, "tile: crop %u px%s", (unsigned)px, lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2402,16 +2226,17 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if (argc < 4U) return LWSHELL_ERROR_SYNTAX_CMD;
     long oh = atol((char*)argv[2]);
     long ov = atol((char*)argv[3]);
-    if (oh < 0 || ov < 0 || oh >= (long)_tile_crop || ov >= (long)_tile_crop)
+    uint16_t cur_crop = 0U;
+    tile_cfg_get(NULL, NULL, &cur_crop, NULL, NULL, NULL, NULL);
+    if (oh < 0 || ov < 0 || oh >= (long)cur_crop || ov >= (long)cur_crop)
     {
       CMD_PRINTF(stream, "tile overlap: 0..crop-1 (0 = auto)%s", lwshell_eol());
       return LWSHELL_OK;
     }
-    _tile_ovl_h = (uint16_t)oh;
-    _tile_ovl_v = (uint16_t)ov;
+    tile_cfg_set_overlap((uint16_t)oh, (uint16_t)ov);
     CMD_PRINTF(stream, "tile: overlap h=%u v=%u%s%s",
-               (unsigned)_tile_ovl_h, (unsigned)_tile_ovl_v,
-               (_tile_ovl_h == 0U && _tile_ovl_v == 0U) ? " (auto)" : "",
+               (unsigned)oh, (unsigned)ov,
+               (oh == 0 && ov == 0) ? " (auto)" : "",
                lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
@@ -2427,30 +2252,62 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       CMD_PRINTF(stream, "tile thresh: <conf%%> <iou%%>, each 0..100%s", lwshell_eol());
       return LWSHELL_OK;
     }
-    _tile_conf = (float)cp / 100.0f;
-    _tile_iou  = (float)ip / 100.0f;
-    CMD_PRINTF(stream, "tile: conf>=%.2f iou=%.2f%s", _tile_conf, _tile_iou, lwshell_eol());
+    tile_cfg_set_thresh((float)cp / 100.0f, (float)ip / 100.0f);
+    CMD_PRINTF(stream, "tile: conf>=%.2f iou=%.2f%s",
+               (float)cp / 100.0f, (float)ip / 100.0f, lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* The two corrections that make tiling safe to count with. Switches rather
+   * than constants because both were settled by measurement, and the next
+   * person to question them should be able to re-measure in one command. */
+  if ((strcmp(sub, "fullpass") == 0) || (strcmp(sub, "edgedrop") == 0))
+  {
+    if (argc < 3U) return LWSHELL_ERROR_SYNTAX_CMD;
+    bool on;
+    if      (strcmp((char*)argv[2], "on")  == 0) { on = true;  }
+    else if (strcmp((char*)argv[2], "off") == 0) { on = false; }
+    else
+    {
+      CMD_PRINTF(stream, "tile %s: on|off%s", sub, lwshell_eol());
+      return LWSHELL_OK;
+    }
+    if (sub[0] == 'f') { tile_cfg_set_fullpass(on); }
+    else               { tile_cfg_set_edgedrop(on); }
+    CMD_PRINTF(stream, "tile: %s %s%s", sub, on ? "on" : "off", lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
 
   if (strcmp(sub, "query") == 0)
   {
+    uint16_t cols = 0U, rows = 0U, crop = 0U, ovh = 0U, ovv = 0U;
+    float conf = 0.0f, iou = 0.0f;
+    tile_cfg_get(&cols, &rows, &crop, &ovh, &ovv, &conf, &iou);
+
     uint16_t xs[TILE_MAX_AXIS], ys[TILE_MAX_AXIS], sx = 0U, sy = 0U;
-    _tile_axis_origins(_tile_cols, _tile_fw, _tile_crop, _tile_ovl_h, xs, &sx);
-    _tile_axis_origins(_tile_rows, _tile_fh, _tile_crop, _tile_ovl_v, ys, &sy);
-    uint16_t eff_oh = (_tile_crop > sx) ? (uint16_t)(_tile_crop - sx) : 0U;
-    uint16_t eff_ov = (_tile_crop > sy) ? (uint16_t)(_tile_crop - sy) : 0U;
+    tile_axis_origins(cols, _tile_fw, crop, ovh, xs, &sx);
+    tile_axis_origins(rows, _tile_fh, crop, ovv, ys, &sy);
+    uint16_t eff_oh = (crop > sx) ? (uint16_t)(crop - sx) : 0U;
+    uint16_t eff_ov = (crop > sy) ? (uint16_t)(crop - sy) : 0U;
     CMD_PRINTF(stream, "tile: frame %ux%u grid %ux%u crop %u -> NN %u%s",
-               (unsigned)_tile_fw, (unsigned)_tile_fh, (unsigned)_tile_cols,
-               (unsigned)_tile_rows, (unsigned)_tile_crop, (unsigned)TILE_NN_SIDE, lwshell_eol());
+               (unsigned)_tile_fw, (unsigned)_tile_fh, (unsigned)cols,
+               (unsigned)rows, (unsigned)crop, (unsigned)TILE_NN_SIDE, lwshell_eol());
     CMD_PRINTF(stream, "  stride h=%u v=%u  overlap h=%u v=%u  conf>=%.2f iou=%.2f  %s%s",
                (unsigned)sx, (unsigned)sy, (unsigned)eff_oh, (unsigned)eff_ov,
-               _tile_conf, _tile_iou, _tile_loaded ? "frame LOADED" : "frame EMPTY",
+               conf, iou, _tile_loaded ? "frame LOADED" : "frame EMPTY",
                lwshell_eol());
-    for (uint16_t r = 0U; r < _tile_rows; r++)
+    CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  -> %lu inferences a sweep%s",
+               tile_cfg_get_fullpass() ? "on" : "off",
+               tile_cfg_get_edgedrop() ? "on" : "off",
+               (unsigned long)tile_cfg_count(), lwshell_eol());
+    CMD_PRINTF(stream, "  main path: %s%s",
+               nn_task_tile_get() ? "TILE (detect mode tile)"
+                                  : "default (whole frame)", lwshell_eol());
+    for (uint16_t r = 0U; r < rows; r++)
     {
-      for (uint16_t c = 0U; c < _tile_cols; c++)
+      for (uint16_t c = 0U; c < cols; c++)
       {
         CMD_PRINTF(stream, "  tile[%u,%u] @ (%u,%u)%s",
                    (unsigned)c, (unsigned)r, (unsigned)xs[c], (unsigned)ys[r], lwshell_eol());
@@ -2544,17 +2401,18 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
 
   if (strcmp(sub, "default") == 0)
   {
-    _tile_cols  = TILE_DEF_COLS;  _tile_rows  = TILE_DEF_ROWS;
-    _tile_crop  = TILE_DEF_CROP;
-    _tile_ovl_h = TILE_DEF_OVL_H; _tile_ovl_v = TILE_DEF_OVL_V;
-    _tile_fw    = TILE_DEF_FW;    _tile_fh    = TILE_DEF_FH;
-    _tile_conf  = TILE_DEF_CONF;  _tile_iou   = TILE_DEF_IOU;
+    tile_cfg_default();
+    _tile_fw    = 2592U;
+    _tile_fh    = 1944U;
     _tile_loaded = false;
     nn_task_set_test_frame(NULL);   /* also drop any stale NN override           */
+    uint16_t cols = 0U, rows = 0U, crop = 0U;
+    float conf = 0.0f, iou = 0.0f;
+    tile_cfg_get(&cols, &rows, &crop, NULL, NULL, &conf, &iou);
     CMD_PRINTF(stream,
       "tile: restored defaults (grid %ux%u crop %u frame %ux%u overlap auto conf>=%.2f iou=%.2f)%s",
-      (unsigned)_tile_cols, (unsigned)_tile_rows, (unsigned)_tile_crop,
-      (unsigned)_tile_fw, (unsigned)_tile_fh, _tile_conf, _tile_iou, lwshell_eol());
+      (unsigned)cols, (unsigned)rows, (unsigned)crop,
+      (unsigned)_tile_fw, (unsigned)_tile_fh, conf, iou, lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2815,6 +2673,70 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
+  /* ScopusQA #22: which detector runs on the MAIN path.
+   *
+   * `default` is one inference per camera frame on the whole field of view
+   * downscaled to 256x256 — fast, and blind to anything much smaller than
+   * half the frame. `tile` sweeps a 4x3 grid of the live main pipe and merges
+   * across tiles, which costs ~1.1 s a detection and finds what the downscale
+   * loses. Persisted, and reachable over the remote command channel like any
+   * other shell command. */
+  if (strcmp(sub, "mode") == 0)
+  {
+    if (argc < 3U)
+    {
+      return LWSHELL_ERROR_SYNTAX_CMD;
+    }
+    const char *m = (const char*)argv[2];
+
+    if (strcmp(m, "query") == 0)
+    {
+      uint32_t sweeps = 0U, last_ms = 0U, tiles = 0U;
+      nn_task_tile_stats(&sweeps, &last_ms, &tiles);
+      CMD_PRINTF(stream, "detect mode: %s%s",
+                 nn_task_tile_get() ? "tile" : "default", lwshell_eol());
+      if (nn_task_tile_get())
+      {
+        uint16_t cols = 0U, rows = 0U, crop = 0U;
+        tile_cfg_get(&cols, &rows, &crop, NULL, NULL, NULL, NULL);
+        CMD_PRINTF(stream, "  grid %ux%u crop %u, %lu sweep(s), last %lu ms%s",
+                   (unsigned)cols, (unsigned)rows, (unsigned)crop,
+                   (unsigned long)sweeps, (unsigned long)last_ms, lwshell_eol());
+      }
+      _cmd_ack(stream, argv, argc);
+      return LWSHELL_OK;
+    }
+
+    bool want_tile;
+    if      (strcmp(m, "tile")    == 0) { want_tile = true;  }
+    else if (strcmp(m, "default") == 0) { want_tile = false; }
+    else
+    {
+      CMD_PRINTF(stream, "detect mode: use 'default', 'tile' or 'query'%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+
+    nn_task_tile_set(want_tile);
+    t_registry_data *reg = registry_acquire();
+    if (reg) { reg->detect_tile_mode = want_tile ? 1U : 0U;
+               registry_release(); registry_request_save(); }
+
+    if (want_tile)
+    {
+      uint16_t cols = 0U, rows = 0U, crop = 0U;
+      tile_cfg_get(&cols, &rows, &crop, NULL, NULL, NULL, NULL);
+      CMD_PRINTF(stream, "detect mode: tile (%ux%u grid, crop %u, ~%lu inferences a detection)%s",
+                 (unsigned)cols, (unsigned)rows, (unsigned)crop,
+                 (unsigned long)tile_cfg_count(), lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "detect mode: default (whole frame, one inference)%s", lwshell_eol());
+    }
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
   if (strcmp(sub, "simulate") == 0)
   {
     /* default to 1 box if no count given.
@@ -2884,8 +2806,24 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
         registry_request_save();
       }
     }
-    CMD_PRINTF(stream, "detect debounce: %lu ms%s",
-               (unsigned long)nn_task_debounce_get(), lwshell_eol());
+    /* Report the EFFECTIVE window, not just the stored one. Tile mode floors
+     * it at two sweeps, because a window shorter than the sampling period
+     * debounces nothing — and a query that answered "1000 ms" while the
+     * firmware was using 2800 would be exactly the kind of silent mismatch
+     * this line exists to prevent. */
+    uint32_t cfg_ms = nn_task_debounce_get();
+    uint32_t eff_ms = nn_task_debounce_effective();
+    if (eff_ms != cfg_ms)
+    {
+      CMD_PRINTF(stream, "detect debounce: %lu ms (effective %lu ms — "
+                         "floored at 2 tile sweeps)%s",
+                 (unsigned long)cfg_ms, (unsigned long)eff_ms, lwshell_eol());
+    }
+    else
+    {
+      CMD_PRINTF(stream, "detect debounce: %lu ms%s",
+                 (unsigned long)cfg_ms, lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }

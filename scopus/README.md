@@ -100,6 +100,40 @@ payload parameters and restore `` ` `` → `"`". The camera splits the body into
 Group H pins that contract and **asserts on the received datagram, never on the
 AT reply** — every failure mode it guards against answers `OK`.
 
+## Tiled detection (ScopusQA #22)
+
+`detect mode tile` sweeps a 4x3 grid of 256 px crops over the live 800x600 main
+pipe, merges across tiles with NMS, and drives the counts, the overlay and the
+§4.2 notifications from the merged result. ~13 inferences, ~1.36 s a detection.
+`detect mode default` is one inference on the whole downscaled frame. The
+setting persists and is reachable over MQTT like any other shell command.
+
+```bash
+python3 scopus/cam.py "detect mode tile"      # or: default | query
+python3 scopus/cam.py "tile query"            # geometry + which path is live
+python3 scopus/tile_compare.py ~/qa-images    # score both paths on labelled images
+```
+
+The network is fixed at 256x256, so the crop is 256 — a different NN side is a
+retrain and a model reflash, not a setting.
+
+Two corrections make tiling safe to count with, both on by default and both
+switchable so a claim can be re-measured (`tile fullpass on|off`,
+`tile edgedrop on|off`):
+
+| Switch | What it does |
+|---|---|
+| `fullpass` | run the whole frame as one extra step alongside the tiles, so tiling can only add |
+| `edgedrop` | drop a tile detection whose box runs into a tile edge that is not a frame edge — it is a fragment, and the object is seen whole by a neighbour or by the whole-frame pass |
+
+Without `edgedrop`, an object larger than a tile is counted once per tile it
+touches: `5_people.jpeg` measured **19** people. See `STATUS.md` 2026-08-27 for
+the numbers and for why the default is still `default`.
+
+In tile mode the debounce is floored at two sweeps, because a window shorter
+than the sampling period debounces nothing. `detect debounce query` reports the
+effective value when it differs from the configured one.
+
 ## Manual end-to-end test
 
 Two documents, both generated, for two different readers:

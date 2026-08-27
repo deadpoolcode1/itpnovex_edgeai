@@ -33,6 +33,7 @@
  ******************************************************************************  
  */
 #include "nn_task.h"
+#include "tile_detect.h"
 
 #if ENABLE_NN == 1U
 #include "camera_task.h"
@@ -216,6 +217,50 @@ uint32_t nn_task_resume_thread(void)
 
 /* Runtime detection gate (SoW §3.1 detect start/stop). Default is OFF —
  * the SoW says detection must be explicitly started. */
+/* ── Main-path tiled detection (ScopusQA #22) ──────────────────────────────
+ *
+ * Off, the NN eats one 256x256 ancillary frame per camera event: the whole
+ * field of view squeezed into 256 px, which is why a car at a third of the
+ * frame vanishes (ScopusQA #17 — measured cliff between 50 % and 35 %).
+ *
+ * On, each camera event carries ONE TILE of a sweep: snapshot the main pipe at
+ * the top of the sweep, crop tile i, infer, accumulate. After the last tile,
+ * cross-tile NMS produces the merged detection set and that — not any single
+ * tile — is what enters the debounce and the §4.2 action path. A sweep is
+ * therefore ~12 inferences, about 1.1 s, which is the rate this was specified
+ * at ("run the camera slowly, ~1 FPS").
+ *
+ * Two invariants matter and both cost a little code below:
+ *
+ *   - Nothing partial is ever published. `_pp_box_buff` keeps showing the last
+ *     COMPLETED sweep for the whole of the next one, so the live overlay and
+ *     `nn_get_detections` never see one tile's boxes in full-frame coordinates.
+ *   - The count that drives notifications is the untruncated survivor count,
+ *     while `_pp_box_count` stays clamped to NN_BOXES_MAX_NUM. A 12-tile sweep
+ *     can find more objects than the publish buffer holds, and a consumer
+ *     reading `_pp_box_count` entries out of a 20-entry array is the overflow
+ *     the `detect simulate` clamp exists to prevent.
+ *
+ * An injected test frame still wins: `frame run` and the injection suites need
+ * the single-frame path, so tiling stands down while an override is armed.
+ */
+static volatile bool    _nn_tile_mode      = false;
+static uint32_t         _nn_tile_idx       = 0U;   /* next tile in the sweep */
+static uint32_t         _nn_tile_n         = 0U;   /* tiles in this sweep    */
+static uint32_t         _nn_tile_sweeps    = 0U;   /* completed sweeps       */
+static uint32_t         _nn_tile_ms        = 0U;   /* last sweep, ms         */
+static uint32_t         _nn_tile_t0        = 0U;
+static bool             _nn_tile_starved   = false;/* camera gave no buffer  */
+
+/* Last COMPLETED sweep, kept so the publish buffer never shows a part sweep. */
+static t_nn_box         _nn_tile_pub[NN_BOXES_MAX_NUM];
+static uint32_t         _nn_tile_pub_n     = 0U;
+
+/* Per-tile NN input. Its own buffer: the shell's `_frame_test_buf` belongs to
+ * the injection path, which must stay usable while this is running. */
+static __ALIGN_BEGIN uint8_t
+  _nn_tile_in[CAMERA_ANCILLARY_BUFFER_SIZE] __ALIGN_END IN_PSRAM;
+
 static volatile bool    _nn_detect_enabled = false;
 static volatile uint8_t _nn_action_mask    = 0U;
 static volatile uint8_t _nn_det_mask       = 0x01U; /* default people */
@@ -336,9 +381,43 @@ static uint32_t          _nn_fall_peak     = 0U;
 
 /* ThreadX ticks for the configured window, rounded up so a sub-tick
  * setting still waits at least one tick. */
-static uint32_t _nn_debounce_ticks(void)
+/* How many sweeps a change must survive before tiling believes it.
+ *
+ * Two is the smallest number that means anything: one sweep is a single
+ * sample, and a window shorter than the sampling period debounces nothing. */
+#define NN_TILE_DEBOUNCE_SWEEPS   2U
+
+/* The debounce window actually in force, in ms.
+ *
+ * A tiled sweep samples the scene about once every 1.4 s, and the debounce
+ * default is 1000 ms — a window SHORTER than the gap between samples, which
+ * cannot debounce anything. Every sweep's count was therefore believed on
+ * sight, and a live scene drifting between 3 and 4 people raised an event per
+ * sweep. That is not cosmetic: the notification stream shares the console, so
+ * it swallowed `photo upload`'s reply and F1/F2 of the integration suite
+ * failed against a camera that was working perfectly.
+ *
+ * So in tile mode the floor is a couple of sweeps. An operator who asks for a
+ * longer window still gets it; what they cannot ask for is one shorter than
+ * the thing being measured. Public so `detect debounce query` can report it —
+ * answering "1000 ms" while the firmware used 2800 would be its own trap.
+ */
+uint32_t nn_task_debounce_effective(void)
 {
   uint32_t ms = _nn_debounce_ms;
+  if (ms == 0U) { return 0U; }
+
+  if (_nn_tile_mode && (_nn_tile_ms > 0U))
+  {
+    uint32_t floor_ms = _nn_tile_ms * NN_TILE_DEBOUNCE_SWEEPS;
+    if (ms < floor_ms) { ms = floor_ms; }
+  }
+  return ms;
+}
+
+static uint32_t _nn_debounce_ticks(void)
+{
+  uint32_t ms = nn_task_debounce_effective();
   if (ms == 0U) { return 0U; }
   uint32_t ticks = (ms * TX_TIMER_TICKS_PER_SECOND) / 1000U;
   return (ticks == 0U) ? 1U : ticks;
@@ -490,12 +569,47 @@ void nn_task_detect_set(bool enable)
   {
     _nn_count_reset(0U);
     _nn_prev_boxes = 0U;
+    _nn_tile_idx   = 0U;      /* a stop/start begins a fresh sweep */
+    _nn_tile_pub_n = 0U;
     _nn_people_now = _nn_vehicles_now = 0U;
     _nn_people_rep = _nn_vehicles_rep = 0U;
   }
   _nn_detect_enabled = enable;
 }
 bool nn_task_detect_get(void)          { return _nn_detect_enabled; }
+
+/* Switching modes abandons whatever sweep was in flight and clears the last
+ * published set: a half sweep's boxes are in the coordinates of a frame that
+ * is about to stop being how we look at the world, and carrying the old count
+ * across would raise a spurious edge on the first frame of the new mode. */
+void nn_task_tile_set(bool enable)
+{
+  if (enable == _nn_tile_mode)
+  {
+    return;
+  }
+  _nn_tile_mode    = enable;
+  _nn_tile_idx     = 0U;
+  _nn_tile_n       = 0U;
+  _nn_tile_pub_n   = 0U;
+  _nn_tile_starved = false;
+  if (enable)
+  {
+    /* The factory tile geometry describes a sensor-sized uploaded frame and
+     * degenerates on the 800x600 live pipe. Arm the one that belongs to it. */
+    tile_cfg_for_live();
+  }
+  LINFO(TRACE_NN, "detection mode: %s", enable ? "tile" : "default");
+}
+
+bool nn_task_tile_get(void)            { return _nn_tile_mode; }
+
+void nn_task_tile_stats(uint32_t *sweeps, uint32_t *last_ms, uint32_t *tiles)
+{
+  if (sweeps)  *sweeps  = _nn_tile_sweeps;
+  if (last_ms) *last_ms = _nn_tile_ms;
+  if (tiles)   *tiles   = _nn_tile_n;
+}
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 
 /* Changing which classes count changes what the filtered box count *means*,
@@ -806,13 +920,54 @@ static void _nn_task_run(uint32_t args)
         LWARNING(TRACE_NN, "test frame expired after %u s — NN back on the "
                            "live camera", (unsigned)NN_TEST_FRAME_TTL_S);
       }
-      _nn_frame = (override != NULL) ? override
-                                     : camera_get_buffer(camera.ancillary.id);
+      if (override != NULL)
+      {
+        _nn_frame = override;                 /* injection wins over tiling  */
+        /* Abandon any sweep in flight rather than resume it when the override
+         * clears. Its frame snapshot is however many seconds old the
+         * injection lasted, and half a sweep of a stale scene merged with
+         * half of a live one is a detection of neither. */
+        _nn_tile_idx = 0U;
+      }
+      else if (_nn_tile_mode)
+      {
+        /* One tile per camera event. The frame is snapshotted once, at the
+         * top of the sweep, so every tile describes the same instant rather
+         * than 12 successive views of a moving scene. */
+        if (_nn_tile_idx == 0U)
+        {
+          uint16_t fw = 0U, fh = 0U;
+          uint8_t *full = tile_capture_live(&fw, &fh);
+          if (full == NULL)
+          {
+            /* Camera not streaming. Say it once per outage, not per frame. */
+            if (!_nn_tile_starved)
+            {
+              _nn_tile_starved = true;
+              LWARNING(TRACE_NN, "tile mode: no camera buffer — is the camera "
+                                 "streaming? (detection paused)");
+            }
+            continue;
+          }
+          _nn_tile_starved = false;
+          _nn_tile_n  = tile_sweep_begin(full, fw, fh);
+          _nn_tile_t0 = HAL_GetTick();
+        }
+        tile_sweep_crop(_nn_tile_idx, _nn_tile_in);
+        SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_nn_tile_in,
+                                          CAMERA_ANCILLARY_BUFFER_SIZE);
+        _nn_frame = _nn_tile_in;
+      }
+      else
+      {
+        _nn_frame = camera_get_buffer(camera.ancillary.id);
+      }
     }
     if (_nn_frame != NULL)
     {
       bool on_test_frame = (_nn_frame == _nn_test_frame_override) &&
                            (_nn_test_frame_override != NULL);
+      bool on_tile       = (_nn_frame == _nn_tile_in);
       stat_time_start(STAT_TIME_NN_TOTAL);
       _nn_frame_process();
       stat_time_stop(STAT_TIME_NN_TOTAL);
@@ -821,9 +976,91 @@ static void _nn_task_run(uint32_t args)
         _nn_test_frame_seq++;
       }
 
+      /* ── Tiled sweep: fold this tile in, and only act on a whole one ──── */
+      uint32_t tile_total = 0U;
+      if (on_tile)
+      {
+        /* Take this tile's raw boxes, then immediately put the publish buffer
+         * back to the last completed sweep. Consumers run on their own clocks
+         * and must never catch one tile's boxes being read as full-frame
+         * coordinates — that is a box in the wrong place on the overlay and,
+         * worse, a count that never happened. */
+        t_nn_box raw[NN_BOXES_MAX_NUM];
+        uint32_t n_raw;
+
+        rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
+        n_raw = (uint32_t)_pp_box_count;
+        if (n_raw > (uint32_t)NN_BOXES_MAX_NUM) n_raw = (uint32_t)NN_BOXES_MAX_NUM;
+        memcpy(raw, _pp_box_buff, (size_t)n_raw * sizeof(t_nn_box));
+        memcpy(_pp_box_buff, _nn_tile_pub,
+               (size_t)_nn_tile_pub_n * sizeof(t_nn_box));
+        _pp_box_count = (size_t)_nn_tile_pub_n;
+        rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
+
+        tile_sweep_collect(_nn_tile_idx, raw, n_raw);
+
+        _nn_tile_idx++;
+        if (_nn_tile_idx < _nn_tile_n)
+        {
+          continue;               /* sweep still in progress — nothing to act on */
+        }
+        _nn_tile_idx = 0U;
+
+        /* Sweep closed. Cross-tile NMS, then the same class split the
+         * single-frame path does — but over the merged survivors. */
+        (void)tile_sweep_finish();
+        uint32_t n_dets = 0U;
+        const t_tile_det *dets = tile_sweep_dets(&n_dets);
+
+        uint32_t people = 0U, vehicles = 0U, pub = 0U;
+        for (uint32_t i = 0U; i < n_dets; i++)
+        {
+          if (!dets[i].keep) continue;
+          if (!_class_passes_mask(dets[i].cls, _nn_det_mask)) continue;
+
+          if (dets[i].cls == 0)                    { people++; }
+          else if (_class_is_vehicle(dets[i].cls)) { vehicles++; }
+
+          /* Publish what fits, in the centre+size form every consumer of
+           * _pp_box_buff already speaks. The COUNT below is the untruncated
+           * one; this buffer is the overlay's view, and it stays inside its
+           * own bounds. */
+          if (pub < (uint32_t)NN_BOXES_MAX_NUM)
+          {
+            t_nn_box *b = &_nn_tile_pub[pub++];
+            b->x_center    = (dets[i].x1 + dets[i].x2) * 0.5f;
+            b->y_center    = (dets[i].y1 + dets[i].y2) * 0.5f;
+            b->width       =  dets[i].x2 - dets[i].x1;
+            b->height      =  dets[i].y2 - dets[i].y1;
+            b->conf        =  dets[i].conf;
+            b->class_index =  dets[i].cls;
+          }
+        }
+        _nn_tile_pub_n = pub;
+        tile_total     = people + vehicles;
+
+        rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
+        memcpy(_pp_box_buff, _nn_tile_pub, (size_t)pub * sizeof(t_nn_box));
+        _pp_box_count    = (size_t)pub;
+        _nn_people_now   = people;
+        _nn_vehicles_now = vehicles;
+        rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
+
+        _nn_tile_ms = HAL_GetTick() - _nn_tile_t0;
+        _nn_tile_sweeps++;
+
+        if (tile_sweep_saturated())
+        {
+          LWARNING(TRACE_NN, "tile sweep hit the %u-detection cap — counts are "
+                             "a floor, not a total", (unsigned)TILE_MAX_DETS);
+        }
+      }
+
       /* SoW §4.2 W5/W6: filter detections by class against det_msk.
        * Holds the box-buffer mutex briefly so consumers see a consistent
        * (filtered) view. */
+      if (!on_tile)
+      {
       rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
       size_t kept = 0U;
       uint32_t people = 0U, vehicles = 0U;
@@ -850,11 +1087,14 @@ static void _nn_task_run(uint32_t args)
       _nn_people_now   = people;
       _nn_vehicles_now = vehicles;
       rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
+      }
 
       /* SoW W12 / W11: on a 0->N box-count edge, fire side effects
        * per the action_msk profile. Edge-only so we don't spam SD
        * with one JPEG per frame at 22 Hz. */
-      uint32_t cur_boxes = (uint32_t)_pp_box_count;
+      /* In tile mode this is the untruncated survivor count, not the size of
+       * the publish buffer — a sweep can find more than NN_BOXES_MAX_NUM. */
+      uint32_t cur_boxes = on_tile ? tile_total : (uint32_t)_pp_box_count;
 
       /* Hysteresis: quick to believe a rise, slow to believe a fall. See
        * the _nn_debounce block above for why the symmetric version of this

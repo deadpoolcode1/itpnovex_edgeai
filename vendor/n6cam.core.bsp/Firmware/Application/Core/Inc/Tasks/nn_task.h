@@ -172,6 +172,42 @@ void nn_task_upload_stats(uint32_t *skipped, uint32_t *busy);
 void nn_task_det_set(uint8_t mask);
 
 /**
+ * @brief Turn main-path tiled detection on or off (ScopusQA #22).
+ *
+ *        Off (the historical behaviour): one inference per camera frame on the
+ *        256x256 ancillary, which is the whole field of view downscaled. An
+ *        object smaller than roughly half the frame is below the detection
+ *        cliff measured in ScopusQA #17.
+ *
+ *        On: each camera frame carries one tile of a 4x3 sweep over the live
+ *        main pipe, and the merged, NMS-ed result of the whole sweep is what
+ *        drives the counts, the overlay and the §4.2 notifications. ~12
+ *        inferences per detection, about 1.1 s — the rate this was asked for.
+ *
+ *        Switching modes abandons any sweep in flight and clears the published
+ *        set, so the first result after a switch is a fresh one and the change
+ *        cannot fabricate an edge.
+ *
+ *        An armed test frame suspends tiling for as long as it is armed:
+ *        `frame run` and the injection suites need the single-frame path.
+ */
+void nn_task_tile_set(bool enable);
+
+/** @brief The debounce window actually in force, in ms. Tile mode floors it at
+ *         two sweeps, because a window shorter than the sampling period
+ *         debounces nothing. */
+uint32_t nn_task_debounce_effective(void);
+
+/** @brief Is main-path tiling on? */
+bool nn_task_tile_get(void);
+
+/**
+ * @brief Sweep counters: how many sweeps have completed, how long the last one
+ *        took in ms, and how many tiles it was. Any pointer may be NULL.
+ */
+void nn_task_tile_stats(uint32_t *sweeps, uint32_t *last_ms, uint32_t *tiles);
+
+/**
  * @brief Read back the SoW §4.2 'det_msk' set by nn_task_det_set().
  *        The live-view overlay uses it to decide which counts to show:
  *        a vehicles-only profile has no business printing a people count

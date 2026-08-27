@@ -1,8 +1,173 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-26. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-27. Everything below was measured on the bench, not inferred.
 
 ---
+
+## 2026-08-27 — tiled detection on the main path (ScopusQA #22)
+
+`detect mode default|tile|query`. Tiling is built, persisted, reachable over
+the remote command channel, and **measured**. The measurements are the point of
+this entry: two of them changed the design and the third says the default
+should not be flipped yet.
+
+### What it is
+
+Off, the NN eats one 256x256 ancillary frame per camera event — the whole field
+of view in a single downscale, which is why ScopusQA #17's car disappears below
+about half the frame. On, each camera event carries **one tile of a sweep**:
+snapshot the live main pipe once, crop tile *i*, infer, accumulate; after the
+last tile, cross-tile NMS, and the merged result — not any single tile — drives
+the counts, the overlay and the §4.2 notifications.
+
+The geometry is #22's: **4 columns x 3 rows, 256 px crops** over the 800x600
+main pipe. 320x320 was asked about and is not available — the flashed network
+is fixed at 256x256 (`STAI_NETWORK_IN_1_WIDTH`), so a different side is a
+retrain and a model reflash, not a setting. Confirmed as fine to leave at 256.
+
+Measured sweep: **13 inferences, ~1.36 s**. That is the specified rate.
+
+The engine moved out of `shell_task.c` into `tile_detect.c`, because nn_task is
+the thread that *runs* inferences and cannot block waiting for itself. The
+module holds the state and the caller keeps the drive: `tile_sweep_begin` /
+`_crop` / `_collect` / `_finish` is a cursor the shell steps synchronously and
+the NN loop steps one tile per frame event. `tile run` and `tile live` are the
+same arithmetic on a different clock, not a second copy of it.
+
+Nothing partial is ever published: `_pp_box_buff` keeps showing the last
+COMPLETED sweep for the whole of the next one, so the overlay never shows one
+tile's boxes read as full-frame coordinates. And the count that drives
+notifications is the untruncated survivor count while `_pp_box_count` stays
+clamped to `NN_BOXES_MAX_NUM` — a 12-tile sweep can find more objects than the
+publish buffer holds, and a consumer reading past a 20-entry array is the
+overflow the `detect simulate` clamp already exists to prevent.
+
+### Tiles alone were much worse, and the image set said so immediately
+
+The ScopusQA set labels itself — `5_people.jpeg` has five people in it — so
+`scopus/tile_compare.py` scores both paths against the file names rather than
+against each other. First run, tiles only:
+
+| image | truth | default | tiles only |
+|---|---|---|---|
+| `5_people.jpeg` | 5p | **5p** | 19p |
+| `4_people.jpeg` | 4p | **4p** | 12p |
+| `3_people_01.jpeg` | 3p | **3p** | 11p |
+
+An object bigger than a tile is cut by the grid, and every tile holding a piece
+of it reports that piece as a whole object. Two half-people overlap only along
+the seam, so their IoU is small and cross-tile NMS — which is an IoU test —
+keeps both. "Tiling finds more" was not a result; it was a bug.
+
+Two corrections, both in `tile_detect.c` and both switchable so the next person
+can re-measure in one command (`tile fullpass on|off`, `tile edgedrop on|off`):
+
+- **Whole-frame pass.** The full frame runs as one extra step alongside the
+  tiles — the exact detector that used to be the main path — so tiling can only
+  add. One inference in thirteen.
+- **Fragment rejection.** A tile detection whose box runs into a tile edge that
+  is *not* a frame edge is dropped: it is a piece, and whatever it is a piece of
+  is seen whole by a neighbour (that is what the overlap is for) or by the
+  whole-frame pass. Boxes that stop at the FRAME edge are kept — nothing was
+  cut there.
+
+### Scored, after both corrections
+
+24 labelled images, absolute count error (the count *is* the product — `rsd` is
+what the customer's server acts on):
+
+| | total count error | exact |
+|---|---|---|
+| default | 28 | 10 / 24 |
+| tile | **25** | 6 / 24 |
+
+So: a wash. Tiling is clearly better at **people** on hard frames
+(`3_people_night` 7 -> 4 against a truth of 3, `3_people_02` 7 -> 5,
+`four_people_night` 5 -> 4, `five-people-…` 6 -> 5) and clearly worse at
+**vehicles** (`1_person_1_vehicle_02`, truth 1p 2v by eye: default 1p 2v,
+tile 1p 4v). Lower total error, fewer exact hits.
+
+That is not surprising and it is worth stating plainly: the QA set is close-up
+subjects, which is tiling's *worst* case — its premise is small and distant
+objects. It is the deployment scene, not this set, that should decide.
+
+### E2E found the third problem, which nothing else would have
+
+With tiling on, the integration suite went **55 PASS / 2 FAIL** — F1 and F2,
+photo capture and the SENDBIN transfer. `photo upload` typed by hand worked
+every time, in both modes, which is the shape of a timing fault rather than a
+broken feature.
+
+It was the debounce. A tiled sweep samples the scene about once every 1.4 s and
+the debounce default is **1000 ms** — a window *shorter than the gap between
+samples*, so it cannot debounce anything. Every sweep's count was believed on
+sight, a live scene drifting between three and four people raised an event per
+sweep, and the notification stream shares the console: the events swallowed
+`photo upload`'s reply. The camera was working perfectly the whole time.
+
+In tile mode the window is now floored at two sweeps, and `detect debounce
+query` reports the effective value when it differs from the configured one — a
+query answering "1000 ms" while the firmware used 2760 would be the next trap.
+
+Measured, same scene, same profile, eight `photo upload`s each:
+
+| mode | replies answered |
+|---|---|
+| default | 8/8 |
+| tile, before the floor | reply lost roughly 1 in 3 |
+| tile, after the floor | **8/8** |
+
+Worth keeping in mind for any future sampling change: a debounce expressed in
+milliseconds is only meaningful next to the sampling period, and tiling moved
+that period by a factor of thirty.
+
+### E2E, with tiling as the main path
+
+| Suite | Result |
+|---|---|
+| `preflight.py` | 12/12 PASS |
+| `run_integration_tests.py` | **66 — 65 PASS / 0 FAIL / 0 GAP / 1 SKIP** |
+| `run_scopus_tests.py` | **49 — 45 PASS / 0 FAIL / 4 SKIP** |
+
+Identical to the pre-tiling baseline, so the main path carries tiling with no
+regression. E3 raises a real `+SDVRNTF` from a tiled sweep, so the chain the
+product exists for — NN sees objects, event leaves the device — runs on the
+merged result end to end.
+
+### Where this leaves the default
+
+Shipped **on** (`detect_tile_mode` defaults to 1 in registry V7), as asked.
+What the evidence does and does not support:
+
+- The rate is fine: 1.36 s a detection, specified and confirmed as acceptable.
+- E2E is unaffected.
+- Accuracy on the QA image set is a wash — better on people, worse on vehicles.
+  That set is close-up subjects, which is tiling's worst case, so it is weak
+  evidence *against* and no evidence *for*.
+
+The measurement that would settle it does not exist yet: the same comparison on
+footage from a deployment-like scene, where objects are small and distant and
+tiling's premise actually applies. Until then `detect mode default` is one
+command away and persists, and `scopus/tile_compare.py <dir>` scores any image
+set in about seven minutes.
+
+### Two bench traps this cost a cycle each
+
+- **A flash that reports success can silently not take.** `n6cam-update.py`
+  said "Sent … erase+write+reboot" and the device kept running the old image.
+- **`until [ -e /dev/serial/by-id/…-if02 ]` is not a reboot check** — the link
+  is still there for a few seconds after the write starts, so the loop falls
+  through immediately and the next command answers from the *old* firmware. The
+  build-date string is not a reliable version marker either; it comes from
+  whichever translation unit was last recompiled. **Check `uptime` instead** —
+  it resets on reboot and cannot be faked:
+
+```bash
+python3 scopus/cam.py "uptime"      # before
+# … flash …
+sleep 45
+python3 scopus/cam.py "uptime"      # must be smaller, or the flash did not take
+```
 
 ## 2026-08-26 — the obsolete half of the harness is gone
 
