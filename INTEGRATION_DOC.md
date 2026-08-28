@@ -388,9 +388,7 @@ What it does:
 ├── M1_M2_WORKFLOW.md           — pipeline + self-update flow (v1.4.1)
 ├── MULTICLASS_STATUS.md        — model accuracy / stability journal
 ├── INTEGRATION_DOC.md          — this file (A6)
-├── STATUS_EMAIL_M1_M2.md       — client-ready acceptance email
 ├── Scopus_SoW_v3.pdf           — authoritative SoW
-├── Kamacode_N6Cam_Proposal_v4.docx — WBS + milestone plan
 │
 ├── docs/
 │   ├── diagrams/               — graphviz sources + rendered PNGs

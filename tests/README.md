@@ -117,7 +117,7 @@ Starting from Ultralytics' `yolov8n.pt` (full 80-class COCO), exported to ONNX a
 
 Three paths, in increasing effort:
 
-1. **Ask ST for a multi-class N6 variant** — `stm32-hotspot/ultralytics` ships only `coco-person-st.tflite` today, but ST internally has multi-class deployments (the Cube AI Developer Cloud examples reference them). One support email could be the shortest path. See `EMAIL_TO_SYLVAIN.md` for a draft.
+1. **Ask ST for a multi-class N6 variant** — `stm32-hotspot/ultralytics` ships only `coco-person-st.tflite` today, but ST internally has multi-class deployments (the Cube AI Developer Cloud examples reference them). One support email could be the shortest path.
 
 2. **QAT on a GPU** — fine-tune `yolov8n.pt` with quantisation-aware training, then export to INT8 ONNX, then `stedgeai`. Preserves 70–80% of the float mAP. Tooling: `ultralytics` + `pytorch-quantization`. Runs in ~10 min on a modern GPU. We have a Jetson Orin available at the office for this.
 

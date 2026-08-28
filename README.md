@@ -184,7 +184,7 @@ Only required when changing the FSBL itself, or when the Application is bricked 
    ```
 3. Set the boot switch back to **operation mode**, fully power-cycle again.
 
-Why two paths? STM32N6's Debug Authentication locks the SWD access ports while the FSBL is running in op mode, so SWD only works from dev-mode boot. The CDC self-updater is in-application — it writes xSPI flash from inside the running App, bypassing SWD entirely. See `memory/project_n6cam_debug_auth_locked.md` for the full story.
+Why two paths? STM32N6's Debug Authentication locks the SWD access ports while the FSBL is running in op mode, so SWD only works from dev-mode boot. The CDC self-updater is in-application — it writes xSPI flash from inside the running App, bypassing SWD entirely.
 
 ## 5. Test suite + HTML report
 
@@ -243,11 +243,9 @@ Everything upstream (grid size, crop size, overlap, confidence/IoU thresholds) i
 ## Reference
 
 - **`Scopus_SoW_v3.pdf`** — Scopus PoC system spec (this firmware implements §3.1, 3.4, 3.5, 3.7, 3.8, 4.1–4.5, partial §6).
-- **`Kamacode_N6Cam_Proposal_v4.docx`** — WBS-based cost proposal + milestone plan.
 - **`SIANA.N6Cam_Using the N6Cam Viewer_250306-1430.pdf`** — vendor viewer GUI (Windows build works; Linux build broken on Ubuntu 24.04 Wayland; use `ffmpeg | mpv` instead).
 - **`e2ip EdgeAI_Datasheet.pdf`** — hardware spec, pinout, sensor list.
 - **`vendor/n6cam.core.bsp/Documentation/SIANA.N6Cam.*_Schematics-RevB4-PVT.pdf`** — full kit schematics (camera, compute, IO).
-- **`memory/`** — long-form engineering notes on debug-auth lock, flash procedure, and the self-update internals.
 
 ## Source layout
 
