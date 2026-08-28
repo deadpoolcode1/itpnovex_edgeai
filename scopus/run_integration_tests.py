@@ -529,8 +529,16 @@ def g_d_tunnel(s, ctx):
     s.group("D — camera ↔ modem UART tunnel (§4.6)")
     cam = ctx["cam"]
 
-    # Let the notifier finish anything group C queued, so this group measures
-    # the shell's own traffic rather than two producers sharing the link.
+    # Draining the queue is not enough on its own: group C leaves the detector
+    # RUNNING, so the live loop keeps raising events off whatever the lens sees
+    # while D measures. In tile mode that is a sweep every ~1.4 s, and one
+    # notification landing inside the window below shows up as stray bytes D5
+    # then charges to the wire (measured 2026-08-28: run 1 failed D5 with
+    # stray+6, run 2 passed with stray+0, same firmware, same commands — the
+    # only difference was whether anyone was in front of the camera).
+    # Stop the producer first, then drain what it already queued. Group E turns
+    # detection back on for itself.
+    quiesce_detector(cam)
     drained = wait_for_notify_drain(cam)
 
     # Wake the link before measuring. The CN805 FXMA108 translator latches
@@ -670,6 +678,13 @@ def g_e_full_chain(s, ctx):
                      else "nothing arrived from the camera"))
     finally:
         watch.close()
+        # E is the last group that needs a live detector; leave it stopped so
+        # F onwards do not share the shell with it. In tile mode the loop wakes
+        # every ~1.4 s, and a notification printed between `photo upload` and
+        # its reply swallows the reply — F1 read back an empty string on
+        # 2026-08-28 for exactly that reason, on a camera that had captured and
+        # sent the photo. K drives its own detections with `detect simulate`.
+        quiesce_detector(cam)
 
 
 def g_f_photo_upload(s, ctx):
