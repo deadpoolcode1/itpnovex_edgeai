@@ -1,6 +1,92 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-27. Everything below was measured on the bench, not inferred.
+Last updated: 2026-08-30. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-08-30 — one port, both schemes (ScopusQA #19, reopened in practice)
+
+ITP asked for both options to be supported. What was actually on the bench was
+one option at a time, and the switch had been left in the wrong position: the
+receiver on 8991 spoke TLS only, `sdvr-http.service` was enabled alongside it
+and had been restarting **900 times** against `EADDRINUSE` — two servers, one
+port. A unit in plain-HTTP mode (which is where `AT+SDVRCERTDEL` leaves it) had
+nothing to talk to, and the journal filled with `ssl.SSLEOFError` from its
+probes.
+
+### The receiver decides per connection now
+
+`/opt/sdvr-server/server.py` peeks one byte before it consumes anything. A TLS
+ClientHello starts with the record type `0x16`; every HTTP request starts with
+an ASCII method letter. The connection is wrapped in TLS only when the client
+actually asked for TLS. The sniff runs on the per-connection thread, not in the
+accept loop, so a client that connects and says nothing cannot stall every other
+upload.
+
+`sdvr-http.service` and `sdvr-https.service` are now one-line shims that pull in
+the single `sdvr-receiver.service`, so `systemctl enable --now sdvr-http` from
+the older notes still does the right thing instead of starting a second server.
+
+Version-controlled copy, with the install and check recipes: `scopus/receiver/`.
+
+Measured on 8991, no server change between the two rows — only the unit's own
+`AT+SDVRCERTIMPORT` / `AT+SDVRCERTDEL`, over cellular from the carrier NAT
+address:
+
+```
+11:14:14  POST /notify  ntf_…001.json         101 B  scheme=http
+11:14:33  POST /upload  4194336_…111412.rdy   122049 B  scheme=http
+11:16:46  POST /notify  ntf_…002.json         101 B  scheme=https tls=TLSv1.2 client_cn="…sdvr-device-client"
+11:17:04  POST /upload  4194336_…111643.rdy   121097 B  scheme=https tls=TLSv1.2 client_cn="…sdvr-device-client"
+```
+
+Both `.rdy` files are complete JPEGs (FFD8…FFD9). The log line carries
+`scheme=` now, so which leg a transfer took is readable without a packet
+capture.
+
+### Modem 1.17.0 — a cert import now reaches the MQTT channel too
+
+Found by walking the whole chain rather than the upload leg alone. After an
+import, photos and notifications moved to https correctly and the command
+channel kept answering `+SDVRMQTT: ERROR 99` — *certificate verify failed* —
+for as long as anyone cared to watch.
+
+The cause is in `mqtt.c` and it was written down there: the certificate set is
+loaded once, into the TLS context, at `Mqtt_Init`. `upload_file.c` hands curl
+the three paths on every transfer, so the upload leg picks up an import
+immediately; the MQTT client had already built its context, and on a unit that
+booted with no certificates that context trusts nothing. An app restart fixed
+it, which is why it had never been noticed.
+
+Same shape as #19 itself: two legs reading the same three files at different
+moments.
+
+`Mqtt_CertsChanged()` is now called by `AT+SDVRCERTIMPORT` and
+`AT+SDVRCERTDEL`. It sets a flag; the worker rebuilds the whole `SSL_CTX` from
+what is on disk before its next connect, and drops a live session first. A whole
+new context rather than a reload into the old one, because a *delete* has to be
+honoured as well: OpenSSL 1.0's `load_verify_locations` only ever adds to the
+trust store and there is no call to un-set a client certificate, so a reused
+context would keep trusting a CA the operator just removed.
+
+Measured, no app restart anywhere in the sequence:
+
+| | `+SDVRMQTT?` |
+|---|---|
+| certs imported, before | `1,1,…` connected |
+| `AT+SDVRCERTDEL` | `1,0,…` session dropped |
+| `AT+SDVRCERTIMPORT` | `1,0` for ~40 s (the backoff), then `1,1` — reconnects 1 → 2 |
+
+Installed and marked good on the bench as **1.17.0**.
+
+### Two things to know about the bench state
+
+- The SD card is mounted and carries `ca.crt` / `client.crt` / `client.key`, so
+  `AT+SDVRCERTIMPORT` works as QA runs it. Import is the *only* way back to
+  https — nothing else sets `use_https` true — so unmounting the card makes
+  `AT+SDVRCERTDEL` a one-way door.
+- The unit is left with certificates imported: uploads, notifications and MQTT
+  all on TLS, which is what ITP asked for on #19.
 
 ---
 

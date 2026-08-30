@@ -1,0 +1,31 @@
+[Unit]
+# One receiver on :8991 that answers BOTH http:// and https:// (ScopusQA #19).
+# It replaces sdvr-http.service and sdvr-https.service, which were two services
+# fighting over the same port — whichever lost restarted forever (EADDRINUSE).
+# Those two names are kept as systemd aliases of this unit, so the old
+# `systemctl ... sdvr-http` / `sdvr-https` commands in the QA notes still work.
+Description=SDVR upload receiver (HTTP + HTTPS mutual-TLS on :8991)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Environment=SDVR_PORT=8991
+Environment=SDVR_UPLOAD_DIR=/home/user/sdvr-uploads
+# TLS half. Drop these four lines to run plain HTTP only; the http half needs
+# no configuration and is always on unless SDVR_ALLOW_PLAIN=0 is set.
+Environment=SDVR_TLS_CERT=/opt/sdvr-server/certs/server.crt
+Environment=SDVR_TLS_KEY=/opt/sdvr-server/certs/server.key
+Environment=SDVR_TLS_CA=/opt/sdvr-server/certs/ca.crt
+Environment=SDVR_TLS_CLIENT_REQUIRED=1
+ExecStart=/usr/bin/python3 /opt/sdvr-server/server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+

@@ -532,21 +532,31 @@ def g10_modem_sd(c: Ctx, s: Suite):
     # These three used to go red for it, which reads as "SD management is
     # broken" — the same misdiagnosis the FTDI cable produced in group 8.
     # AT+SDVRMOUNTSD answers +SDVRERR: 3 because there is nothing to mount.
-    if ssh and ssh.reachable():
-        _, devs, _ = ssh.run("ls /dev/mmcblk0 2>/dev/null | wc -l")
-        if devs.strip().splitlines()[0] == "0":
-            for tid, desc in tids:
-                s.skip(tid, desc,
-                       "no SD card in the MODEM's slot (/dev/mmcblk0 absent) — "
-                       "this is the modem's own card, separate from the N6's; "
-                       "insert one to exercise §3.2 SD management")
-            return
-
+    #
+    # The test for that used to be `ls /dev/mmcblk0`, and it was wrong: an
+    # unbound card is not an absent one. AT+SDVRUNMOUNTSD unbinds the card
+    # from the mmcblk driver on purpose (sd_manager.c, SD_Unmount
+    # releaseCard), and so does AT+SDVRCERTIMPORT whenever it found the card
+    # unmounted and put it back the way it was — the exact sequence a tester
+    # runs for the certificate import in ScopusQA #19. The node then does not
+    # exist while the card sits in the slot, and this whole group skipped
+    # itself on a bench that has one (seen 2026-08-30).
+    #
+    # So ask the modem to mount instead of guessing from the host. That is
+    # the operation under test, it re-binds a released card, and only a
+    # genuinely empty slot makes it fail.
     _, r = m.expect("AT+SDVRMOUNTSD", "OK", 8.0)
     mounted = False
     if ssh and ssh.reachable():
         _, mounts, _ = ssh.run("cat /proc/mounts | grep -c mmcblk || echo 0")
         mounted = mounts.strip().splitlines()[0] != "0"
+    if "OK" not in r and not mounted:
+        for tid, desc in tids:
+            s.skip(tid, desc,
+                   "no SD card in the MODEM's slot (AT+SDVRMOUNTSD failed) — "
+                   "this is the modem's own card, separate from the N6's; "
+                   "insert one to exercise §3.2 SD management")
+        return
     s.ok("T10.1", "AT+SDVRMOUNTSD mounts card (/proc/mounts) (§3.2)",
          "OK" in r and mounted, reason="not present in /proc/mounts", extra=_oneline(r))
     ok, r = m.expect("AT+SDVRLSALL", "OK", 5.0)

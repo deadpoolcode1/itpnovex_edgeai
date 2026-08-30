@@ -188,8 +188,13 @@ python3 scopus/at.py --point-cloud 213.8.185.180 --http-port 8991 \
 python3 scopus/at.py "AT+SDVRNET?"     # 1,1,1,1 = attached with a route
 
 # on the server: watch both legs land
-sudo journalctl -fu sdvr-https
+sudo journalctl -fu sdvr-receiver
 ```
+
+That receiver takes plain HTTP and HTTPS on the same port and picks the scheme
+per connection, so nothing on the server has to change when a certificate is
+imported or deleted on the unit — `scopus/receiver/` holds the copy under
+version control, with why it is built that way (ScopusQA #19).
 
 Two things bite here, both documented in `STATUS.md`: the notification host
 must be a dotted **IP** (that leg is a raw UDP socket and never resolves
@@ -243,10 +248,12 @@ mapping closes in **under 30 seconds**: probes sent back 30, 60, 120 and 240 s
 after a report never arrived, measured at both ends. That path can answer a
 report; it cannot start a conversation, which is what a command has to do.
 
-Two things bite here as well. The broker must own 5912, so ITP's
-`sdvr-https.service` is stopped on the bench (`systemctl start sdvr-https`
-restores it, but not while mosquitto holds the port) — photos are unaffected
-on 8991. And `AT+SDVR*` commands are answered by *our* atServer rather than
+Two things bite here as well. The broker owns 5912, so the upload receiver
+lives on 8991 and nothing else may be pointed at 5912. And a certificate change
+has to reach this leg as well as the transfers — `AT+SDVRCERTIMPORT` calls
+`Mqtt_CertsChanged()` for that; before app 1.17.0 the command channel kept
+answering `+SDVRMQTT: ERROR 99` after an import until the app was restarted.
+And `AT+SDVR*` commands are answered by *our* atServer rather than
 the module's AT parser, which is why `mqtt.c` owns a PTY handed to atServer;
 without it every `AT+SDVR*` sent remotely comes back a bare ERROR.
 

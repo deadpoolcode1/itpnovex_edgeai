@@ -1,0 +1,19 @@
+[Unit]
+# Compatibility shim — NOT a server.
+# HTTP and HTTPS are the same listener now: sdvr-receiver.service answers both
+# on :8991 and picks the scheme per connection (ScopusQA #19). This unit exists
+# only so the old "systemctl enable --now sdvr-http" in the QA notes still does
+# the right thing. It starts the real receiver and nothing else.
+# Before 2026-08-30 this name was a second python process that tried to bind
+# :8991 as well, lost the race, and restarted forever.
+Description=SDVR receiver (http compat alias -> sdvr-receiver.service)
+Requires=sdvr-receiver.service
+After=sdvr-receiver.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
