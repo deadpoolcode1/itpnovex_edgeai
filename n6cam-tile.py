@@ -77,6 +77,36 @@ class Port:
             sys.stdout.write(out)
         return out
 
+    def wait_for(self, tokens, timeout, echo=True):
+        """Read until one of `tokens` appears, or `timeout` seconds pass.
+
+        `drain` decides the device has finished talking from a gap in the
+        stream, which is only true when the device answers promptly. It does
+        not for the two steps that take real time: checksumming an uploaded
+        frame (2.4 s of silence for a 2592x1944 one) and running a sweep. Both
+        used to be read with a one-second quiet window, so a full-resolution
+        upload was declared failed while the device was still working on it and
+        answered `ok` into the next command's output (ScopusQA #17).
+        """
+        buf = ""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                d = os.read(self.fd, 65536)
+            except BlockingIOError:
+                d = b""
+            if d:
+                chunk = d.decode(errors="replace")
+                buf += chunk
+                if echo:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                if any(t in buf for t in tokens):
+                    return buf
+            else:
+                time.sleep(0.01)
+        return buf
+
     def close(self):
         os.close(self.fd)
 
@@ -127,32 +157,31 @@ def main():
         # 'Ready' prompt before streaming the framed payload.
         p.drain(0.3)
         p.write(b"tile upload\r\n")
-        ready = ""
-        t0 = time.time()
-        while "Ready" not in ready and time.time() - t0 < 3.0:
-            ready += p.drain(0.4)
-        sys.stdout.write(ready)
+        ready = p.wait_for(("Ready", "ERROR"), 10.0)
         if "Ready" not in ready:
             sys.exit("device did not enter upload mode")
         hdr = FRAME_MAGIC + len(payload).to_bytes(4, "little") + crc.to_bytes(4, "little")
+        t0 = time.time()
         p.write(hdr)
         p.write(payload)
-        up = p.drain(1.0, hard=15)
-        sys.stdout.write(up)
-        if "ok" not in up:
-            sys.exit("upload failed")
+        # The device answers only after checksumming the whole frame, which is
+        # about 0.16 s per megabyte on top of the write itself.
+        budget = 15.0 + len(payload) / 1e6 * 2.0
+        up = p.wait_for(("tile upload ok", "ERROR"), budget)
+        if "tile upload: ok" not in up:
+            sys.exit("upload failed after %.1fs" % (time.time() - t0))
+        print("(%.1f MB uploaded in %.1fs)" % (len(payload) / 1e6, time.time() - t0))
 
         # Run. The firmware is silent during compute (~100 ms/tile + resize)
         # then emits the whole report at once, so poll until we see the result
         # line ('run:') or the ack, with a generous hard cap.
-        budget = cols * rows * 0.20 + 5.0
+        # Measured: 13 tiles of 256 px over 800x600 take 2.6 s, 21 tiles of
+        # 576 px over 2592x1944 take 7.0 s. Half a second a tile covers both
+        # with room to spare.
+        budget = cols * rows * 0.5 + 10.0
         print(f"\n--- tile run (waiting up to {budget:.0f}s) ---")
         p.write(b"tile run\r\n")
-        out = ""
-        t0 = time.time()
-        while "tile run ok" not in out and time.time() - t0 < budget:
-            out += p.drain(0.5)
-        sys.stdout.write(out)
+        p.wait_for(("tile run ok",), budget)
     finally:
         p.close()
 

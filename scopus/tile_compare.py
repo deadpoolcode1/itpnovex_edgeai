@@ -155,6 +155,9 @@ def main():
     ap.add_argument("dir", nargs="?",
                     default=os.path.expanduser("~/qa-images"))
     ap.add_argument("--conf", type=int, default=45, help="confidence %%")
+    ap.add_argument("--crop", type=int, default=CROP,
+                    help="tile crop in px (default %d; 320 trades 1:1 tiles for "
+                         "more seam overlap, ScopusQA #24)" % CROP)
     ap.add_argument("--iou", type=int, default=40, help="NMS IoU %%")
     args = ap.parse_args()
 
@@ -176,7 +179,7 @@ def main():
         cam.send("detect start", "detect", 4.0)
         cam.send(f"tile frame {LIVE_W} {LIVE_H}", "tile", 4.0)
         cam.send(f"tile grid {GRID_C} {GRID_R}", "tile", 4.0)
-        cam.send(f"tile crop {CROP}", "tile", 4.0)
+        cam.send(f"tile crop {args.crop}", "tile", 4.0)
         cam.send(f"tile thresh {args.conf} {args.iou}", "tile", 4.0)
 
         print(f"{'image':38s} {'default':>18s}   {'tile':>18s}")
