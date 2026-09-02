@@ -83,6 +83,17 @@ static bool     _cfg_fullpass = true;
  * so those are kept, which is why this tests the two separately. */
 static bool     _cfg_edgedrop = true;
 
+/* What fraction of the confidence floor a detection has to hold to keep being
+ * believed. 0.75 of the 0.45 default is 0.34 — comfortably below the 0.45-0.50
+ * the flickering sixth person in 5_people.jpeg measured at, and comfortably
+ * above the noise that a 0.2 floor would let in. See tile_detect.h. */
+#define TILE_SUSTAIN_FRAC   0.75f
+
+/* Weak detections may never crowd real ones out of the accumulator: they exist
+ * only to slow the count's descent, and a sweep that dropped a real detection
+ * to make room for one would be worse off than before. */
+#define TILE_WEAK_LIMIT     ((TILE_MAX_DETS * 3U) / 4U)
+
 /* How close to a tile edge counts as touching it, as a fraction of the tile.
  * Generous on purpose: a detector rarely puts a fragment's box exactly on the
  * cut, and half a person 3 px short of the seam is still half a person. */
@@ -114,6 +125,9 @@ void tile_cfg_set_overlap(uint16_t h, uint16_t v)
   _cfg_ovl_h = h;
   _cfg_ovl_v = v;
 }
+
+float tile_cfg_conf(void)            { return _cfg_conf; }
+float tile_cfg_conf_sustain(void)    { return _cfg_conf * TILE_SUSTAIN_FRAC; }
 
 void tile_cfg_set_fullpass(bool on)  { _cfg_fullpass = on; }
 bool tile_cfg_get_fullpass(void)     { return _cfg_fullpass; }
@@ -152,6 +166,38 @@ void tile_cfg_for_live(void)
   _cfg_crop  = TILE_LIVE_CROP;
   _cfg_ovl_h = 0U;                  /* auto: even spread over 800x600        */
   _cfg_ovl_v = 0U;
+
+  /* And the thresholds and the two merge rules, which the main path does not
+   * get to inherit from whatever the last `tile` experiment left behind
+   * (ScopusQA #24).
+   *
+   * The confidence floor belongs in this list for the plainest reason of all:
+   * a `tile thresh 20 40` typed to look at what the network is thinking leaves
+   * the live detector counting everything down to 0.20, which is noise, and
+   * nothing about the running system says so.
+   *
+   * They were settled by measurement and they are not preferences: with
+   * edgedrop off, every person taller than a 256 px tile is cut by the grid
+   * and each piece counted, so 3_people_01.jpeg reads as 9-12 people and the
+   * number lands somewhere new on nearly every sweep — a notification each
+   * time, which is exactly what ITP reported against a picture that never
+   * moved. With fullpass off the opposite failure: every box on that image
+   * touches a seam, all of them are dropped, and the sweep reports nobody.
+   * Measured on the bench, 12 looks at one unchanging frame:
+   *
+   *     fullpass off edgedrop off   9..12 people, 9 changes
+   *     fullpass on  edgedrop off   9..11 people, 9 changes
+   *     fullpass off edgedrop on    0 people,     0 changes
+   *     fullpass on  edgedrop on    3 people,     1 excursion to 4
+   *
+   * The shell keeps both switches so the next person can re-measure that
+   * table, and turning one off still works while tiling is live — it now says
+   * what it is about to do. What it may not do is decide the product's
+   * behaviour by accident. */
+  _cfg_conf     = TILE_DEF_CONF;
+  _cfg_iou      = TILE_DEF_IOU;
+  _cfg_fullpass = true;
+  _cfg_edgedrop = true;
 }
 
 /* ── Sweep state ───────────────────────────────────────────────────────── */
@@ -281,29 +327,38 @@ static float _iou_of(const t_tile_det *a, const t_tile_det *b)
 }
 
 /* Greedy class-aware NMS over the first `n` accumulated entries. O(n^2) with
- * n <= TILE_MAX_DETS. */
+ * n <= TILE_MAX_DETS.
+ *
+ * Suppression runs over `sustain`, the wider set, and `keep` arrives carrying
+ * whether the box cleared the counting floor. Weak boxes can only ever be
+ * suppressed, never suppress: the survivor of an overlap is the more confident
+ * one, and a weak box is by definition the less confident of the pair. */
 static void _nms(uint32_t n, float iou_th)
 {
-  for (uint32_t i = 0U; i < n; i++) _sw_dets[i].keep = true;
-
   for (uint32_t i = 0U; i < n; i++)
   {
-    if (!_sw_dets[i].keep) continue;
+    if (!_sw_dets[i].sustain) continue;
     for (uint32_t j = i + 1U; j < n; j++)
     {
-      if (!_sw_dets[j].keep) continue;
+      if (!_sw_dets[j].sustain) continue;
       if (_sw_dets[j].cls != _sw_dets[i].cls) continue;
       if (_iou_of(&_sw_dets[i], &_sw_dets[j]) > iou_th)
       {
         /* keep the higher-confidence one */
         if (_sw_dets[j].conf > _sw_dets[i].conf)
         {
-          _sw_dets[i].keep = false;
+          _sw_dets[i].sustain = false;
           break;                 /* i is gone; stop comparing it             */
         }
-        _sw_dets[j].keep = false;
+        _sw_dets[j].sustain = false;
       }
     }
+  }
+
+  /* A detection is counted only if it survived AND cleared the full floor. */
+  for (uint32_t i = 0U; i < n; i++)
+  {
+    _sw_dets[i].keep = _sw_dets[i].keep && _sw_dets[i].sustain;
   }
 }
 
@@ -377,10 +432,18 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
 
   const bool is_tile = !(_sw_full && (idx >= _sw_tiles));
 
+  const float sustain_floor = tile_cfg_conf_sustain();
+
   for (uint32_t i = 0U; i < n; i++)
   {
     _sw_n_raw++;
-    if (boxes[i].conf < _cfg_conf) continue;
+    if (boxes[i].conf < sustain_floor) continue;
+
+    /* Below the full floor this is not a detection — it is only evidence that
+     * something the sweep already counted has not gone away. Admitted, marked,
+     * and never counted. */
+    const bool weak = (boxes[i].conf < _cfg_conf);
+    if (weak && (_sw_n_acc >= TILE_WEAK_LIMIT)) continue;
 
     /* Fragment rejection — see the note on _cfg_edgedrop. Only tiles; the
      * whole-frame pass has no cut edges, only frame edges. */
@@ -414,9 +477,10 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     d->y1   = (by - bh * 0.5f) * inv_fh;
     d->x2   = (bx + bw * 0.5f) * inv_fw;
     d->y2   = (by + bh * 0.5f) * inv_fh;
-    d->conf = boxes[i].conf;
-    d->cls  = boxes[i].class_index;
-    d->keep = true;
+    d->conf    = boxes[i].conf;
+    d->cls     = boxes[i].class_index;
+    d->keep    = !weak;
+    d->sustain = true;
   }
 }
 

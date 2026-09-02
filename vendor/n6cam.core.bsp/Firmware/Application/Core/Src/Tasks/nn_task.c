@@ -441,14 +441,25 @@ static void _nn_count_reset(uint32_t to)
   _nn_fall_since   = tx_time_get();
 }
 
-/* Feed one frame's raw count in; returns true when the believed count
- * changed, in which case _nn_stable_boxes is the new value.
+/* Feed one frame's counts in; returns true when the believed count changed,
+ * in which case _nn_stable_boxes is the new value.
+ *
+ * `raw` is what the frame COUNTED. `sustained` is that plus the detections
+ * that held the sustain floor without reaching the counting one — see
+ * tile_cfg_conf_sustain(). A rise is judged on `raw`, because nothing below
+ * the floor may ever raise a count; a fall is judged on `sustained`, because a
+ * detection hovering at the floor has not gone away, and treating it as gone
+ * is what made the count alternate on a scene that never moved (ScopusQA #24).
+ * The single-frame path has no sub-threshold set — its post-processor
+ * thresholds inside — and passes the same number twice, which is the old
+ * behaviour exactly.
  *
  * Called once per inference from the NN loop and nowhere else, so the state
  * above needs no lock. */
-static bool _nn_count_update(uint32_t raw)
+static bool _nn_count_update(uint32_t raw, uint32_t sustained)
 {
   uint32_t window = _nn_debounce_ticks();
+  if (sustained < raw) { sustained = raw; }
 
   /* 0 = no filtering: believe every frame, which is what the raw detector
    * looks like and is occasionally what you want to see. */
@@ -484,7 +495,7 @@ static bool _nn_count_update(uint32_t raw)
     }
     _nn_rise_hits++;
   }
-  else if (raw == _nn_stable_boxes)
+  else if (sustained >= _nn_stable_boxes)
   {
     /* The scene agrees with what we believe: abandon any fall in progress.
      *
@@ -520,14 +531,15 @@ static bool _nn_count_update(uint32_t raw)
     }
   }
 
-  if (raw >= _nn_stable_boxes)
+  if (sustained >= _nn_stable_boxes)
   {
     return false;
   }
 
-  /* raw < believed: a fall, believed only if it lasts. Remember the highest
-   * count seen while it lasts, so we fall to 3 rather than to the single
-   * worst frame's 1. */
+  /* Even what is still standing is short of the believed count: a fall,
+   * believed only if it lasts. Remember the highest count seen while it lasts,
+   * so we fall to 3 rather than to the single worst frame's 1 — and remember
+   * it from the COUNTED number, because that is what will be reported. */
   if (raw > _nn_fall_peak) { _nn_fall_peak = raw; }
 
   /* Signed compare, so the wait stays correct across tick wrap. */
@@ -586,6 +598,15 @@ void nn_task_tile_set(bool enable)
 {
   if (enable == _nn_tile_mode)
   {
+    /* Already in the mode being asked for — but `detect mode tile` is also the
+     * documented way to put the merge rules back after an experiment with
+     * `tile edgedrop off`, and that has to work from inside tile mode, which
+     * is where anyone experimenting already is (ScopusQA #24). Re-arm and
+     * leave the sweep in progress alone: nothing about the mode changed. */
+    if (enable)
+    {
+      tile_cfg_for_live();
+    }
     return;
   }
   _nn_tile_mode    = enable;
@@ -977,7 +998,8 @@ static void _nn_task_run(uint32_t args)
       }
 
       /* ── Tiled sweep: fold this tile in, and only act on a whole one ──── */
-      uint32_t tile_total = 0U;
+      uint32_t tile_total     = 0U;
+      uint32_t tile_sustained = 0U;
       if (on_tile)
       {
         /* Take this tile's raw boxes, then immediately put the publish buffer
@@ -1013,10 +1035,16 @@ static void _nn_task_run(uint32_t args)
         const t_tile_det *dets = tile_sweep_dets(&n_dets);
 
         uint32_t people = 0U, vehicles = 0U, pub = 0U;
+        uint32_t sustained = 0U;
         for (uint32_t i = 0U; i < n_dets; i++)
         {
-          if (!dets[i].keep) continue;
+          if (!dets[i].sustain) continue;
           if (!_class_passes_mask(dets[i].cls, _nn_det_mask)) continue;
+
+          /* Everything that survived NMS in a class we care about holds the
+           * count up; only what cleared the counting floor is a detection. */
+          sustained++;
+          if (!dets[i].keep) continue;
 
           if (dets[i].cls == 0)                    { people++; }
           else if (_class_is_vehicle(dets[i].cls)) { vehicles++; }
@@ -1036,8 +1064,9 @@ static void _nn_task_run(uint32_t args)
             b->class_index =  dets[i].cls;
           }
         }
-        _nn_tile_pub_n = pub;
-        tile_total     = people + vehicles;
+        _nn_tile_pub_n   = pub;
+        tile_total       = people + vehicles;
+        tile_sustained   = sustained;
 
         rtos_mutex_acquire(&_nn_task.pp_box_mtx, true);
         memcpy(_pp_box_buff, _nn_tile_pub, (size_t)pub * sizeof(t_nn_box));
@@ -1095,11 +1124,14 @@ static void _nn_task_run(uint32_t args)
       /* In tile mode this is the untruncated survivor count, not the size of
        * the publish buffer — a sweep can find more than NN_BOXES_MAX_NUM. */
       uint32_t cur_boxes = on_tile ? tile_total : (uint32_t)_pp_box_count;
+      /* The single-frame path thresholds inside its post-processor and has no
+       * sub-threshold set to offer, so it sustains on exactly what it counts. */
+      uint32_t cur_sustained = on_tile ? tile_sustained : cur_boxes;
 
       /* Hysteresis: quick to believe a rise, slow to believe a fall. See
        * the _nn_debounce block above for why the symmetric version of this
        * could sit silent for minutes on a busy scene. */
-      bool count_changed = _nn_count_update(cur_boxes);
+      bool count_changed = _nn_count_update(cur_boxes, cur_sustained);
 
       /* Never let an injected picture masquerade as a real detection. The
        * side effects here are the product's outward claims — a JPEG filed
@@ -1465,12 +1497,27 @@ static void _pp_publish_objects(t_nn_boxes *out)
   memset(_pp_box_buff, 0x00U, sizeof(_pp_box_buff));
   int32_t n = out->nb_detect;
   if (n > NN_BOXES_MAX_NUM) { n = NN_BOXES_MAX_NUM; }
+  int32_t kept = 0;
   for (int32_t idx = 0; idx < n; idx++)
   {
-    _pp_box_buff[idx] = (t_nn_box)(out->pOutBuff[idx]);
-  }
-  _pp_box_count = (size_t)n;
+    const t_nn_box b = (t_nn_box)(out->pOutBuff[idx]);
 
+    /* A confidence is a probability. The post-processor occasionally hands
+     * back a box whose confidence is not one — 1.0066e+38 was caught on the
+     * bench, on a 46x59 px box against the bottom of the frame — and such a
+     * box is above every threshold there is, by construction: it cannot be
+     * filtered by raising one. It is a phantom person, an SD photograph of
+     * nothing, and a notification (ScopusQA #24).
+     *
+     * Written as a rejection of what is NOT in range so that a NaN, which
+     * fails every comparison it is given, is rejected too. Degenerate
+     * geometry goes with it: a box with no area is not a detection either. */
+    if (!(b.conf > 0.0f) || !(b.conf <= 1.0f)) { continue; }
+    if (!(b.width > 0.0f) || !(b.height > 0.0f)) { continue; }
+
+    _pp_box_buff[kept++] = b;
+  }
+  _pp_box_count = (size_t)kept;
 }
 
 /**

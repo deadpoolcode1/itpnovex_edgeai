@@ -96,20 +96,11 @@ def _vehicles(by):
 
 
 def inject_retry(cam, img, tries=3):
-    """`frame upload` occasionally misses its Ready banner right after a tile
-    sweep — the shell is still draining the sweep's report when the next
-    command lands, and the banner scrolls past the read window. That is a
-    harness race, not a device fault: the same image uploads on the retry.
-    Drain first, then ask again."""
-    last = ""
-    for _ in range(tries):
-        cam.n6.drain(0.5)
-        ok, detail = cam.inject(img)
-        if ok:
-            return True, detail
-        last = detail
-        time.sleep(0.5)
-    return False, last
+    """Kept as a name: `Camera.inject` retries by itself now, so every caller
+    of it gets what only this wrapper used to have. See its docstring for the
+    race — a `+SDVRNTF` line landing between the command and its banner."""
+    cam.n6.drain(0.5)
+    return cam.inject(img, tries=tries)
 
 
 def tile_upload(cam, image_path, w, h):
@@ -132,16 +123,31 @@ def tile_upload(cam, image_path, w, h):
     return ("ERROR" not in out), out.strip().replace("\n", " ")[-120:]
 
 
+class TileRunRefused(RuntimeError):
+    """`tile run` answered with a refusal instead of a sweep.
+
+    It refuses for two reasons — the NN is stopped, or main-path tiling owns
+    the accumulator — and both answers contain no boxes. Read as a result that
+    is a count of zero, which is a number a report will happily print and
+    nobody can tell from a real empty scene. It cost a wrong "0 people, 0
+    changes" table on 2026-08-30, so it is an exception now, not a value."""
+
+
 def tile_run(cam, tiles):
     """`tile run` is silent for the whole sweep then emits the report at once,
     so the timeout has to cover every tile — ~100 ms of inference each, plus
     the resize, plus slack for a notification landing mid-sweep."""
     budget = tiles * 0.5 + 8.0
     out = cam.n6.send("tile run", "tile run ok", budget)
+    if ("owns the engine" in out) or ("NN stopped" in out):
+        raise TileRunRefused(out.strip().replace("\n", " ")[-160:])
     dets = [(int(c), float(cf)) for c, cf in
             re.findall(r"\]\s+\w+\((-?\d+)\)\s+conf=([\d.]+)", out)]
     m = re.search(r"->\s*(\d+)\s+after NMS", out)
-    return (int(m.group(1)) if m else None), dets, out
+    if m is None:
+        raise TileRunRefused(f"no sweep report in the reply: "
+                             f"{out.strip()[-160:]!r}")
+    return int(m.group(1)), dets, out
 
 
 def main():

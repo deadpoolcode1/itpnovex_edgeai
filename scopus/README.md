@@ -126,9 +126,36 @@ switchable so a claim can be re-measured (`tile fullpass on|off`,
 | `fullpass` | run the whole frame as one extra step alongside the tiles, so tiling can only add |
 | `edgedrop` | drop a tile detection whose box runs into a tile edge that is not a frame edge — it is a fragment, and the object is seen whole by a neighbour or by the whole-frame pass |
 
-Without `edgedrop`, an object larger than a tile is counted once per tile it
-touches: `5_people.jpeg` measured **19** people. See `STATUS.md` 2026-08-27 for
-the numbers and for why the default is still `default`.
+**Leave both on. They are the setting** (ScopusQA #24). They are not a
+trade-off to tune: with `edgedrop` off the count is wrong AND unstable, and
+with `fullpass` off tiles on their own see nothing they cannot fit inside a
+256 px crop. `scopus/tile_stability.py` pushes one image through the device
+many times, changed only by sensor noise and sub-pixel tremor, and counts how
+often the answer moves — 12 looks at `3_people_01.jpeg`, which has three people
+in it:
+
+| `fullpass` | `edgedrop` | people | count changed |
+|---|---|---|---|
+| off | off | 9–12 | 9 times |
+| on  | off | 9–11 | 9 times |
+| off | on  | 0    | never |
+| **on** | **on** | **3** | **once, to 4** |
+
+Every change is a notification, which is what a storm on a picture that never
+moved actually is. The switches are shared with the offline `tile` commands, so
+`detect mode tile` arms all four of them itself — `conf 0.45 iou 0.40 fullpass
+on edgedrop on` — and says so, and an experiment cannot become the product's
+behaviour by being left switched on. `detect mode query` shows what the live
+detector is using, and `tile fullpass|edgedrop|thresh` warn when the main path
+is tiling and they are about to change it.
+
+Below the counting floor there is a second, lower one. A detection sitting near
+`conf` crosses it both ways between sweeps, and a count that alternates 5, 6,
+5, 6 is a notification each time — measured on `5_people.jpeg`, where a sixth
+detection comes and goes at 0.45–0.50 against a 0.45 floor. So a detection has
+to reach `conf` to be **counted** and only 75% of it to **stay** counted:
+nothing below the floor is ever reported, drawn or added to a total, it only
+makes the count slow to come back down. Rises are unaffected.
 
 In tile mode the debounce is floored at two sweeps, because a window shorter
 than the sampling period debounces nothing. `detect debounce query` reports the

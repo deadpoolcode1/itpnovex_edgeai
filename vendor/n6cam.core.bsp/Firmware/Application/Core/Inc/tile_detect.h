@@ -60,8 +60,29 @@ typedef struct
   float   x1, y1, x2, y2;
   float   conf;
   int32_t cls;
-  bool    keep;
+  bool    keep;      /* survived NMS and is above the confidence floor       */
+  bool    sustain;   /* survived NMS, floor or sustain floor — see below     */
 } t_tile_det;
+
+/**
+ * @brief Confidence floor for counting, and the lower floor a detection only
+ *        has to hold to keep being believed (ScopusQA #24).
+ *
+ * A person at the edge of what the network is sure about sits near the floor
+ * and crosses it both ways between sweeps. Counting on one number turns that
+ * into a count that alternates — 5, 6, 5, 6 — and every alternation is a
+ * notification about a scene that never moved. Measured on 5_people.jpeg, 10
+ * looks at one unchanging frame: the sixth detection appears at conf 0.45-0.50
+ * against a 0.45 floor, and the count changed four times.
+ *
+ * So: `conf` is what a detection must reach to be COUNTED, and
+ * `conf_sustain` is what it must hold to stay counted. Nothing below the full
+ * floor is ever reported, drawn, or added to a total — the wider set exists
+ * only so that the count is slow to come back DOWN, which is the direction
+ * this flicker travels.
+ */
+float    tile_cfg_conf(void);
+float    tile_cfg_conf_sustain(void);
 
 /* ── Configuration ─────────────────────────────────────────────────────── */
 
@@ -109,13 +130,18 @@ void     tile_cfg_get(uint16_t *cols, uint16_t *rows, uint16_t *crop,
 uint32_t tile_cfg_count(void);
 
 /**
- * @brief Set the geometry that belongs to the LIVE main pipe: ScopusQA #22's
- *        4 columns x 3 rows at the NN's own 256 px side.
+ * @brief Set everything that belongs to the LIVE main pipe: ScopusQA #22's
+ *        4 columns x 3 rows at the NN's own 256 px side, and both merge rules.
  *
  * The factory defaults describe a sensor-sized uploaded frame and degenerate
  * on an 800x600 one — a 576 px crop over a 600 px axis puts all three rows
  * within 24 px of each other. This is the geometry the main path arms itself
  * with, and `tile live` uses it too.
+ *
+ * It also re-asserts fullpass and edgedrop, because the shell's copies of them
+ * are an experiment bench and the main path must not inherit where an
+ * experiment happened to stop (ScopusQA #24 — see tile_detect.c for the
+ * measured table).
  */
 void     tile_cfg_for_live(void);
 
@@ -165,7 +191,9 @@ void     tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n);
 uint32_t tile_sweep_finish(void);
 
 /** Survivors of the last finished sweep. `*n` is the raw array length; walk it
- *  and skip entries with keep == false. */
+ *  and skip entries with keep == false. Entries with sustain == true and
+ *  keep == false are the sustain set — see tile_cfg_conf_sustain(); they are
+ *  not detections and must not be counted, drawn or reported. */
 const t_tile_det *tile_sweep_dets(uint32_t *n);
 
 /** Diagnostics for the last sweep: every box the NN emitted, and how many

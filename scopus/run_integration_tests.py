@@ -110,14 +110,31 @@ class Camera:
             pass
         self.n6.close()
 
-    def inject(self, image_path):
+    def inject(self, image_path, tries=3):
         """Upload an image as the NN input. Returns (ok, detail).
 
         The geometry is read back from the kit rather than assumed: the
         firmware wants CAMERA_ANCILLARY_BUFFER_SIZE (256*256*3 today) and the
         old tooling hardcoded 300*300*3, so every upload was rejected and
         inference silently ran on a stale buffer.
+
+        Retried, because the `Ready` banner shares the console with the
+        camera's own `+SDVRNTF` lines: a notification landing between the
+        command and the banner takes the banner out of the read window and the
+        upload reads as a device fault. It is not one — the same image goes in
+        on the next attempt. Measured 0/20 misses against a quiet scene and 1-3
+        per suite run against a room with people in it, which is the tell.
         """
+        last = ""
+        for attempt in range(tries):
+            ok, detail = self._inject_once(image_path)
+            if ok:
+                return True, detail
+            last = detail
+            self.n6.drain(0.5)
+        return False, last
+
+    def _inject_once(self, image_path):
         from PIL import Image
         self.n6.send("frame clear", max_secs=2.0)
         self.n6.drain(0.3)

@@ -4,6 +4,118 @@ Last updated: 2026-08-30. Everything below was measured on the bench, not inferr
 
 ---
 
+## 2026-08-30 — the tile switches were deciding the product (ScopusQA #24)
+
+ITP: "when I work with tiles, I get notifications constantly when there is no
+change in the image in front of the camera", asked against `3_people_01.jpeg`,
+with the question "is there a preferred setting for `tile fullpass` /
+`tile edgedrop`?"
+
+The bench was found in exactly that state — `detect mode tile`, `action_msk
+0x07`, `debounce 3000` — and the receiver had the storm in it: eight events in
+under seven minutes, `rsd` going 1, 0, 3, 1, 2, 0, 1, 0 at a scene nobody was
+in.
+
+### Both switches were off, and the live path had inherited them
+
+`tile fullpass` and `tile edgedrop` are one pair of variables shared by the
+offline `tile` commands and the live main path. `tile_cfg_for_live()` armed the
+geometry when `detect mode tile` was given and said nothing about these two, so
+whatever the last experiment left behind became how the product counted. `tile
+query` showed `fullpass off  edgedrop off`; nothing else did, and `detect mode
+query` — the command you would actually ask — did not.
+
+The confidence floor is the same variable and the same hole, found by walking
+into it: a `tile thresh 20 40` typed to see what the network was thinking left
+the live detector counting down to 0.20, and nothing running said so.
+
+### What each switch is worth, measured
+
+`scopus/tile_stability.py` takes one image, manufactures N frames that differ
+only by sensor noise (sigma 2 LSB) and sub-pixel tremor (±0.4 px), pushes each
+through the device and records the count. Nothing a person would call a change,
+so every movement in the answer is the detector's own. 12 looks at
+`3_people_01.jpeg`, truth 3 people:
+
+| `fullpass` | `edgedrop` | people | count changed |
+|---|---|---|---|
+| off | off | 9–12 | 9 times |
+| on  | off | 9–11 | 9 times |
+| off | on  | 0 | never |
+| **on** | **on** | **3** | **once, to 4** |
+
+The single-frame path over the same 12 frames: 3 every time, never moved.
+
+So `edgedrop` is what stops the storm — without it every person taller than a
+256 px tile is cut and each piece counted — and `fullpass` is what keeps the
+unit from going blind when it is on: on this image every box touches a seam, so
+with tiles alone all of them are dropped and the sweep reports nobody. Off/off
+is the worst of the four and it is where the bench was.
+
+### Fixed: the live path owns them
+
+- `tile_cfg_for_live()` re-asserts `conf 0.45, iou 0.40, fullpass on, edgedrop
+  on` — every knob the two callers share — so `detect mode tile` arms a known
+  configuration instead of inheriting one. It also re-arms when the mode is
+  already tile, because that is the documented way back after an experiment and
+  the person experimenting is already in tile mode.
+- `detect mode query` prints all four, and says `<- counts every fragment;
+  expect a storm` when edgedrop is off.
+- `tile edgedrop off`, `tile fullpass off` and `tile thresh` under a live sweep
+  now say that they change live detection, what it will do, and how to put it
+  back.
+
+### Two more things the measurement turned up
+
+**A confidence of 1.0066e+38.** One sweep in ten produced a 46x59 px box at the
+bottom of the frame with that as its confidence. It is above every threshold
+there is, by construction — no floor can filter it — and it is a phantom
+person, an SD photograph of nothing and a notification. `_pp_publish_objects`
+now drops any box whose confidence is not in (0, 1] (written as a rejection of
+what is not in range, so a NaN goes too) or whose box has no area.
+
+**A detection at the floor flickers, and each flicker is an event.** On
+`5_people.jpeg` at the corrected settings a sixth detection appears at
+conf 0.45–0.50 against a 0.45 floor: 5, 6, 5, 5, 5, 6, 6, 5, 6, 6 over ten
+identical frames. The debounce cannot help — two consecutive 6s confirm a rise,
+three 5s confirm the fall, and it repeats about every seven seconds. So the
+tiled sweep now has a second, lower floor at 75% of `conf`: a detection must
+reach `conf` to be **counted** and only hold 0.75×`conf` to **stay** counted.
+Nothing below the full floor is ever counted, published, drawn or reported —
+the wider set is passed to the hysteresis as `sustained` and only makes the
+count slow to come back DOWN, which is the direction this flicker travels.
+Rises still need the full floor, so nothing marginal can raise a count.
+
+### One trap in the measuring, worth more than the number it spoiled
+
+`tile run` refuses when main-path tiling owns the accumulator, and the refusal
+carries no boxes. `tile_stability.py` read that as a sweep that found nobody
+and printed `0 people, 0 count changes` for twelve consecutive samples — a
+table that says the detector is perfectly stable, at nothing. The reply to the
+`detect mode default` that would have prevented it had been swallowed by a
+notification. The tool now confirms the mode instead of assuming it, and a
+refusal raises instead of counting as zero.
+
+### End to end
+
+Camera build `Aug 30 2026 16:53:33`, flashed over CDC, left in the state ITP
+reported it in: tile mode, `det_msk 0x03`, `action_msk 0x07`, debounce 3000 ms,
+same lens, same room.
+
+| window | configuration | notifications | photos |
+|---|---|---|---|
+| 15:54–16:01, before | as found: `fullpass off edgedrop off` | 8 (`rsd` 1,0,3,1,2,0,1,0) | 5 |
+| 16:55–17:04, after | `detect mode tile` arms its own | **0** | **0** |
+
+407 sweeps over the second window, so the detector was looking the whole time,
+and `detect simulate 3` still lands on the server as `rsn 16 rsd 3` — quiet,
+not deaf.
+
+On the fixed image, 12 looks each, after the fix: single-frame 3 every time,
+tiled 3 every time, neither moved.
+
+---
+
 ## 2026-08-30 — one port, both schemes (ScopusQA #19, reopened in practice)
 
 ITP asked for both options to be supported. What was actually on the bench was

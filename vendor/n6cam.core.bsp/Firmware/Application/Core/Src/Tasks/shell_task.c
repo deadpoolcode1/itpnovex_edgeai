@@ -1962,6 +1962,25 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     return LWSHELL_OK;
   }
 
+  /* frame grab [nn|live] — stream out the picture the detector is looking at.
+   *
+   * Every other window onto the detector shows its ANSWER: boxes, counts, the
+   * overlay. When the answer disagrees with what a person sees on the screen,
+   * there is no way to tell whether the network was wrong about the picture or
+   * was handed a different picture — and those two have opposite fixes.
+   * ScopusQA #25 sat between them for a week: the same frame that the live
+   * camera path found nobody in was found correctly when it was pushed back in
+   * over `frame upload`, which only says the two paths differ, not how.
+   *
+   *   nn   (default) the ancillary buffer, exactly the bytes memcpy'd into the
+   *                  NN input — what the network sees
+   *   live           the main pipe, RGB888 — what the preview and the UVC
+   *                  stream show
+   *
+   * RGB888 base64, 512 chars a line, framed by `begin`/`end` so a host tool can
+   * find it in a console that is also printing notifications. The geometry line
+   * carries both pipes' effective sensor areas, which is what makes the two
+   * pictures comparable rather than merely both present. */
   return LWSHELL_ERROR_SYNTAX_CMD;
 }
 
@@ -2255,6 +2274,15 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     tile_cfg_set_thresh((float)cp / 100.0f, (float)ip / 100.0f);
     CMD_PRINTF(stream, "tile: conf>=%.2f iou=%.2f%s",
                (float)cp / 100.0f, (float)ip / 100.0f, lwshell_eol());
+    /* Shared with the main path, exactly like the two merge switches. A floor
+     * typed to see what the network is thinking should not quietly become the
+     * floor the customer's server is told about (ScopusQA #24). */
+    if (nn_task_tile_get())
+    {
+      CMD_PRINTF(stream, "  NOTE: the main path is tiling, so this is the live "
+                         "floor too. 'detect mode tile' puts it back.%s",
+                 lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2276,6 +2304,24 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if (sub[0] == 'f') { tile_cfg_set_fullpass(on); }
     else               { tile_cfg_set_edgedrop(on); }
     CMD_PRINTF(stream, "tile: %s %s%s", sub, on ? "on" : "off", lwshell_eol());
+    /* These are shared with the main path, so switching one off while it is
+     * tiling changes what the customer's server is told — say so here rather
+     * than let it be discovered from the notification stream (ScopusQA #24).
+     * `detect mode tile` re-asserts both, so this lasts until the next one. */
+    if (!on && nn_task_tile_get())
+    {
+      CMD_PRINTF(stream, "  NOTE: the main path is tiling, so this changes "
+                         "live detection too.%s", lwshell_eol());
+      CMD_PRINTF(stream, "  %s%s",
+                 (sub[0] == 'f')
+                   ? "Without the whole-frame pass, anything larger than a "
+                     "256 px tile is lost."
+                   : "Without edge-drop, an object cut by the grid is counted "
+                     "once per piece, and the count moves every sweep.",
+                 lwshell_eol());
+      CMD_PRINTF(stream, "  'detect mode tile' puts both back on.%s",
+                 lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2698,10 +2744,21 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       if (nn_task_tile_get())
       {
         uint16_t cols = 0U, rows = 0U, crop = 0U;
-        tile_cfg_get(&cols, &rows, &crop, NULL, NULL, NULL, NULL);
+        float    conf = 0.0f, iou = 0.0f;
+        tile_cfg_get(&cols, &rows, &crop, NULL, NULL, &conf, &iou);
         CMD_PRINTF(stream, "  grid %ux%u crop %u, %lu sweep(s), last %lu ms%s",
                    (unsigned)cols, (unsigned)rows, (unsigned)crop,
                    (unsigned long)sweeps, (unsigned long)last_ms, lwshell_eol());
+        /* The two merge rules belong in the answer to "what is the live
+         * detector doing", not only in `tile query` — reading them from the
+         * offline command is how ScopusQA #24 stayed invisible. */
+        CMD_PRINTF(stream, "  conf>=%.2f iou=%.2f  fullpass %s  edgedrop %s%s%s",
+                   conf, iou,
+                   tile_cfg_get_fullpass() ? "on" : "off",
+                   tile_cfg_get_edgedrop() ? "on" : "off",
+                   tile_cfg_get_edgedrop() ? ""
+                     : "  <- counts every fragment; expect a storm",
+                   lwshell_eol());
       }
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
@@ -2724,10 +2781,15 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if (want_tile)
     {
       uint16_t cols = 0U, rows = 0U, crop = 0U;
-      tile_cfg_get(&cols, &rows, &crop, NULL, NULL, NULL, NULL);
+      float    conf = 0.0f, iou = 0.0f;
+      tile_cfg_get(&cols, &rows, &crop, NULL, NULL, &conf, &iou);
       CMD_PRINTF(stream, "detect mode: tile (%ux%u grid, crop %u, ~%lu inferences a detection)%s",
                  (unsigned)cols, (unsigned)rows, (unsigned)crop,
                  (unsigned long)tile_cfg_count(), lwshell_eol());
+      /* Named because arming them is a side effect of this command, and a
+       * side effect nobody is told about is the bug this closes. */
+      CMD_PRINTF(stream, "  conf>=%.2f iou=%.2f, fullpass on, edgedrop on%s",
+                 conf, iou, lwshell_eol());
     }
     else
     {
