@@ -42,7 +42,13 @@ extern "C" {
 
 /* Public Macros -------------------------------------------------------------*/
 
+/* PSRAM is 32 MB but not all of it is ours: the generated model owns
+ * 0x91a00000..0x91a80000 (see the MEMORY block in STM32N657xx.ld). IN_PSRAM is
+ * the 26 MB below that pool; IN_PSRAM_HI is the 5.5 MB above it. Both are the
+ * same memory, so the choice is only about which side of the pool a buffer
+ * lands on, and the linker now refuses either that does not fit. */
 #define IN_PSRAM          IN_SECTION(".psram_bss")
+#define IN_PSRAM_HI       IN_SECTION(".psram_hi_bss")
 #define IN_SRAM_UNCACHED  IN_SECTION(".uncached_bss")
 
 /* Public Types --------------------------------------------------------------*/

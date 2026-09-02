@@ -10,8 +10,26 @@ MEMORY
   SRAM_UNCACHED	(xrw): ORIGIN = 0x341C0000, LENGTH =  256K
   SRAM_NPU  	(xrw): ORIGIN = 0x34200000, LENGTH = 2048K
 
-  /* PSRAM */
-  PSRAM   		(xrw): ORIGIN = 0x90000000, LENGTH =   32M	/* Use for reference */
+  /* PSRAM is 32M, 0x90000000..0x92000000, but a slice in it is not ours: the
+     generated model hardcodes its read/write pool at 0x91a00000 and uses the
+     first 512K of it ("offset=0x91a00000 absolute_mode size=6291448" and
+     "global pool 4 is 512.00 KB" in Model/network.c; the pool's declared 6M
+     is what the allocator was offered, the 512K is what it took, and
+     ATON_LIB_PHYSICAL_TO_VIRTUAL_ADDR is the identity macro, so these are
+     real addresses).
+
+     Nothing in the link knew that. PSRAM was one 32M region, .psram_bss grew
+     from 0x90000000 straight through 0x91a00000, and _live_rgb ended up
+     sitting on the NN's working memory: every tiled sweep wrote a picture
+     through the model's buffers, and `frame grab live` came back with a band
+     of float32 activations where the top of the frame should be.
+
+     So PSRAM now stops at the pool, NN_POOL holds it and nothing is placed
+     there, and PSRAM_HI is the rest above it. Overflowing either is a link
+     error instead of a corrupted picture. */
+  PSRAM   		(xrw): ORIGIN = 0x90000000, LENGTH =   26M	/* to 0x91a00000     */
+  NN_POOL 		( rw): ORIGIN = 0x91a00000, LENGTH =  512K	/* model's, keep clear */
+  PSRAM_HI		(xrw): ORIGIN = 0x91a80000, LENGTH = 5632K	/* the rest, above it */
 
   /* FLASH */
   FLASH       	(xrw): ORIGIN = 0x70000000, LENGTH =   64M	/* Use for reference */
@@ -201,6 +219,18 @@ SECTIONS
     . = ALIGN(4);
     __psram_bss_end__ = .;
   } >PSRAM
+
+  /* PSRAM above the model's pool. Same memory, reached over the reserved
+     512K; for buffers that do not fit under it. */
+  .psram_hi_bss (NOLOAD) :
+  {
+  	. = ALIGN(4);
+    __psram_hi_bss_start__ = .;
+    *(.psram_hi_bss)
+    *(.psram_hi_bss*)
+    . = ALIGN(4);
+    __psram_hi_bss_end__ = .;
+  } >PSRAM_HI
 
   /* Extras END -------------*/
 

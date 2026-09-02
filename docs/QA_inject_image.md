@@ -154,7 +154,31 @@ The picture must come from a buffer the camera is not writing into. If that
 line says `SAME`, the frame can be a splice of two frames and anything moving
 in it is torn.
 
-## 8. If it fails
+## 8. The live view and an injected picture use different floors
+
+They do not have to agree, and when they disagree the same picture is found one
+way and missed the other. That is not a fault, and it has been reported as one.
+
+- `frame run` on an injected picture reports everything the network scores at
+  **0.30** or better (`AI_OD_YOLOV8_PP_CONF_THRESHOLD`).
+- `detect mode tile` gates the **live** path at **0.45** (`tile thresh`), and
+  `n6cam-tile.py` defaults to `--conf 45` as well.
+
+So a detection scoring between 0.30 and 0.45 shows nothing on the live view and
+nothing in a tile run, and appears at once when the same pixels are injected.
+Measured on ScopusQA #25: a person filmed off a monitor scored **0.37**
+injected, and the tile sweep over the same frame reported `3 raw -> 0
+over-thresh` at 0.45 and found him at `conf=0.33` at 0.30.
+
+Before reporting "the camera can see him and does not count him":
+
+    python3 scopus/cam.py "detect mode query"      # is tiling on, and at what gate
+    python3 scopus/inference_test.py --image <the frame you grabbed> --expect 1
+
+If the conf lands between 0.30 and 0.45, the answer is the gate, not the
+detector.
+
+## 9. If it fails
 
 | What you see | What it means |
 |---|---|

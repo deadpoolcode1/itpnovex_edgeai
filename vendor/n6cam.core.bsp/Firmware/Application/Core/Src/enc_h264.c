@@ -114,7 +114,9 @@ typedef struct
 * @{
 *//*--------------------------------------------------------------------------*/
 
-static uint8_t    _enc_alloc_buff[ENC_ALLOC_SIZE] DMA_ALIGN IN_PSRAM;
+/* IN_PSRAM_HI: 4 MB of arena that has no reason to be under the model's
+ * pool, and moving it leaves room under there for everything that has. */
+static uint8_t    _enc_alloc_buff[ENC_ALLOC_SIZE] DMA_ALIGN IN_PSRAM_HI;
 static t_enc_ctx  _enc_ctx;
 
 /*-------------------------------------------------------------------------*//**

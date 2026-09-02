@@ -220,10 +220,17 @@ static t_tile_det     _sw_dets[TILE_MAX_DETS];
 
 /* Live-frame scratch. RGB888 expansion of the DCMIPP main pipe — its own
  * buffer rather than a loan of the firmware-update stash, so a live sweep and
- * an uploaded frame can coexist and neither has to know about the other. */
+ * an uploaded frame can coexist and neither has to know about the other.
+ *
+ * IN_PSRAM_HI, not IN_PSRAM. Under the old single PSRAM region this buffer
+ * landed at 0x919ff200 and so straddled the model's pool at 0x91a00000: all
+ * but its first 3584 bytes sat on the NN's working memory, a tiled sweep
+ * wrote a picture through the model's buffers on every pass, and rows 2 to
+ * 220 of a `frame grab live` came back as float32 activations. Above the pool
+ * it collides with nothing. */
 static __ALIGN_BEGIN uint8_t
   _live_rgb[(uint32_t)CAMERA_MAIN_WIDTH * CAMERA_MAIN_HEIGHT * 3U]
-  __ALIGN_END IN_PSRAM;
+  __ALIGN_END IN_PSRAM_HI;
 
 /* ── Geometry ──────────────────────────────────────────────────────────── */
 
