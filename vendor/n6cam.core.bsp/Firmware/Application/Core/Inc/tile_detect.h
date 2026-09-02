@@ -62,6 +62,7 @@ typedef struct
   int32_t cls;
   bool    keep;      /* survived NMS and is above the confidence floor       */
   bool    sustain;   /* survived NMS, floor or sustain floor — see below     */
+  bool    frag;      /* cut by a tile edge that is not a frame edge          */
 } t_tile_det;
 
 /**

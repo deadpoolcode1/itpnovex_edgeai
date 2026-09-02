@@ -7,7 +7,16 @@ a picture whose answer is known into the camera's inference buffer and checks
 what comes back:
 
     python3 scopus/inference_test.py                    # 3 people
-    python3 scopus/inference_test.py --image images/7_people.jpg --expect 7
+    python3 scopus/inference_test.py --image images/7_people.jpg
+    python3 scopus/inference_test.py --image mine.jpg --expect 2
+
+The count comes from the file name where the name states one, the way the whole
+ScopusQA set labels itself: 7_people.jpg has seven. `--expect` overrides it.
+A picture whose name states no count is REPORTED, not judged: there is no truth
+to compare against, and inventing one turns "here is what the camera saw" into a
+FAILED that means nothing. That default used to be a flat 3, so every picture
+without three people in it failed, including the one this was recommended for on
+ScopusQA #25.
 
 It does the five things Step 7 of the tester manual describes, in the order
 that works:
@@ -37,6 +46,7 @@ healthy from the outside.
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -140,12 +150,32 @@ def attempt(sh, image):
     return None
 
 
+def people_in_name(path):
+    """How many people the file name claims, or None if it claims nothing.
+
+    The ScopusQA set labels itself (5_people.jpeg, 3_people_1_car_01.jpeg)
+    and that is the only ground truth available without re-annotating the set
+    by hand. `person behind a short fence.jpg` states nothing, and nothing is
+    the right answer for it: see the note at the top of this file.
+
+    Deliberately the same rule as scopus/tile_compare.truth(), imported rather
+    than written twice so the two tools can never disagree about what a picture
+    is supposed to contain.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tile_compare import truth
+    people, _vehicles = truth(os.path.basename(path))
+    return people
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run inference on a known image.")
     ap.add_argument("--image", default=os.path.join(REPO, "images",
                                                     "3_people.jpg"))
-    ap.add_argument("--expect", type=int, default=3,
-                    help="how many people are in the picture")
+    ap.add_argument("--expect", type=int, default=None,
+                    help="how many people are in the picture (default: read "
+                         "from the file name, e.g. 7_people.jpg; omitted "
+                         "entirely if the name states no count)")
     ap.add_argument("--tries", type=int, default=4)
     args = ap.parse_args()
 
@@ -155,14 +185,20 @@ def main() -> int:
         print(f"{R}No such image: {image}{Z}", file=sys.stderr)
         return 2
 
+    expect = args.expect if args.expect is not None else people_in_name(image)
+
     try:
         sh = N6Shell()
     except RuntimeError:
         print(f"{R}The camera was not found. Run: python3 "
               f"scopus/preflight.py{Z}", file=sys.stderr)
         return 2
-    print(f"Camera on {sh.tty} — expecting {args.expect} people in "
-          f"{os.path.basename(image)}\n")
+    if expect is None:
+        print(f"Camera on {sh.tty}: {os.path.basename(image)} states no "
+              f"count, so this reports what the camera sees\n")
+    else:
+        print(f"Camera on {sh.tty}: expecting {expect} people in "
+              f"{os.path.basename(image)}\n")
 
     out = None
     restored = False
@@ -188,9 +224,9 @@ def main() -> int:
 
     got = out.split("detection(s)")[0].split(":")[-1].strip()
     ms = out.split("NN ")[-1].split("ms")[0] if "NN " in out else "?"
-    if got != str(args.expect):
+    if expect is not None and got != str(expect):
         print(f"\n{R}FAILED{Z} — the camera counted {got}, the picture "
-              f"has {args.expect}.")
+              f"has {expect}.")
         return 1
     if not restored:
         print(f"\n{R}FAILED{Z} — {got} people were counted correctly, but the "

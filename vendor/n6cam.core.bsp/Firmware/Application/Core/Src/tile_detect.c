@@ -370,8 +370,18 @@ static void _nms(uint32_t n, float iou_th)
       if (_sw_dets[j].cls != _sw_dets[i].cls) continue;
       if (_iou_of(&_sw_dets[i], &_sw_dets[j]) > iou_th)
       {
-        /* keep the higher-confidence one */
-        if (_sw_dets[j].conf > _sw_dets[i].conf)
+        /* A whole box beats a fragment whatever the confidences say. The
+         * fragment is a piece of something and its box describes the piece,
+         * so letting a confident fragment suppress the box that actually
+         * frames the object would keep the count and lose the geometry, and
+         * an overlay drawn on half a person is how this looked on the bench.
+         * Between two of a kind, the more confident one wins as before. */
+        const bool i_frag = _sw_dets[i].frag;
+        const bool j_frag = _sw_dets[j].frag;
+        const bool j_wins = (i_frag != j_frag)
+                          ? i_frag
+                          : (_sw_dets[j].conf > _sw_dets[i].conf);
+        if (j_wins)
         {
           _sw_dets[i].sustain = false;
           break;                 /* i is gone; stop comparing it             */
@@ -471,8 +481,27 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     const bool weak = (boxes[i].conf < _cfg_conf);
     if (weak && (_sw_n_acc >= TILE_WEAK_LIMIT)) continue;
 
-    /* Fragment rejection — see the note on _cfg_edgedrop. Only tiles; the
-     * whole-frame pass has no cut edges, only frame edges. */
+    /* Fragment marking, see the note on _cfg_edgedrop. Only tiles; the
+     * whole-frame pass has no cut edges, only frame edges.
+     *
+     * This used to `continue`, and dropping the fragment outright is what
+     * ScopusQA #25 turned out to be: a person WIDER THAN THE OVERLAP can be
+     * cut by every tile that sees him, so every copy is a fragment, all of
+     * them are discarded, and he vanishes from a picture the network reads at
+     * 0.84 when the same tile is handed to it directly. Measured on the bench
+     * print: 245 px wide over a 160 px overlap, found 0/6 sweeps with the
+     * shipped settings.
+     *
+     * Simply not dropping is worse, and that was measured too: over the
+     * 77-image QA set, `edgedrop off` takes the total count error from 32 to
+     * 117 and the exact counts from 12 to 5, because each piece of a big
+     * object is then counted as a whole one (5_people.jpeg reads 13).
+     *
+     * So a fragment is now admitted as EVIDENCE and never as a count: it can
+     * hold a count up and it takes part in NMS, but `keep` is false, so on its
+     * own it adds nothing. _rescue_fragments() below is what promotes one,
+     * and only when nothing whole accounts for it. */
+    bool frag = false;
     if (is_tile && _cfg_edgedrop)
     {
       const float m  = TILE_EDGE_MARGIN;
@@ -481,14 +510,15 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
       const float y1 = boxes[i].y_center - boxes[i].height * 0.5f;
       const float y2 = boxes[i].y_center + boxes[i].height * 0.5f;
 
-      if (((x1 < m)        && (cx > 0U))            ||
-          ((x2 > 1.0f - m) && ((uint32_t)cx + cw < (uint32_t)_sw_fw)) ||
-          ((y1 < m)        && (cy > 0U))            ||
-          ((y2 > 1.0f - m) && ((uint32_t)cy + ch < (uint32_t)_sw_fh)))
-      {
-        continue;
-      }
+      frag = (((x1 < m)        && (cx > 0U))            ||
+              ((x2 > 1.0f - m) && ((uint32_t)cx + cw < (uint32_t)_sw_fw)) ||
+              ((y1 < m)        && (cy > 0U))            ||
+              ((y2 > 1.0f - m) && ((uint32_t)cy + ch < (uint32_t)_sw_fh)));
     }
+
+    /* Fragments are held to the same budget as weak boxes: neither may crowd
+     * a real detection out of the accumulator. */
+    if (frag && (_sw_n_acc >= TILE_WEAK_LIMIT)) continue;
 
     if (_sw_n_acc >= TILE_MAX_DETS) { _sw_sat = true; continue; }
 
@@ -505,14 +535,88 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     d->y2   = (by + bh * 0.5f) * inv_fh;
     d->conf    = boxes[i].conf;
     d->cls     = boxes[i].class_index;
-    d->keep    = !weak;
+    d->frag    = frag;
+    d->keep    = !weak && !frag;
     d->sustain = true;
+  }
+}
+
+/* What fraction of `a` lies inside `b`. Not IoU: a fragment is a PART of the
+ * object, so it is small next to the whole box that explains it and their IoU
+ * is low even when one completely contains the other. Containment is the
+ * question being asked here, and IoU answers a different one. */
+static float _inside_of(const t_tile_det *a, const t_tile_det *b)
+{
+  float ix1 = (a->x1 > b->x1) ? a->x1 : b->x1;
+  float iy1 = (a->y1 > b->y1) ? a->y1 : b->y1;
+  float ix2 = (a->x2 < b->x2) ? a->x2 : b->x2;
+  float iy2 = (a->y2 < b->y2) ? a->y2 : b->y2;
+  float iw  = ix2 - ix1;
+  float ih  = iy2 - iy1;
+  if ((iw <= 0.0f) || (ih <= 0.0f)) return 0.0f;
+
+  float area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
+  return (area_a > 0.0f) ? ((iw * ih) / area_a) : 0.0f;
+}
+
+/* How much of a fragment has to sit inside a counted box before that box is
+ * taken to explain it. Half is deliberately lenient: the tile cuts wherever
+ * the grid falls, so a piece can stick out past the whole object's box on the
+ * side the network guessed at, and demanding near-total containment would
+ * promote that piece into a second person. */
+#define TILE_EXPLAINED_FRAC  0.50f
+
+/* Promote fragments that nothing whole accounts for (ScopusQA #25).
+ *
+ * A fragment is a person the grid cut in half. Usually some other tile, or the
+ * whole-frame pass, saw the same person intact, and then the fragment is noise
+ * and counting it is the double count that edgedrop exists to prevent. But
+ * when an object is wider than the tile overlap, NO tile holds it whole, every
+ * copy is a fragment, and dropping all of them loses a person who is plainly
+ * in the picture.
+ *
+ * So: walk the surviving fragments, most confident first. If a counted box of
+ * the same class already covers one, it is explained and stays uncounted. If
+ * nothing does, promote it, and then let it explain its own siblings, so the
+ * two halves of one person become one person and not two. */
+static void _rescue_fragments(uint32_t n)
+{
+  for (;;)
+  {
+    /* The best unexplained fragment left, if any. */
+    uint32_t best = n;
+    for (uint32_t i = 0U; i < n; i++)
+    {
+      const t_tile_det *f = &_sw_dets[i];
+      if (!f->sustain || !f->frag || f->keep) continue;
+      if (f->conf < _cfg_conf) continue;      /* weak: evidence, never a count */
+
+      bool explained = false;
+      for (uint32_t j = 0U; j < n; j++)
+      {
+        if ((j == i) || !_sw_dets[j].keep) continue;
+        if (_sw_dets[j].cls != f->cls) continue;
+        if (_inside_of(f, &_sw_dets[j]) >= TILE_EXPLAINED_FRAC)
+        {
+          explained = true;
+          break;
+        }
+      }
+      if (explained) continue;
+
+      if ((best == n) || (f->conf > _sw_dets[best].conf)) best = i;
+    }
+
+    if (best == n) break;          /* nothing left that needs rescuing */
+
+    _sw_dets[best].keep = true;    /* this piece now stands for the object */
   }
 }
 
 uint32_t tile_sweep_finish(void)
 {
   _nms(_sw_n_acc, _cfg_iou);
+  _rescue_fragments(_sw_n_acc);
 
   uint32_t kept = 0U;
   for (uint32_t i = 0U; i < _sw_n_acc; i++)

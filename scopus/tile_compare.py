@@ -160,6 +160,12 @@ def main():
                     help="tile crop in px (default %d; 320 trades 1:1 tiles for "
                          "more seam overlap, ScopusQA #24)" % CROP)
     ap.add_argument("--iou", type=int, default=40, help="NMS IoU %%")
+    ap.add_argument("--edgedrop", choices=("on", "off"), default="on",
+                    help="reject a box that runs into a tile edge that is not "
+                         "a frame edge (default on, as detect mode tile arms)")
+    ap.add_argument("--fullpass", choices=("on", "off"), default="on",
+                    help="also run the whole frame as one extra pass")
+    ap.add_argument("--out", default=None, help="where to write the JSON")
     args = ap.parse_args()
 
     d = Path(args.dir)
@@ -182,6 +188,8 @@ def main():
         cam.send(f"tile grid {GRID_C} {GRID_R}", "tile", 4.0)
         cam.send(f"tile crop {args.crop}", "tile", 4.0)
         cam.send(f"tile thresh {args.conf} {args.iou}", "tile", 4.0)
+        cam.send(f"tile edgedrop {args.edgedrop}", "tile", 4.0)
+        cam.send(f"tile fullpass {args.fullpass}", "tile", 4.0)
 
         print(f"{'image':38s} {'default':>18s}   {'tile':>18s}")
         print("-" * 80)
@@ -225,7 +233,7 @@ def main():
         cam.send("tile clear", "tile", 4.0)
         cam.close()
 
-    out = Path("scopus/results/tile-compare.json")
+    out = Path(args.out or "scopus/results/tile-compare.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rows, indent=2))
 
