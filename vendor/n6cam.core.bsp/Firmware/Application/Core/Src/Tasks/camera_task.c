@@ -121,6 +121,27 @@ static uint8_t              _camera_decimation = 1U;
 static uint8_t              _camera_main_buffer[CAMERA_MAIN_BUFFER_NUM][CAMERA_MAIN_BUFFER_SIZE] DMA_ALIGN IN_PSRAM;
 static uint8_t              _camera_ancillary_buffer[CAMERA_ANCILLARY_BUFFER_NUM][CAMERA_ANCILLARY_BUFFER_SIZE] DMA_ALIGN IN_PSRAM;
 
+/* The buffer that holds a COMPLETE frame, per pipe (ScopusQA #25).
+ *
+ * Both pipes run double-buffered, and `PxSTM0AR` is a status register: it
+ * names the buffer the DCMIPP is filling right now. Handing that to a reader
+ * gives it a frame that is still being written — the top of the picture from
+ * the new frame and the bottom from the one before it, spliced wherever the
+ * DMA happened to be. On a still scene the two halves are identical and
+ * nothing shows; anything moving is torn, and a torn person is a person the
+ * detector may not find, or finds only the intact half of.
+ *
+ * At the end-of-frame event the hardware has already switched to the other
+ * buffer for the next frame, so the frame that just completed is the one the
+ * status register is NOT naming. That is what the readers get. If that phase
+ * were ever wrong the cost is one frame of staleness (33 ms); reading the
+ * register directly costs a spliced frame every other time.
+ *
+ * NULL until the first frame completes — before that there is nothing whole to
+ * hand out and the register is the only answer there is. */
+static uint8_t * volatile   _camera_main_done      = NULL;
+static uint8_t * volatile   _camera_ancillary_done = NULL;
+
 /* Peripheral */
 DCMIPP_HandleTypeDef  hdcmipp;
 ISP_HandleTypeDef     hisp;
@@ -262,11 +283,19 @@ int32_t camera_task_start(void)
 
 uint8_t *camera_get_buffer(ULONG pipe)
 {
+  /* The last COMPLETE frame, not the one being written — see the note on
+   * _camera_ancillary_done. Both are volatile pointers set from the frame-end
+   * interrupt, so a single load is the whole read; there is nothing here to
+   * lock against. */
   switch (pipe)
   {
-    case DCMIPP_PIPE0: return (uint8_t*)DCMIPP->P0STM0AR;
-    case DCMIPP_PIPE1: return (uint8_t*)DCMIPP->P1STM0AR;
-    case DCMIPP_PIPE2: return (uint8_t*)DCMIPP->P2STM0AR;
+    case DCMIPP_PIPE0: return (uint8_t*)DCMIPP->P0STM0AR;   /* not buffered */
+    case DCMIPP_PIPE1: return (_camera_main_done != NULL)
+                            ? _camera_main_done
+                            : (uint8_t*)DCMIPP->P1STM0AR;
+    case DCMIPP_PIPE2: return (_camera_ancillary_done != NULL)
+                            ? _camera_ancillary_done
+                            : (uint8_t*)DCMIPP->P2STM0AR;
     default:           return NULL;
   }
 }
@@ -1467,6 +1496,12 @@ static ISP_StatusTypeDef _camera_pipe_stop(DCMIPP_HandleTypeDef *phdcmipp, uint3
     return ISP_ERR_DCMIPP_STOP;
   }
 
+  /* Forget which buffer held a whole frame: after a stop the pipe may restart
+   * on either one, and a reader that got the stale answer would be looking at
+   * a picture from before the stop with nothing to say so. */
+  if (pipe == DCMIPP_PIPE1) { _camera_main_done      = NULL; }
+  if (pipe == DCMIPP_PIPE2) { _camera_ancillary_done = NULL; }
+
   /* Handle overrun */
   if ((phdcmipp->ErrorCode != 0) || (phdcmipp->State != HAL_DCMIPP_STATE_READY))
   {
@@ -1588,8 +1623,44 @@ static ISP_StatusTypeDef _camera_pipe_get_scale_config(DCMIPP_CropConfTypeDef *c
     return ISP_ERR_DCMIPP_CONFIGPIPE;
   }
 
-  crop->HSize   = (uint32_t)MIN(camera.sensor.width, ratio * hpipe->width);
-  crop->VSize   = (uint32_t)MIN(camera.sensor.height, ratio * hpipe->height);
+  /* The ancillary pipe takes the WHOLE sensor, not a centred crop of it
+   * (ScopusQA #25).
+   *
+   * The rule above — one ratio for both axes, the smaller one, centred — keeps
+   * a pipe's aspect equal to the sensor's by throwing away whatever does not
+   * fit. That is right for the preview, whose 800x600 already matches
+   * 2592x1944. It is wrong for the ancillary pipe, because that pipe is not a
+   * picture anybody looks at: it is the detector's entire input, and it is
+   * square. Under the common rule 256x256 asked for a 1944x1944 centre crop,
+   * so the network was shown the middle 75 % of the frame and the left and
+   * right eighths of every scene were invisible to it — while the operator,
+   * the overlay, the UVC stream and every uploaded photo showed them in full.
+   * A person could stand in the picture, on the screen, and never be counted.
+   *
+   * Measured on the bench before this change: `frame grab` reported
+   * `nn-area 324,0 1944x1944` against `main-area 0,0 2592x1944`.
+   *
+   * The cost is that 4:3 is squeezed into 1:1, so a person reaches the network
+   * about a quarter narrower than life. That is not a new risk: it is exactly
+   * the geometry `frame upload` has always used, which is to say the geometry
+   * every number in the ScopusQA image set was measured through. The same
+   * frames the live path lost were found through it at 0.84-0.90 confidence.
+   * (Letterboxing 2592x1944 into 256x192 inside the 256x256 input would keep
+   * the aspect as well as the field of view — 10.125 on both axes, exactly —
+   * but it moves the padding into the NN input assembly and out of the boxes'
+   * coordinate space, so it is a separate change.)
+   *
+   * The display transform needs no counterpart: it maps NN box coordinates
+   * through `camera.ancillary.sensor` to `camera.main.sensor`, and those two
+   * become the same rectangle here. */
+  const bool whole_sensor = (pipe == DCMIPP_PIPE2);
+
+  crop->HSize   = whole_sensor
+                ? camera.sensor.width
+                : (uint32_t)MIN(camera.sensor.width, ratio * hpipe->width);
+  crop->VSize   = whole_sensor
+                ? camera.sensor.height
+                : (uint32_t)MIN(camera.sensor.height, ratio * hpipe->height);
   crop->HStart  = (camera.sensor.width - crop->HSize + 1) / 2;
   crop->VStart  = (camera.sensor.height - crop->VSize + 1) / 2;
   crop->PipeArea= DCMIPP_POSITIVE_AREA;
@@ -1970,11 +2041,27 @@ extern void HAL_DCMIPP_PIPE_FrameEventCallback(DCMIPP_HandleTypeDef *phdcmipp, u
     case DCMIPP_PIPE1:
       stat_freq_count(STAT_FREQ_CAMERA, 1U);
       ISP_IncMainFrameId(&hisp);
+      #if CAMERA_MAIN_BUFFER_NUM > 1U
+      /* The frame that just completed is the buffer the DCMIPP has now moved
+       * OFF — see _camera_main_done. */
+      _camera_main_done =
+        ((uint8_t*)DCMIPP->P1STM0AR == _camera_main_buffer[0])
+          ? _camera_main_buffer[1] : _camera_main_buffer[0];
+      #else
+      _camera_main_done = _camera_main_buffer[0];
+      #endif
       event = CAMERA_EVT_FRAME_MAIN;
       break;
 
     case DCMIPP_PIPE2:
       ISP_IncAncillaryFrameId(&hisp);
+      #if CAMERA_ANCILLARY_BUFFER_NUM > 1U
+      _camera_ancillary_done =
+        ((uint8_t*)DCMIPP->P2STM0AR == _camera_ancillary_buffer[0])
+          ? _camera_ancillary_buffer[1] : _camera_ancillary_buffer[0];
+      #else
+      _camera_ancillary_done = _camera_ancillary_buffer[0];
+      #endif
       event = CAMERA_EVT_FRAME_ANCILLARY;
       break;
 

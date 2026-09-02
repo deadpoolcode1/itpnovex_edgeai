@@ -1,6 +1,123 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-08-30. Everything below was measured on the bench, not inferred.
+Last updated: 2026-09-02. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-09-02 — the detector was not looking at the picture (ScopusQA #25)
+
+ITP: "the person is not identified when his head is at the top of the picture.
+After lowering the image, he is identified." Two scenes, a man behind a fence
+and two people walking, each photographed by the camera twice — once with the
+print high in the frame, once lower. High: `People: 0`, or people found with
+their heads outside the box. Lower: found, boxes correct.
+
+### Height in the frame is not the variable
+
+The first thing to settle was whether the network cares where in a picture a
+person stands. It does not. One person composited at the top, middle and bottom
+of an 800x600 canvas, pushed in with `frame upload`:
+
+| position | found | box |
+|---|---|---|
+| top | 2, conf 0.88 | y 0.03-0.53 |
+| middle | 2, conf 0.88 | y 0.22-0.72 |
+| bottom | 2, conf 0.88 | y 0.42-0.92 |
+
+Identical answers, box following the people. So the report was not about
+position, and the next question was whether it was about the picture at all.
+
+### The same pixels, found
+
+ITP's own screenshots are the camera's preview output, so they are exactly what
+the camera produced at the moment it failed. Cropping the video area out of
+them and pushing it back into the same network:
+
+| ITP's frame | live, as reported | injected, same pixels |
+|---|---|---|
+| fence, print high | 0 people | **1, conf 0.50**, box y 0.21-0.99 |
+| fence, print low | 1, conf 0.63 | 1, conf 0.50 |
+| two people, print high | 2, boxes start at y 0.38 — below the heads | **2, conf 0.90/0.84**, boxes y 0.11-0.97 — including the heads |
+| two people, print low | 2, conf 0.84/0.88 | 2, conf 0.88/0.84 |
+
+Same network, same pixels, different answers. So nothing was wrong with the
+picture or with the detector: something between the camera and the network was
+losing part of the frame. That is a question no view of the system could answer,
+because every view shows the detector's *answer* — boxes, counts, overlay — and
+none of them shows its *input*.
+
+### `frame grab` — the missing view
+
+`frame grab [nn|live]` streams the picture out over CDC as base64;
+`n6cam-grab-frame.py --source nn|live` saves it as a PNG. `nn` is the ancillary
+buffer, the exact bytes memcpy'd into the network's input. `live` is the main
+pipe, what the screen shows. It also prints the geometry, which is the part that
+mattered:
+
+```
+frame grab: sensor 2592x1944  nn-area 324,0 1944x1944  main-area 0,0 2592x1944
+```
+
+### Defect 1 — a quarter of the frame's width was invisible to the detector
+
+`_camera_pipe_get_scale_config` gives every pipe the largest centred crop with
+the sensor's aspect ratio. For the 800x600 preview that is the whole sensor, so
+the screen is honest. For the **square** 256x256 ancillary pipe it is a
+1944x1944 centre crop: the network was shown the middle 75 % of the picture and
+the left and right eighths of every scene were invisible to it, while the
+operator, the UVC stream and every uploaded photo showed them in full. A person
+could stand in the picture, on the screen, and never be counted, and nothing
+anywhere said so.
+
+The ancillary pipe now takes the whole sensor. Verified on the device:
+
+```
+frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  main-area 0,0 2592x1944
+```
+
+The cost is that 4:3 is squeezed into 1:1, so a person reaches the network about
+a quarter narrower than life. That is not new risk — it is precisely the
+geometry `frame upload` has always used, which is to say the geometry every
+number in the ScopusQA image set was measured through, and the frames the live
+path lost are found through it at 0.84-0.90. On the ScopusQA #17 car it is an
+improvement, not a cost: `truck 0.81` where the centre crop gave `truck 0.55`.
+
+Letterboxing 2592x1944 into 256x192 inside the 256x256 input would keep the
+aspect ratio as well as the field of view — 10.125 on both axes, exactly — and
+is the better answer eventually. It moves padding into the NN input assembly and
+out of the boxes' coordinate space, so it is a separate change.
+
+### Defect 2 — the reader could catch a frame mid-write
+
+Both pipes run double-buffered, and `camera_get_buffer` returned
+`DCMIPP->PxSTM0AR` — a *status* register, naming the buffer the DCMIPP is
+filling. A reader handed that gets the top of the picture from the new frame and
+the bottom from the one before it, spliced wherever the DMA had reached. On a
+still scene the halves are identical and nothing shows; on anything moving —
+which is what ITP was doing, sliding the print up and down — the frame is torn,
+and a torn person is one the detector may find only the intact half of.
+
+The frame-end callback now records the buffer the hardware has moved *off*, and
+that is what readers get. `frame grab` prints both so the invariant is checkable
+on any unit:
+
+```
+frame grab: buffer 0x90030000, pipe filling 0x90000000
+```
+
+If those are ever equal the line says `SAME: this frame may be torn`.
+
+That the register really is a moving target, rather than the constant base
+address it could have been, is worth not arguing about — `frame grab probe`
+samples it, and on the bench:
+
+```
+frame grab probe: pipe2 status reg, 60 samples — 33 at 0x90000000, 27 at 0x90030000
+frame grab probe: nn reads 0x90030000
+```
+
+Half and half, which is the double buffer alternating at 30 Hz. So the old code
+handed the network the buffer being written roughly every other frame.
 
 ---
 

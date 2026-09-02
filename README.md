@@ -77,7 +77,8 @@ wait
 | `photo savesd` / `photo upload` | Capture JPEG → SD card (`savesd`) or modem (`upload`, needs WP76). Filename `serial_DDMMYYYY_HHMMSS.rdy`. |
 | `recovery` | Reboot into FSBL recovery halt (limited use on this kit — debug auth locks SWD in op mode regardless). |
 | `update [app\|model]` | Receive new App firmware (default) or NN model weights over CDC and reflash xSPI. Used by `n6cam-update.py` — you won't run this by hand. |
-| `frame upload\|load\|run\|clear\|query` | Test-frame injection — push a 192×192 RGB image into the NN input from the host, run inference, read back detections. Used by the regression suite to validate the algorithm without depending on the lens. |
+| `frame upload\|load\|run\|clear\|query` | Test-frame injection — push a 256×256 RGB image into the NN input from the host, run inference, read back detections. Used by the regression suite to validate the algorithm without depending on the lens. |
+| `frame grab [nn\|live]` | Dump the picture the detector is actually looking at — `nn` is the network's own 256×256 input, `live` is the 800×600 preview — plus both pipes' effective sensor areas. Driven by `n6cam-grab-frame.py`. The one view that says whether a missed object was missed or never shown (ScopusQA #25). |
 | `tile grid\|crop\|frame\|overlap\|thresh\|upload\|run\|live\|query\|clear\|default` | Tiled multi-crop detection (see [§6 Long-range mode](#tiled-multi-crop-detection-long-range--low-power-mode)). `run` sweeps a host-uploaded high-res frame; `live [n]` sweeps the live camera; `default` restores factory tile settings. Driven by `n6cam-tile.py`. |
 | `sd query\|ls\|format CONFIRM` | SD card status, root listing, destructive reformat (FAT32). |
 
@@ -252,7 +253,8 @@ Everything upstream (grid size, crop size, overlap, confidence/IoU thresholds) i
 ```
 modular-tools.sh           # one-liner workflows: setup / build / flash / update [app|model] / test / demo-* / doctor
 n6cam-update.py            # host-side self-update script (CDC, supports --target app|model)
-n6cam-inject-frame.py      # host-side test-frame inject (any image → 192x192 RGB → NN)
+n6cam-inject-frame.py      # host-side test-frame inject (any image → 256x256 RGB → NN)
+n6cam-grab-frame.py        # save what the detector sees: the NN input or the live preview, as PNG
 n6cam-regress.py           # standalone batch detection-regression script (older; superseded by tests/run_tests.py)
 n6cam-prep-tests.py        # convert folder of images → .raw files for SD-based testing
 tests/

@@ -466,7 +466,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
-  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | report on|off | clear | query] - inject test frame into NN" },
+  {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | report on|off | grab [nn|live] | clear | query] - inject test frame into NN; grab dumps what the detector sees" },
   {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|fullpass on|off|edgedrop on|off|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | relink | test wedge [baud] | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
@@ -1981,6 +1981,156 @@ static int32_t _frame_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
    * find it in a console that is also printing notifications. The geometry line
    * carries both pipes' effective sensor areas, which is what makes the two
    * pictures comparable rather than merely both present. */
+  /* frame grab probe [n] — sample the pipes' buffer status registers.
+   *
+   * `camera_get_buffer` hands out the frame that has finished rather than the
+   * one the DCMIPP is filling, and it decides which is which from
+   * `PxSTM0AR` — a status register. This says whether that register actually
+   * moves: if it alternates between the two buffer bases the decision is
+   * sound, and if it never moves the pipe is effectively single-buffered and
+   * the reader can still catch a write in progress. Worth being able to
+   * answer on any unit rather than reasoning about it from the manual. */
+  if ((strcmp(sub, "grab") == 0) && (argc >= 3U) &&
+      (strcmp((const char*)argv[2], "probe") == 0))
+  {
+    uint32_t n = (argc >= 4U) ? (uint32_t)strtoul((const char*)argv[3], NULL, 10)
+                              : 40U;
+    if (n == 0U)   { n = 1U;   }
+    if (n > 200U)  { n = 200U; }
+
+    const uint32_t first = DCMIPP->P2STM0AR;
+    uint32_t       same  = 0U;
+    uint32_t       other = 0U;
+    uint32_t       other_val = 0U;
+
+    for (uint32_t i = 0U; i < n; i++)
+    {
+      uint32_t v = DCMIPP->P2STM0AR;
+      if (v == first) { same++; }
+      else            { other++; other_val = v; }
+      HAL_Delay(7U);            /* ~4 samples per 30 Hz frame period */
+    }
+
+    CMD_PRINTF(stream, "frame grab probe: pipe2 status reg, %lu samples — "
+                       "%lu at 0x%08lx, %lu at 0x%08lx%s",
+               (unsigned long)n, (unsigned long)same, (unsigned long)first,
+               (unsigned long)other, (unsigned long)other_val,
+               lwshell_eol());
+    CMD_PRINTF(stream, "frame grab probe: nn reads %p%s",
+               (void*)camera_get_buffer(camera.ancillary.id), lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  if (strcmp(sub, "grab") == 0)
+  {
+    static const char b64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static char line[520];
+
+    const bool     live = (argc >= 3U) &&
+                          (strcmp((const char*)argv[2], "live") == 0);
+    const uint8_t *src  = NULL;
+    uint32_t       w    = 0U, h = 0U;
+
+    if (live)
+    {
+      uint16_t fw = 0U, fh = 0U;
+      src = tile_capture_live(&fw, &fh);   /* invalidates + expands to RGB888 */
+      w   = fw;
+      h   = fh;
+    }
+    else
+    {
+      src = camera_get_buffer(camera.ancillary.id);
+      w   = CAMERA_ANCILLARY_WIDTH;
+      h   = CAMERA_ANCILLARY_HEIGHT;
+      if (src != NULL)
+      {
+        /* The pipe DMAs into PSRAM behind the D-cache — the same invalidate
+         * the NN task does before its own memcpy, for the same reason. */
+        SCB_InvalidateDCache_by_Addr((uint32_t*)src,
+                                     (int32_t)CAMERA_ANCILLARY_BUFFER_SIZE);
+      }
+    }
+
+    if (src == NULL)
+    {
+      CMD_PRINTF(stream, "frame grab: no camera buffer — is the camera "
+                         "streaming?%s", lwshell_eol());
+      return LWSHELL_OK;
+    }
+
+    const uint32_t bytes = w * h * 3U;
+
+    CMD_PRINTF(stream, "frame grab: %s %lux%lu rgb888 %lu bytes%s",
+               live ? "live" : "nn",
+               (unsigned long)w, (unsigned long)h, (unsigned long)bytes,
+               lwshell_eol());
+    CMD_PRINTF(stream,
+               "frame grab: sensor %lux%lu  nn-area %lu,%lu %lux%lu  "
+               "main-area %lu,%lu %lux%lu%s",
+               (unsigned long)camera.sensor.width,
+               (unsigned long)camera.sensor.height,
+               (unsigned long)camera.ancillary.sensor.x,
+               (unsigned long)camera.ancillary.sensor.y,
+               (unsigned long)camera.ancillary.sensor.width,
+               (unsigned long)camera.ancillary.sensor.height,
+               (unsigned long)camera.main.sensor.x,
+               (unsigned long)camera.main.sensor.y,
+               (unsigned long)camera.main.sensor.width,
+               (unsigned long)camera.main.sensor.height,
+               lwshell_eol());
+    /* Which buffer this came out of, and which one the DCMIPP is filling.
+     * They must differ: equal means the picture was read out from under the
+     * DMA and can be a splice of two frames (ScopusQA #25). */
+    if (!live)
+    {
+      CMD_PRINTF(stream, "frame grab: buffer %p, pipe filling %p%s%s",
+                 (void*)src, (void*)DCMIPP->P2STM0AR,
+                 ((uint32_t)(uintptr_t)src == DCMIPP->P2STM0AR)
+                   ? "  <- SAME: this frame may be torn" : "",
+                 lwshell_eol());
+    }
+    CMD_PRINTF(stream, "frame grab: begin%s", lwshell_eol());
+
+    /* 384 source bytes -> 512 base64 chars, so every line is whole triples and
+     * fits inside SHELL_OUT_SIZE with room for the CRLF. */
+    for (uint32_t off = 0U; off < bytes; off += 384U)
+    {
+      uint32_t n = ((bytes - off) < 384U) ? (bytes - off) : 384U;
+      uint32_t o = 0U;
+      uint32_t i;
+
+      for (i = 0U; (i + 2U) < n; i += 3U)
+      {
+        uint32_t v = ((uint32_t)src[off + i] << 16) |
+                     ((uint32_t)src[off + i + 1U] << 8) |
+                      (uint32_t)src[off + i + 2U];
+        line[o++] = b64[(v >> 18) & 0x3FU];
+        line[o++] = b64[(v >> 12) & 0x3FU];
+        line[o++] = b64[(v >>  6) & 0x3FU];
+        line[o++] = b64[ v        & 0x3FU];
+      }
+      if (i < n)                              /* 1 or 2 bytes left over       */
+      {
+        uint32_t rem = n - i;
+        uint32_t v   = (uint32_t)src[off + i] << 16;
+        if (rem == 2U) { v |= (uint32_t)src[off + i + 1U] << 8; }
+        line[o++] = b64[(v >> 18) & 0x3FU];
+        line[o++] = b64[(v >> 12) & 0x3FU];
+        line[o++] = (rem == 2U) ? b64[(v >> 6) & 0x3FU] : '=';
+        line[o++] = '=';
+      }
+      line[o] = '\0';
+      CMD_PRINTF(stream, "%s%s", line, lwshell_eol());
+    }
+
+    CMD_PRINTF(stream, "frame grab: end%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
   return LWSHELL_ERROR_SYNTAX_CMD;
 }
 

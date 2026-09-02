@@ -123,7 +123,38 @@ Put the pictures in a folder and run:
 It injects each one in turn and prints what was found, by class. The results
 are written to `scopus/results/qa-image-sweep.json`.
 
-## 7. If it fails
+## 7. Seeing what the detector sees
+
+Injection answers "what would the network find in this picture". It does not
+answer "what picture is the network being given", and when the overlay
+disagrees with the screen that second question is the one that matters: a
+person who is plainly there and is not counted is either a network that missed
+them or a network that was never shown them, and those have opposite fixes.
+
+    python3 n6cam-grab-frame.py --source nn     -o nn_input.png    # the network's own input
+    python3 n6cam-grab-frame.py --source live   -o live_frame.png  # what the screen shows
+
+`--source nn` saves the 256x256 the network is handed. `--source live` saves
+the 800x600 preview. Both come off the camera as it is running; neither
+disturbs detection.
+
+Each run also prints the geometry, and that line is the point of the tool:
+
+    frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  main-area 0,0 2592x1944
+
+`nn-area` and `main-area` are the parts of the sensor the two pipes are fed
+from. **They must be the same rectangle.** When they were not — the detector
+used to be given a 1944x1944 centre crop while the screen showed all of
+2592x1944 — the left and right eighths of every scene were invisible to the
+detector and nothing anywhere said so (ScopusQA #25).
+
+    frame grab: buffer 0x90030000, pipe filling 0x90000000
+
+The picture must come from a buffer the camera is not writing into. If that
+line says `SAME`, the frame can be a splice of two frames and anything moving
+in it is torn.
+
+## 8. If it fails
 
 | What you see | What it means |
 |---|---|
