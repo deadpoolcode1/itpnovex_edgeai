@@ -62,6 +62,14 @@ event signaling.
 
 ---
 
+Inside the N6Cam, the detector and the video output are fed by two separate
+camera pipes off the one sensor, and the pair has an invariant worth stating at
+this level too: **they are fed from the same sensor rectangle**. When they were
+not, the unit reported nothing for people who were plainly on the video
+(ScopusQA #25). The pipe-level picture is
+[`docs/diagrams/detection_path.png`](docs/diagrams/detection_path.png), and
+`frame grab` on the camera shell prints both rectangles.
+
 ## 3. Signal / Interface Inventory
 
 | Signal | Direction | Owner asserts | Purpose |

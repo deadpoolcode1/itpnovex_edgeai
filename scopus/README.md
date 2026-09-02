@@ -100,6 +100,25 @@ payload parameters and restore `` ` `` → `"`". The camera splits the body into
 Group H pins that contract and **asserts on the received datagram, never on the
 AT reply** — every failure mode it guards against answers `OK`.
 
+## What the detector is looking at (ScopusQA #25)
+
+Before blaming the network for a miss, save the picture it was given. The screen
+and the network are fed by two different camera pipes, and they are not always
+showing you the same thing:
+
+```bash
+python3 n6cam-grab-frame.py --source nn    -o nn_input.png     # the network's 256x256
+python3 n6cam-grab-frame.py --source live  -o live_frame.png   # what the screen shows
+# frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  main-area 0,0 2592x1944
+# frame grab: buffer 0x90030000, pipe filling 0x90000000
+```
+
+`nn-area` and `main-area` must be the same rectangle, and `buffer` must differ
+from `pipe filling`. Until 2026-09-02 the first was false — the network got a
+1944x1944 centre crop and was blind to the left and right eighths of every
+scene — and the second could be false on any frame, which spliced two frames
+together whenever anything moved.
+
 ## Tiled detection (ScopusQA #22)
 
 `detect mode tile` sweeps a 4x3 grid of 256 px crops over the live 800x600 main

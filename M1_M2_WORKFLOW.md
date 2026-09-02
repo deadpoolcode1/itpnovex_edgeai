@@ -52,10 +52,12 @@ inferring at full speed inside ~5 seconds of reset.
 **Why this pipeline matters for the proposal milestones.**  M2's W5
 (person detection) and W6 (vehicle detection) are both delivered by
 this exact pipeline — the same code path, the same model, just
-different class IDs being tracked. The 192 × 192 input size is chosen
-to match the on-board camera ancillary buffer and keep all-ATON
-inference, which is what gets us the 25 ms / frame figure that's
-inside the W5/W6 implicit "real-time" budget.
+different class IDs being tracked. The input size is chosen to match
+the on-board camera ancillary buffer and keep all-ATON inference. This
+document describes the 192 × 192 experiment; **what ships today is
+256 × 256** — the ancillary pipe is 256 × 256 RGB888, fed from the
+whole sensor, at about 90 ms / frame. See `README.md` "What the
+detector is given" and `docs/diagrams/detection_path.png`.
 
 ---
 

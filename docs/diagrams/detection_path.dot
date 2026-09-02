@@ -1,0 +1,54 @@
+/* What the detector is given.
+ *
+ * Drawn because the thing that went wrong in ScopusQA #25 was invisible in
+ * every other view of the system: the two pipes were fed from DIFFERENT parts
+ * of the sensor, and nothing said so. Render with:
+ *
+ *     dot -Tpng docs/diagrams/detection_path.dot -o docs/diagrams/detection_path.png
+ */
+digraph detection_path {
+  rankdir=TB;
+  bgcolor="white";
+  node [fontname="Helvetica", shape=box, style="rounded,filled", fillcolor="#f6f7f9",
+        color="#8a8f98", fontsize=11];
+  edge [fontname="Helvetica", color="#5a6068", fontsize=10];
+
+  sensor [label=<<b>IMX335 sensor</b><br/>2592 x 1944>, fillcolor="#e8eef7"];
+
+  subgraph cluster_dcmipp {
+    label="DCMIPP — crop, decimate, downsize";
+    fontname="Helvetica"; fontsize=11; color="#b9bec6";
+    pipe1 [label=<<b>PIPE1 — main</b><br/>whole sensor → 800 x 600<br/>RGB565, double-buffered>];
+    pipe2 [label=<<b>PIPE2 — ancillary</b><br/>whole sensor → 256 x 256<br/>RGB888, double-buffered>, fillcolor="#eaf5ec"];
+  }
+
+  getbuf [label=<<b>camera_get_buffer()</b><br/><font point-size="10">hands out the frame that FINISHED,<br/>not the one being written</font>>,
+          shape=note, fillcolor="#fff7e0"];
+
+  nn     [label=<<b>nn_task</b><br/>ATON, yolov8n 256x256 COCO>, fillcolor="#eaf5ec"];
+  tile   [label=<<b>tile sweep</b> (detect mode tile)<br/>4x3 crops of 256 px off PIPE1<br/>+ one whole-frame pass>, fillcolor="#eaf5ec"];
+  pp     [label=<<b>post-processing</b><br/>conf floor, NMS, edgedrop,<br/>class mask, debounce>];
+  disp   [label=<<b>display_task</b><br/>overlay + H.264 → UVC>];
+  act    [label=<<b>§4.2 actions</b><br/>notify, photo, upload>];
+
+  inject [label=<<b>frame upload</b> (host)<br/>256x256 RGB888>, shape=box, style="rounded,dashed", fillcolor="white"];
+  grab   [label=<<b>frame grab</b> (host)<br/>saves either picture + both geometries>,
+          shape=box, style="rounded,dashed", fillcolor="white"];
+
+  sensor -> pipe1;
+  sensor -> pipe2;
+  pipe1  -> getbuf [style=dashed];
+  pipe2  -> getbuf [style=dashed];
+  getbuf -> nn     [label="default mode"];
+  getbuf -> tile   [label="tile mode"];
+  tile   -> nn;
+  nn     -> pp;
+  pp     -> disp;
+  pp     -> act;
+  inject -> nn     [style=dashed, label="overrides the lens"];
+  getbuf -> grab   [style=dashed, constraint=false];
+
+  note [shape=note, fillcolor="#fff7e0",
+        label=<<b>The invariant</b><br align="left"/>Both pipes are fed from the SAME sensor rectangle.<br align="left"/>`frame grab` prints it as nn-area and main-area;<br align="left"/>if they differ, the detector is blind to picture<br align="left"/>the operator can see (ScopusQA #25).<br align="left"/>>];
+  { rank=same; pipe2; note; }
+}

@@ -1211,6 +1211,44 @@ def build():
     doc.add_paragraph("Put the timeout back when you are done:")
     cmd(doc, f'{CD}python3 scopus/cam.py "motion sense 50 30"')
 
+    doc.add_heading("20. When the camera sees it and the count does not",
+                    level=1)
+    doc.add_paragraph(
+        "Sooner or later you will look at the live picture, see a person "
+        "plainly, and see the counter say 0. Before reporting it, take one "
+        "extra picture: the one the neural network is being given. It is not "
+        "the same picture as the one on your screen, and knowing which of "
+        "the two is wrong is most of the answer.")
+    cmd(doc, f"{CD}python3 n6cam-grab-frame.py --source nn -o nn_input.png")
+    expected(doc)
+    code(doc,
+         "frame grab: nn 256x256 rgb888 196608 bytes\n"
+         "frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  "
+         "main-area 0,0 2592x1944\n"
+         "frame grab: buffer 0x90030000, pipe filling 0x90000000\n"
+         "wrote nn_input.png (256x256)")
+    doc.add_paragraph(
+        "Open nn_input.png. That is exactly what the network saw. Two lines "
+        "in the output matter as much as the picture:")
+    table(doc,
+          ["Line", "What it must say"],
+          [["nn-area / main-area",
+            "The same rectangle. They are the parts of the sensor the "
+            "network and the screen are fed from. If they differ, there is "
+            "picture you can see and the network cannot."],
+           ["buffer / pipe filling",
+            "Two different addresses. If the line says SAME, the picture is "
+            "half of one frame and half of the next, and anything moving in "
+            "it is torn."]])
+    doc.add_paragraph(
+        "You can also save what the screen shows, for comparison:")
+    cmd(doc, f"{CD}python3 n6cam-grab-frame.py --source live -o live_frame.png")
+    note(doc,
+         "Attach both PNGs to the report. A missed person is either a "
+         "network that was wrong about the picture or a network that was "
+         "never shown it, and those have different fixes — these two files "
+         "say which, in one step.")
+
     doc.save(OUT)
     print(f"wrote {OUT}")
 

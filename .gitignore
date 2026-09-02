@@ -90,6 +90,11 @@ results/soak-*/*.html
 results/soak-*/*.pdf
 results/soak-*/*_artifacts/
 
+# Local test reports. Regenerable, and `master` is what ships to the customer
+# repo — these were deleted from it on purpose once already, so keep a stray
+# `git add` from putting them back.
+results/test-report-*
+
 # LibreOffice lock files
 .~lock*#
 

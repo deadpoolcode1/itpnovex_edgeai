@@ -209,6 +209,40 @@ People and vehicle classes both fire end-to-end via `nn_task.c::_class_passes_ma
 
 The full pipeline for producing a custom model is committed under `tools/quantize_yolov8n.py` (ONNX Runtime static quantization with COCO128 calibration). What's blocking production multi-class today is **model accuracy after PTQ** — Ultralytics' post-training quantization on `yolov8n.pt` collapses confidence scores when fed through `stedgeai → ATON → vendor's app_postprocess_od_yolov8`. Production-grade accuracy requires either QAT (quantization-aware training on a GPU) or a vendor-blessed multi-class N6 model from ST. See `tests/README.md` for the experimental results and what each variant produced.
 
+### What the detector is given
+
+Two DCMIPP pipes run off the one sensor and they feed different things:
+
+| Pipe | Feeds | Size | Format |
+|---|---|---|---|
+| PIPE1 "main" | preview, UVC stream, overlay, uploaded photos | 800×600 | RGB565 |
+| PIPE2 "ancillary" | the network, and nothing else | 256×256 | RGB888 |
+
+**Both are fed from the whole sensor**, and that is an invariant worth checking
+first whenever the overlay disagrees with the screen. If the detector's
+rectangle is smaller than the preview's there is picture the operator can see
+and the detector cannot, and no amount of looking at boxes will say so — the
+ancillary pipe took a 1944×1944 centre crop of the 2592×1944 sensor until
+2026-09-02, so the left and right eighths of every scene were invisible to it
+(ScopusQA #25).
+
+```bash
+python3 n6cam-grab-frame.py --source nn    -o nn_input.png     # the network's own input
+python3 n6cam-grab-frame.py --source live  -o live_frame.png   # what the screen shows
+# frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  main-area 0,0 2592x1944
+# frame grab: buffer 0x90030000, pipe filling 0x90000000
+```
+
+The second line is the other invariant: both pipes are double-buffered, so a
+reader that asks the hardware which buffer it is *using* gets one that is half
+written. `camera_get_buffer()` hands out the buffer the DCMIPP has finished
+with. `frame grab probe` samples the register if you need to confirm the pipe
+really is alternating.
+
+See [`docs/diagrams/detection_path.png`](docs/diagrams/detection_path.png) for
+the whole path, including where an injected test frame joins it, and
+[`docs/QA_inject_image.md`](docs/QA_inject_image.md) for the QA workflow.
+
 ### Tiled multi-crop detection (long-range / low-power mode)
 
 The NPU input is a **fixed 256×256**, but the sensor is far larger (multi-megapixel). Feeding a whole frame to the detector means downscaling it ~10× on each axis, so a person far from the camera collapses to a handful of pixels — below the ~40 px-on-target a detector needs to fire, and they are simply missed.

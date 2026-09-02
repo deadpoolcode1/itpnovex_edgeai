@@ -125,6 +125,43 @@ The firmware is **ThreadX**-based with each subsystem in its own task. Producer/
                             └───────────┘     └──────────────┘
 ```
 
+### 2.2 What the detector is given
+
+Two DCMIPP pipes run off the one sensor, and they are **not** interchangeable:
+
+| Pipe | Feeds | Size | Format |
+|---|---|---|---|
+| PIPE1 "main" | preview, UVC stream, overlay, uploaded photos | 800 x 600 | RGB565 |
+| PIPE2 "ancillary" | the neural network, and nothing else | 256 x 256 | RGB888 |
+
+**Both are fed from the whole sensor.** That is an invariant, not an incidental
+fact, and it is the one worth checking first whenever the overlay and the screen
+disagree: if the detector's rectangle is smaller than the preview's, there is
+picture the operator can see and the detector cannot, and no view of the boxes
+will ever say so. It was wrong once — the ancillary pipe took a 1944x1944 centre
+crop of a 2592x1944 sensor, so the left and right eighths of every scene were
+invisible to the network (ScopusQA #25).
+
+`frame grab` prints both rectangles, and saves either picture:
+
+```bash
+python3 n6cam-grab-frame.py --source nn    -o nn_input.png     # the network's own input
+python3 n6cam-grab-frame.py --source live  -o live_frame.png   # what the screen shows
+# frame grab: sensor 2592x1944  nn-area 0,0 2592x1944  main-area 0,0 2592x1944
+# frame grab: buffer 0x90030000, pipe filling 0x90000000
+```
+
+The second line is the other invariant. Both pipes are double-buffered, so a
+reader that asks the hardware which buffer it is *using* gets one that is half
+written — the top of the new frame spliced onto the bottom of the previous one.
+Invisible on a still scene, torn on anything moving. `camera_get_buffer()` hands
+out the buffer the DCMIPP has finished with; `frame grab probe` samples the
+status register if you ever need to confirm the pipe really is alternating.
+
+The whole path, including where an injected frame joins it:
+
+![Detection path](docs/diagrams/detection_path.png)
+
 ---
 
 ## 3.  Protocols
@@ -436,3 +473,12 @@ What it does:
 | **`v1.5.0-m3-cellular-plane`** | **M3 part 1: HDLC + mdm + SoW §8.2 photo upload (this doc)** |
 
 `git log --oneline | head -20` for individual commits.
+
+---
+
+*This document is the source. `docs/docx/INTEGRATION_DOC.docx` is generated from
+it and is regenerated, not edited:*
+
+```bash
+pandoc INTEGRATION_DOC.md -o docs/docx/INTEGRATION_DOC.docx --resource-path=.:docs
+```
