@@ -559,6 +559,37 @@ static float _inside_of(const t_tile_det *a, const t_tile_det *b)
   return (area_a > 0.0f) ? ((iw * ih) / area_a) : 0.0f;
 }
 
+/* Two fragments of the same object, cut apart by the same seam.
+ *
+ * Containment cannot answer this. Each half of a car cut down the middle holds
+ * only the seam's width of the other, so neither is inside the other and both
+ * would be promoted: one car counted twice. What does distinguish the halves
+ * of one object from two objects standing side by side is that the halves
+ * OVERLAP ALONG THE SEAM and line up across it - they share almost all of
+ * their height when the seam is vertical, almost all of their width when it is
+ * horizontal - while two neighbours cut by the same seam do not overlap at all.
+ *
+ * So: the boxes must touch, and along one axis one must cover most of the
+ * other. */
+#define TILE_STITCH_FRAC  0.60f
+
+static bool _stitches_with(const t_tile_det *a, const t_tile_det *b)
+{
+  const float ox = ((a->x2 < b->x2) ? a->x2 : b->x2)
+                 - ((a->x1 > b->x1) ? a->x1 : b->x1);
+  const float oy = ((a->y2 < b->y2) ? a->y2 : b->y2)
+                 - ((a->y1 > b->y1) ? a->y1 : b->y1);
+  if ((ox <= 0.0f) || (oy <= 0.0f)) return false;   /* they do not even touch */
+
+  const float aw = a->x2 - a->x1, bw = b->x2 - b->x1;
+  const float ah = a->y2 - a->y1, bh = b->y2 - b->y1;
+  const float min_w = (aw < bw) ? aw : bw;
+  const float min_h = (ah < bh) ? ah : bh;
+
+  return ((min_h > 0.0f) && ((oy / min_h) >= TILE_STITCH_FRAC))
+      || ((min_w > 0.0f) && ((ox / min_w) >= TILE_STITCH_FRAC));
+}
+
 /* How much of a fragment has to sit inside a counted box before that box is
  * taken to explain it. Half is deliberately lenient: the tile cuts wherever
  * the grid falls, so a piece can stick out past the whole object's box on the
@@ -577,8 +608,8 @@ static float _inside_of(const t_tile_det *a, const t_tile_det *b)
  *
  * So: walk the surviving fragments, most confident first. If a counted box of
  * the same class already covers one, it is explained and stays uncounted. If
- * nothing does, promote it, and then let it explain its own siblings, so the
- * two halves of one person become one person and not two. */
+ * nothing does, promote it, and stitch its siblings into it, so the pieces of
+ * one object become one object and not two. */
 static void _rescue_fragments(uint32_t n)
 {
   for (;;)
@@ -610,6 +641,24 @@ static void _rescue_fragments(uint32_t n)
     if (best == n) break;          /* nothing left that needs rescuing */
 
     _sw_dets[best].keep = true;    /* this piece now stands for the object */
+
+    /* Stitch the rest of the object into it: every other fragment cut by the
+     * same seam is retired into this one, and the box grows to cover them, so
+     * the count is one and the overlay frames the whole object rather than the
+     * piece that happened to be the most confident. */
+    for (uint32_t j = 0U; j < n; j++)
+    {
+      t_tile_det *sib = &_sw_dets[j];
+      if ((j == best) || !sib->sustain || !sib->frag || sib->keep) continue;
+      if (sib->cls != _sw_dets[best].cls) continue;
+      if (!_stitches_with(sib, &_sw_dets[best])) continue;
+
+      if (sib->x1 < _sw_dets[best].x1) _sw_dets[best].x1 = sib->x1;
+      if (sib->y1 < _sw_dets[best].y1) _sw_dets[best].y1 = sib->y1;
+      if (sib->x2 > _sw_dets[best].x2) _sw_dets[best].x2 = sib->x2;
+      if (sib->y2 > _sw_dets[best].y2) _sw_dets[best].y2 = sib->y2;
+      sib->sustain = false;        /* accounted for; not a detection of its own */
+    }
   }
 }
 
