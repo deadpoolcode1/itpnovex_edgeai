@@ -82,10 +82,31 @@ number in the ScopusQA image set was measured through, and the frames the live
 path lost are found through it at 0.84-0.90. On the ScopusQA #17 car it is an
 improvement, not a cost: `truck 0.81` where the centre crop gave `truck 0.55`.
 
-Letterboxing 2592x1944 into 256x192 inside the 256x256 input would keep the
-aspect ratio as well as the field of view — 10.125 on both axes, exactly — and
-is the better answer eventually. It moves padding into the NN input assembly and
-out of the boxes' coordinate space, so it is a separate change.
+That claim was worth more than four frames, because on one of ITP's four the
+squash lost a detection the centre crop kept. So all 41 ScopusQA scenes were run
+through all three candidate geometries, each scene first fitted to 4:3 and
+800x600 the way the camera would see it, then pushed in with `frame upload`:
+
+* **A** — whole sensor squashed into the square input (what shipped)
+* **B** — square centre crop (what it did before)
+* **C** — whole sensor letterboxed into 256x192 inside 256x256, aspect kept
+
+| | A | B | C |
+|---|---|---|---|
+| exact count, of the 25 scenes whose name states one | **8** | 5 | **8** |
+| total absolute count error over those 25 | **32** | 33 | 33 |
+| scenes with any detection at all, of 41 | 36 | 38 | **39** |
+
+So the squash costs nothing on the set: A is better than B on exact counts and
+no worse on error, while also handing back a quarter of the frame's width. The
+one frame that looked like a regression does not generalise — on ITP's own
+`person behind a short fence`, A finds 2, B finds 1 and C finds 0.
+
+Letterboxing keeps the aspect ratio as well as the field of view (10.125 on both
+axes, exactly) and is the textbook input for a YOLO, but it does not earn its
+cost here: identical exact counts, one point worse on error, and it moves
+padding into the NN input assembly and out of the boxes' coordinate space. Left
+undone deliberately, with the numbers above as the reason.
 
 ### Defect 2 — the reader could catch a frame mid-write
 
