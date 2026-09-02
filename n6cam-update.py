@@ -147,6 +147,16 @@ def main() -> int:
             ser.write(buf)
             ser.flush()
 
+        def read_for(seconds: float, until=None) -> bytes:
+            got = b""
+            end = time.time() + seconds
+            while time.time() < end:
+                got += ser.read(4096)
+                if until and any(u in got for u in until):
+                    break
+                time.sleep(0.05)
+            return got
+
         def close_port():
             ser.close()
     else:
@@ -169,13 +179,44 @@ def main() -> int:
                 except BlockingIOError:
                     time.sleep(0.001)
 
+        def read_for(seconds: float, until=None) -> bytes:
+            got = b""
+            end = time.time() + seconds
+            while time.time() < end:
+                try:
+                    got += os.read(fd, 4096)
+                except BlockingIOError:
+                    pass
+                if until and any(u in got for u in until):
+                    break
+                time.sleep(0.05)
+            return got
+
         def close_port():
             os.close(fd)
 
     try:
-        # Trigger the shell 'update [app|model]' command.
+        # Trigger the shell 'update [app|model]' command, and WAIT for the
+        # device to say it is listening.
+        #
+        # This used to be a fixed 0.5 s pause. When the shell was a beat slow
+        # to arm - it had just been asked to stop detection, or it was still
+        # draining a sweep - the header and the whole image landed in the line
+        # parser instead of the receiver, nothing was written, and this tool
+        # printed "Sent 772576 bytes" and exited 0. A flash that silently does
+        # not happen is worse than one that fails, because the next thing
+        # anyone does is measure the old firmware and believe it is the new
+        # one. Two hours went that way on 2026-09-02.
+        read_for(0.3)                       # drop whatever was already queued
         write_all(f"\nupdate {args.target}\n".encode())
-        time.sleep(0.5)
+        banner = read_for(5.0, until=(b"Ready", b"ERROR"))
+        if b"Ready" not in banner:
+            tail = banner.decode(errors="replace").strip()[-200:]
+            print("Device never armed for the update. It answered:")
+            print(f"  {tail!r}" if tail else "  nothing at all")
+            print("The image was NOT written. If the port is silent, the CDC "
+                  "endpoint is wedged: reset the USB device and retry.")
+            return 1
         write_all(b"UPDT" + struct.pack("<II", size, crc))
 
         CHUNK = 4096
@@ -190,11 +231,26 @@ def main() -> int:
                       f"{rate:.0f} KB/s)")
         dt = time.time() - t0
         print(f"Sent {size} bytes in {dt:.1f}s ({size/dt/1024:.0f} KB/s). "
-              f"Device will erase+write+reboot — model can take ~90s, "
-              f"app ~5s.")
+              f"Waiting for the device to erase, write and reboot.")
+
+        # Wait for the device's own account of it. A model image erases and
+        # writes 16 MB and can take ~90 s; an app is a few seconds.
+        wait = 150.0 if args.target == "model" else 45.0
+        report = read_for(wait, until=(b"Resetting", b"ERROR", b"CRC mismatch"))
+        text = report.decode(errors="replace")
+        for line in text.splitlines():
+            if line.strip():
+                print(f"  {line.strip()}")
+        if b"Resetting" not in report:
+            print("The device did not report a completed write. Check it with "
+                  "'version' before trusting what is on it.")
+            return 1
     finally:
         close_port()
 
+    print("Flashed. Note that 'version' only changes its Build stamp when "
+          "shell_task.c is itself recompiled, so use it to check the kit is "
+          "alive, not to tell two builds apart.")
     return 0
 
 
