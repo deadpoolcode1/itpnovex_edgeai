@@ -36,13 +36,32 @@
 #define TILE_DEF_CONF       0.45f
 #define TILE_DEF_IOU        0.40f
 
-/* Live-pipe geometry — ScopusQA #22: 12 tiles, 3 rows x 4 columns. The crop is
- * the NN's own side, so a tile is carried into the network at 1:1 with no
- * resampling loss; 4x256 = 1024 over 800 px and 3x256 = 768 over 600 px, so
- * auto-overlap covers the frame with ~75 px of margin on each seam. */
+/* Live-pipe geometry — ScopusQA #22: 12 tiles, 3 rows x 4 columns.
+ *
+ * The crop was TILE_NN_SIDE, so a tile went into the network at 1:1 with no
+ * resampling loss. That is the better tile in isolation and the worse sweep,
+ * because 4x256 over 800 px and 3x256 over 600 px leave only ~75 px of overlap
+ * on a seam. A person standing on one is cut by the grid, both halves are
+ * discarded by the edge rule that #24 needs, and which side of the line they
+ * fall on changes with a fraction of a pixel of camera tremor. The count then
+ * moves on a scene that has not, and every move is a notification.
+ *
+ * 320 px keeps the same 12 tiles and the same cost, and buys 160 px of
+ * horizontal and 180 px of vertical overlap for a 0.8x downscale into the
+ * network. Measured on the bench, same frames replayed with sensor-scale noise
+ * and sub-pixel shift:
+ *
+ *                          crop 256              crop 320
+ *   crowd of ~15           9..10, 3 changes/11   9, no change in 11
+ *   ScopusQA 3_people_01   3..4,  4 changes/11   4, no change in 11
+ *
+ * and over the 75-image QA set, on the 22 scenes whose name states a count:
+ * 14 exact against 11, total count error 13 against 15, same 61 scenes with
+ * any detection at all. It is better on the still pictures and steady on the
+ * moving ones, so the 1:1 tile was not worth what it cost. */
 #define TILE_LIVE_COLS      4U
 #define TILE_LIVE_ROWS      3U
-#define TILE_LIVE_CROP      TILE_NN_SIDE
+#define TILE_LIVE_CROP      320U
 
 static uint16_t _cfg_cols  = TILE_DEF_COLS;
 static uint16_t _cfg_rows  = TILE_DEF_ROWS;

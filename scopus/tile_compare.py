@@ -7,10 +7,11 @@ Two legs over the same picture, on the same device, with the same network:
             — the whole field of view in one downscale, which is what the NN
               ate on every camera frame before tiling.
 
-  tile      the image at 800x600 -> `tile run`, 4x3 grid, 256 px crops
+  tile      the image at 800x600 -> `tile run`, 4x3 grid, 320 px crops
             — the geometry `detect mode tile` arms, over the same resolution
               the live main pipe carries. Twelve inferences, merged with
-              cross-tile NMS.
+              cross-tile NMS. `--crop` prices a different one; 256 was the
+              default until ScopusQA #24 measured what its thin seams cost.
 
 800x600 is not a choice: it is CAMERA_MAIN_WIDTH x CAMERA_MAIN_HEIGHT, the pipe
 the live sweep snapshots. Feeding the tile leg a sensor-resolution image would
@@ -40,7 +41,7 @@ COCO = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
 # The live main pipe. Both legs are anchored to it — see the module docstring.
 LIVE_W, LIVE_H = 800, 600
 GRID_C, GRID_R = 4, 3
-CROP = 256
+CROP = 320
 
 
 def _classes(pairs):

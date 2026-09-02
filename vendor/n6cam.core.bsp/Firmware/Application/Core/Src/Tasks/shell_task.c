@@ -2482,18 +2482,34 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     float conf = 0.0f, iou = 0.0f;
     tile_cfg_get(&cols, &rows, &crop, &ovh, &ovv, &conf, &iou);
 
+    /* Report the geometry against the frame that is actually being swept.
+     * `_tile_fw/_tile_fh` is the *uploaded* frame, set by `tile frame`; the
+     * live sweep works on the main pipe and never looks at it. Printing the
+     * upload size while the main path is tiling showed the operator a stride
+     * and an overlap the product was not using, which is the same way round
+     * as the switches in ScopusQA #24. */
+    const bool     live_path = nn_task_tile_get();
+    const uint16_t qw = live_path ? (uint16_t)CAMERA_MAIN_WIDTH  : _tile_fw;
+    const uint16_t qh = live_path ? (uint16_t)CAMERA_MAIN_HEIGHT : _tile_fh;
+
     uint16_t xs[TILE_MAX_AXIS], ys[TILE_MAX_AXIS], sx = 0U, sy = 0U;
-    tile_axis_origins(cols, _tile_fw, crop, ovh, xs, &sx);
-    tile_axis_origins(rows, _tile_fh, crop, ovv, ys, &sy);
+    tile_axis_origins(cols, qw, crop, ovh, xs, &sx);
+    tile_axis_origins(rows, qh, crop, ovv, ys, &sy);
     uint16_t eff_oh = (crop > sx) ? (uint16_t)(crop - sx) : 0U;
     uint16_t eff_ov = (crop > sy) ? (uint16_t)(crop - sy) : 0U;
-    CMD_PRINTF(stream, "tile: frame %ux%u grid %ux%u crop %u -> NN %u%s",
-               (unsigned)_tile_fw, (unsigned)_tile_fh, (unsigned)cols,
-               (unsigned)rows, (unsigned)crop, (unsigned)TILE_NN_SIDE, lwshell_eol());
+    CMD_PRINTF(stream, "tile: frame %ux%u (%s) grid %ux%u crop %u -> NN %u%s",
+               (unsigned)qw, (unsigned)qh, live_path ? "live pipe" : "upload",
+               (unsigned)cols, (unsigned)rows, (unsigned)crop,
+               (unsigned)TILE_NN_SIDE, lwshell_eol());
     CMD_PRINTF(stream, "  stride h=%u v=%u  overlap h=%u v=%u  conf>=%.2f iou=%.2f  %s%s",
                (unsigned)sx, (unsigned)sy, (unsigned)eff_oh, (unsigned)eff_ov,
                conf, iou, _tile_loaded ? "frame LOADED" : "frame EMPTY",
                lwshell_eol());
+    if (live_path)
+    {
+      CMD_PRINTF(stream, "  upload frame is %ux%u, used by 'tile run' only%s",
+                 (unsigned)_tile_fw, (unsigned)_tile_fh, lwshell_eol());
+    }
     CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  -> %lu inferences a sweep%s",
                tile_cfg_get_fullpass() ? "on" : "off",
                tile_cfg_get_edgedrop() ? "on" : "off",
