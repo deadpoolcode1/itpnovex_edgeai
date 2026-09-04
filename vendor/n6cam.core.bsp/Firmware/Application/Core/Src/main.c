@@ -300,9 +300,18 @@ void sysutils_mcu_reboot(const t_stream *stream, int32_t reason)
  */
 void assert_failed(uint8_t * file, uint32_t line)
 {
-  /* User can add his own implementation to report the file name and line
-     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
-     line) */
+  /* Say WHERE. The two arguments exist for exactly this and were being
+   * thrown away: a failed HAL parameter check used to reach the trace as
+   * "FAILURE (modem.task)!" and nothing else, which names the thread that
+   * died and not one thing about why. Finding one meant bisecting a build.
+   *
+   * Worth knowing about the failure this reports: Error_Handler() spins the
+   * calling thread for ever AND releases the watchdog, so the board does not
+   * reset, the other threads keep running and the unit looks alive while one
+   * of them is gone. If that thread is the shell, the console stops answering
+   * and the kit can only be recovered over SWD. */
+  LERROR(TRACE_SYSTEM, "assert failed: %s:%lu",
+         (file != NULL) ? (const char*)file : "?", (unsigned long)line);
   Error_Handler();
 }
 #endif /* USE_FULL_ASSERT */
