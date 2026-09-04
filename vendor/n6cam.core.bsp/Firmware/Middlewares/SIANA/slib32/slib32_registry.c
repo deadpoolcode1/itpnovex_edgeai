@@ -220,8 +220,25 @@ int32_t registry_start(bool force)
 
   /* Check data integrity:
    * - CRC mismatch: Corruption: RESET
+   *
+   * Over the number of bytes that were STORED, not over the size of today's
+   * struct. On a version upgrade the struct has grown; _reg_load() reads the
+   * new, larger size out of flash, so the bytes past the stored end are
+   * whatever the erase left behind. Hashing those guarantees a mismatch, and
+   * a mismatch here means RESET, which is why every registry version bump so
+   * far has silently returned the unit to factory defaults and the migration
+   * code immediately below has never once run.
+   *
+   * That is not a cosmetic bug: it is the operator's `notify enable`,
+   * `detect profile`, server endpoints and image settings, gone on a firmware
+   * update that was supposed to add one field. Found while adding
+   * detect_rotate for ScopusQA #26, the bench came back from the flash with
+   * det_msk 0x01 and mask 0x3F, not the 0x03/0x55 ITP had left it in.
    */
-  if (_reg.meta.crc != _reg_crc32_fn((uint8_t*)&_reg.data, sizeof(t_registry_data)))
+  const uint32_t stored_bytes = (_reg.meta.size > sizeof(t_registry_meta))
+                              ? (uint32_t)(_reg.meta.size - sizeof(t_registry_meta))
+                              : 0U;
+  if (_reg.meta.crc != _reg_crc32_fn((uint8_t*)&_reg.data, stored_bytes))
   {
     status = _reg_reset();
     status = status == SLIB32_OK? SLIB32_RESET : status;

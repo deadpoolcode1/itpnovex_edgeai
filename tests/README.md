@@ -44,6 +44,23 @@ Output:
 
 47 tests today. Latest run: `results/test-report-*.html`.
 
+## Host tests (no kit needed)
+
+Two of them, both self-checking and both runnable on any machine with `gcc`:
+
+```bash
+python3 tests/test_hdlc_crosscheck.py      # C encoder vs the Python one
+python3 tests/test_registry_migration.py   # settings survive a version bump
+```
+
+`test_registry_migration.py` exists because the settings store used to be
+reset to factory defaults by every `REGISTRY_VERSION` bump: the integrity
+check hashed today's struct size over a store written at yesterday's, so the
+CRC could not match and the upgrade path was never taken (ScopusQA #27). It
+asserts that an older store migrates with the operator's values intact, that
+a new field arrives at its default, and that a genuinely corrupt store still
+resets. Run it whenever a field is added to `registry.h`.
+
 ## Test images
 
 `tests/images/` ships 15 deterministic samples sourced from `skimage.data` (NASA PD + scikit-image's BSD-licensed sample set):
