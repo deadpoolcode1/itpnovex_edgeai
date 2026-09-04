@@ -4766,6 +4766,32 @@ static int32_t _mdm_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     CMD_PRINTF(stream, "link: relinks=%lu consec_timeouts=%lu%s",
       (unsigned long)st.relinks, (unsigned long)st.consec_timeouts,
       lwshell_eol());
+    /* The RX ring (ScopusQA #23). `lost` is the number that matters and it
+     * must be 0: it counts bytes the DMA wrote over before anyone read them,
+     * which is the one way this path can still drop a URC. `peak` is how
+     * close the ring has ever come to full, and it is the evidence for
+     * whether UART_RX_RING_SIZE is the right size. */
+    {
+      uint32_t rb = 0U, rl = 0U, rp = 0U, rc = 0U, rr = 0U;
+      int32_t  rs = 0;
+      bsp_uart_ring_stats(UART_2, &rb, &rl, &rp, &rc);
+      bsp_uart_ring_health(UART_2, &rs, &rr);
+      CMD_PRINTF(stream, "ring: %s  bytes=%lu lost=%lu peak=%lu/%lu "
+                         "restarts=%lu%s%s",
+                 (uart[UART_2].bsp.mode_rx == UART_MODE_RING)
+                   ? "on (continuous DMA + 16-byte FIFO)"
+                   : "OFF, RX is armed per read, a URC between reads is lost",
+                 (unsigned long)rb, (unsigned long)rl,
+                 (unsigned long)rp, (unsigned long)rc, (unsigned long)rr,
+                 (rl > 0U) ? "  <- bytes were overwritten unread" : "",
+                 lwshell_eol());
+      if (rs != 0)
+      {
+        CMD_PRINTF(stream, "  ring start failed with %ld (see "
+                           "BSP_UART_RING_ERR_* in n6cam_uart.h)%s",
+                   (long)rs, lwshell_eol());
+      }
+    }
     /* Report the line rate the peripheral is REALLY running at. If this is
      * not 115200 the link cannot work, however good the wiring is -- and a
      * loopback test would still pass, because both directions would share the

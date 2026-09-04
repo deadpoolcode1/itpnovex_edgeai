@@ -179,6 +179,24 @@ SECTIONS
 
   /* Extras START -----------*/
 
+  /* SRAM uncached.
+   *
+   * The FSBL has no uncached region and no MPU configuration, so this is
+   * ordinary SRAM here, the section exists only so that BSP code shared
+   * with the Application links in both projects. The UART RX ring
+   * (ScopusQA #23) is the one thing in it, and the FSBL never starts it:
+   * bsp_uart_ring_start() is called from modem_task, which is Application
+   * code. Placing it is enough; nothing in the FSBL touches it. */
+  .uncached_bss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    __uncached_bss_start__ = .;
+    *(.uncached_bss)
+    *(.uncached_bss*)
+    . = ALIGN(4);
+    __uncached_bss_end__ = .;
+  } >SRAM
+
   /* PSRAM */
   .psram_bss (NOLOAD) :
   {

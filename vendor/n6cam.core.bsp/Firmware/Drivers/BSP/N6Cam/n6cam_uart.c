@@ -29,6 +29,8 @@
  *
  *******************************************************************************
  */
+#include <string.h>
+
 #include "n6cam_core.h"
 #include "n6cam_mcu.h"
 #include "n6cam_uart.h"
@@ -59,6 +61,42 @@
 /* UART defaults */
 #define UART_MODE_DEFAULT     UART_MODE_DMA   /*!< UART operation mode */
 #define UART_IT_PRIO          5U              /*!< UART interrupt priority */
+
+/** RX ring size, per UART (ScopusQA #23).
+ *
+ * 1024 bytes is 89 ms of line time at 115200, two orders of magnitude more
+ * than any gap the modem loop leaves today, and enough that the ring survives
+ * a caller that goes away for a while. The whole thing costs 2 KB of the
+ * 256 KB uncached SRAM region. bsp_uart_ring_stats() reports the deepest fill
+ * ever reached, so this number can be argued with evidence rather than
+ * guessed at again. */
+#define UART_RX_RING_SIZE     1024U
+
+/** RX FIFO threshold.
+ *
+ * The silicon has a 16-byte RX FIFO per USART and the BSP configured a
+ * threshold and then called HAL_UARTEx_DisableFifoMode(), which made both
+ * threshold calls inert and left the peripheral servicing one byte at a time.
+ * The FIFO is now on.
+ *
+ * 1/2 (8 bytes) is the interrupt threshold. It does NOT gate the DMA: the
+ * USART raises its DMA request on RXFNE, FIFO not empty, so a partial
+ * FIFO is still drained and receive-to-idle still completes on the gap after
+ * the last character. What the FIFO buys is eight characters of slack before
+ * an overrun, on a link whose ORE/FE/NE counter is not always zero. */
+#define UART_RX_FIFO_THRESH   UART_RXFIFO_THRESHOLD_1_2
+#define UART_TX_FIFO_THRESH   UART_TXFIFO_THRESHOLD_1_8
+
+/** Where the ring and its DMA descriptor live.
+ *
+ * The Application declares this in main.h, which is Application-private; this
+ * file is BSP and is compiled into the FSBL as well, so it names the section
+ * itself. Both linker scripts place `.uncached_bss`: in the Application it is
+ * the MPU's non-cacheable SRAM region, in the FSBL it is ordinary SRAM that
+ * nothing uses, the FSBL never starts a ring. */
+#ifndef IN_SRAM_UNCACHED
+  #define IN_SRAM_UNCACHED    IN_SECTION(".uncached_bss")
+#endif
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_TUNABLES -->
@@ -106,6 +144,41 @@ static volatile size_t  _uart_recv[UART_NUM];
  *  (wrong baud, bad levels, noise), which no other diagnostic surfaces. */
 static volatile uint32_t _uart_errors[UART_NUM];
 
+/* ── RX ring (ScopusQA #23) ────────────────────────────────────────────────
+ *
+ * A GPDMA single-node CIRCULAR linked list writes here for as long as the
+ * UART is up; readers copy out. The N6 GPDMA has no DMA_CIRCULAR Init.Mode -
+ * looping is done with the linked-list engine, which is the mechanism ITP
+ * asked for, and the HAL supports it under HAL_UARTEx_ReceiveToIdle_DMA:
+ * in DMA_LINKEDLIST_CIRCULAR it reports idle/half/complete and leaves the
+ * channel running.
+ *
+ * IN_SRAM_UNCACHED, not cached SRAM with maintenance around it. The DMA
+ * writes this buffer continuously and asynchronously, so there is no moment
+ * at which "invalidate now, read now" is race-free: a line invalidated while
+ * the DMA is mid-line is a line that may be re-read stale. Uncached memory
+ * removes the question. The linked-list NODES live here too, the DMA
+ * fetches them itself, so they must not sit behind the D-cache either. */
+static uint8_t _uart_rx_ring[UART_NUM][UART_RX_RING_SIZE]
+  DMA_ALIGN IN_SRAM_UNCACHED;
+static DMA_NodeTypeDef  _uart_rx_node[UART_NUM] DMA_ALIGN IN_SRAM_UNCACHED;
+static DMA_QListTypeDef _uart_rx_qlist[UART_NUM];
+
+/* Monotonic byte counts. The difference between them is what is waiting;
+ * keeping them monotonic rather than keeping head/tail indices is what makes
+ * "the DMA lapped the reader" detectable at all, two indices cannot tell a
+ * full ring from an empty one. */
+static volatile uint32_t _uart_rx_written[UART_NUM];  /* DMA has written    */
+static volatile uint32_t _uart_rx_taken[UART_NUM];    /* callers have taken */
+static uint32_t          _uart_rx_last_head[UART_NUM];
+static volatile uint32_t _uart_rx_lost[UART_NUM];     /* overwritten unread */
+static volatile uint32_t _uart_rx_peak[UART_NUM];     /* deepest fill seen  */
+static volatile uint32_t _uart_rx_restarts[UART_NUM]; /* re-arms after error */
+static int32_t           _uart_rx_start_rc[UART_NUM];  /* last ring_start result */
+/* Where `bytes` is counted from. `mdm stats reset` moves this rather than
+ * touching _uart_rx_taken, which is a live ring pointer. */
+static volatile uint32_t _uart_rx_base[UART_NUM];
+
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PRIVATE_Data -->
 *//*-----------------------------------------------------------------------*//**
@@ -116,6 +189,11 @@ static volatile uint32_t _uart_errors[UART_NUM];
 /* Internal */
 static int32_t _bsp_uart_init_gpio(t_uart_id id);
 static int32_t _bsp_uart_init_peripheral(t_uart_id id, uint32_t baud, bool swap);
+
+/* Ring */
+static void    _ring_sample(t_uart_id id);
+static int32_t _ring_arm(t_uart_id id);
+static bool    _ring_running(t_uart_id id);
 
 /* Stream */
 static int32_t _bsp_uart1_read(uint8_t *buff, size_t size, uint32_t timeout);
@@ -333,6 +411,314 @@ t_stream *bsp_uart_get_stream(t_uart_id id)
   return &uart[id].stream;
 }
 
+/* ── RX ring (ScopusQA #23) ───────────────────────────────────────────── */
+
+/* Where the DMA has reached, and how far it has advanced since we last
+ * looked. CBR1 counts DOWN from the block size and reloads on each lap, so
+ * the write position is size - counter.
+ *
+ * The advance is folded into a monotonic total instead of being used as a
+ * head index, and that is the whole trick: two indices can say how much is
+ * waiting but cannot say whether the writer has been all the way round, so
+ * they cannot detect loss. A monotonic pair can, see bsp_uart_read().
+ *
+ * Correctness rests on being called at least once per lap. The half-transfer
+ * and transfer-complete events do that (every 512 bytes, ~44 ms at 115200),
+ * which is why HAL_UARTEx_RxEventCallback samples too and not just readers. */
+static void _ring_sample(t_uart_id id)
+{
+  /* Runs on the ISR AND on readers, and it is read-modify-write on state
+   * both of them share, so it is short and it is atomic. The mutex cannot
+   * do this job: an ISR must never wait on one. */
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+
+  const uint32_t sz   = UART_RX_RING_SIZE;
+  uint32_t       rem  = __HAL_DMA_GET_COUNTER(&uart[id].bsp.hdmarx);
+  if (rem > sz) { rem = sz; }
+  const uint32_t head = sz - rem;
+  const uint32_t prev = _uart_rx_last_head[id];
+
+  _uart_rx_last_head[id] = head;
+  _uart_rx_written[id]  += (head >= prev) ? (head - prev) : (sz - prev + head);
+
+  const uint32_t fill = _uart_rx_written[id] - _uart_rx_taken[id];
+  if (fill > _uart_rx_peak[id]) { _uart_rx_peak[id] = fill; }
+
+  __set_PRIMASK(primask);
+}
+
+/* Is the receiver still running? An RX error (ORE/FE/NE) makes the HAL abort
+ * the DMA even in circular mode, UART_EndRxTransfer clears CR3.DMAR, so
+ * "the ring runs forever" is only true if something puts it back. */
+static bool _ring_running(t_uart_id id)
+{
+  return (uart[id].bsp.huart.Instance->CR3 & USART_CR3_DMAR) != 0U;
+}
+
+/* Point the DMA at the ring and start it. Also used to recover after an
+ * error, which is why it resets the head shadow but NOT the byte totals:
+ * the counters are cumulative for the life of the unit. */
+static int32_t _ring_arm(t_uart_id id)
+{
+  t_uart_bsp *bsp = &uart[id].bsp;
+
+  (void)HAL_UART_AbortReceive(&bsp->huart);
+
+  _uart_rx_last_head[id] = 0U;
+  /* Whatever the DMA wrote and nobody read is gone with the restart; say so
+   * rather than let it look like a clean link. */
+  const uint32_t fill = _uart_rx_written[id] - _uart_rx_taken[id];
+  _uart_rx_lost[id]  += fill;
+  _uart_rx_taken[id]  = _uart_rx_written[id];
+
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&bsp->huart, _uart_rx_ring[id],
+                                   (uint16_t)UART_RX_RING_SIZE) != HAL_OK)
+  {
+    return BSP_ERROR_PERIPHERAL;
+  }
+  return BSP_OK;
+}
+
+int32_t bsp_uart_ring_start(t_uart_id id)
+{
+  if (id >= UART_NUM)      { return BSP_ERROR_PARAMETER; }
+  if (!uart[id].ready)     { return BSP_ERROR_NO_INIT;   }
+
+  t_uart_bsp *bsp = &uart[id].bsp;
+  int32_t     rc  = BSP_OK;
+
+  rtos_mutex_acquire(&uart[id].rtos.mtx_rx, true);
+
+  /* Rebuild the RX channel as a linked-list channel. The plain HAL_DMA_Init
+   * done at bring-up produces a one-shot channel; a looping one is a
+   * different object to the HAL and has to be initialised as such.
+   *
+   * Every step is checked and reports WHICH step failed. A single
+   * "peripheral error" out of a seven-call sequence is not a diagnosis, and
+   * this sequence has to survive being run again on every relink. */
+  (void)HAL_UART_AbortReceive(&bsp->huart);
+  (void)HAL_DMA_DeInit(&bsp->hdmarx);
+
+  bsp->hdmarx.InitLinkedList.Priority          = DMA_HIGH_PRIORITY;
+  bsp->hdmarx.InitLinkedList.LinkStepMode      = DMA_LSM_FULL_EXECUTION;
+  bsp->hdmarx.InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT0;
+  bsp->hdmarx.InitLinkedList.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  bsp->hdmarx.InitLinkedList.LinkedListMode    = DMA_LINKEDLIST_CIRCULAR;
+
+  if (HAL_DMAEx_List_Init(&bsp->hdmarx) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_LIST_INIT;
+    goto EXIT;
+  }
+  __HAL_LINKDMA(&bsp->huart, hdmarx, bsp->hdmarx);
+  if (HAL_DMA_ConfigChannelAttributes(&bsp->hdmarx,
+        (DMA_CHANNEL_PRIV | DMA_CHANNEL_SEC |
+         DMA_CHANNEL_SRC_SEC | DMA_CHANNEL_DEST_SEC)) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_ATTRS;
+    goto EXIT;
+  }
+
+  /* One node, and the queue is made circular so the node re-links to itself.
+   * Source/destination/size are overwritten by the HAL out of the
+   * ReceiveToIdle_DMA arguments, so what matters here is the control half:
+   * peripheral-to-memory, source fixed, destination incrementing, byte wide.
+   *
+   * The node config is static rather than a local: it is ~140 bytes and this
+   * runs on the shell task, whose stack is 2 KB and already carries a command
+   * parser and a print path.
+   *
+   * The queue is memset rather than HAL_DMAEx_List_ResetQ'd. ResetQ refuses a
+   * queue that LinkQ has converted to dynamic, and this whole sequence runs
+   * again on every `mdm relink`, so on the second pass the reset would fail,
+   * the old node would still be in the list, and the rebuild would be
+   * inserting a node that is already there. A zeroed queue is by definition a
+   * fresh static one, and nothing else holds a pointer into it. */
+  static DMA_NodeConfTypeDef node;
+  memset(&node, 0, sizeof(node));
+  node.NodeType                        = DMA_GPDMA_LINEAR_NODE;
+  node.Init                            = bsp->hdmarx.Init;
+  node.Init.Mode                       = DMA_NORMAL;
+  node.DataHandlingConfig.DataExchange = DMA_EXCHANGE_NONE;
+  node.DataHandlingConfig.DataAlignment= DMA_DATA_RIGHTALIGN_ZEROPADDED;
+  node.TriggerConfig.TriggerPolarity   = DMA_TRIG_POLARITY_MASKED;
+  node.SrcAddress                      = (uint32_t)&uart[id].bsp.huart.Instance->RDR;
+  node.DstAddress                      = (uint32_t)_uart_rx_ring[id];
+  node.DataSize                        = UART_RX_RING_SIZE;
+#if defined (CPU_IN_SECURE_STATE)
+  /* Not optional, and zero is not "leave it alone": this part is built
+   * CPU_IN_SECURE_STATE, so HAL_DMAEx_List_BuildNode asserts on these two,
+   * and IS_DMA_ATTRIBUTES rejects 0. Leaving them out ran assert_failed() on
+   * the modem task at 181 ms of every boot, which spins that thread for ever
+   * inside Error_Handler() while the rest of the system carries on, the link
+   * looked dead and the trace said only "FAILURE (modem.task)!". They match
+   * the attributes HAL_DMA_ConfigChannelAttributes() sets above. */
+  node.SrcSecure                       = DMA_CHANNEL_SRC_SEC;
+  node.DestSecure                      = DMA_CHANNEL_DEST_SEC;
+#endif /* CPU_IN_SECURE_STATE */
+
+  memset(&_uart_rx_qlist[id], 0, sizeof(_uart_rx_qlist[id]));
+  memset(&_uart_rx_node[id],  0, sizeof(_uart_rx_node[id]));
+
+  if (HAL_DMAEx_List_BuildNode(&node, &_uart_rx_node[id]) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_BUILD;
+    goto EXIT;
+  }
+  if (HAL_DMAEx_List_InsertNode_Tail(&_uart_rx_qlist[id],
+                                     &_uart_rx_node[id]) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_INSERT;
+    goto EXIT;
+  }
+  if (HAL_DMAEx_List_SetCircularMode(&_uart_rx_qlist[id]) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_CIRCULAR;
+    goto EXIT;
+  }
+  if (HAL_DMAEx_List_LinkQ(&bsp->hdmarx, &_uart_rx_qlist[id]) != HAL_OK)
+  {
+    rc = BSP_UART_RING_ERR_LINK;
+    goto EXIT;
+  }
+
+  _uart_rx_written[id]   = 0U;
+  _uart_rx_taken[id]     = 0U;
+  _uart_rx_base[id]      = 0U;
+  _uart_rx_last_head[id] = 0U;
+  _uart_rx_lost[id]      = 0U;
+  _uart_rx_peak[id]      = 0U;
+  _uart_rx_restarts[id]  = 0U;
+
+  uart[id].bsp.mode_rx = UART_MODE_RING;
+  if (_ring_arm(id) != BSP_OK)
+  {
+    rc = BSP_UART_RING_ERR_ARM;
+    goto EXIT;
+  }
+  /* _ring_arm charges whatever was pending to `lost`; on the very first arm
+   * there is nothing pending and nothing to charge. */
+  _uart_rx_lost[id] = 0U;
+
+EXIT:
+  if (rc != BSP_OK) { uart[id].bsp.mode_rx = UART_MODE_IT; }
+  _uart_rx_start_rc[id] = rc;
+  rtos_mutex_acquire(&uart[id].rtos.mtx_rx, false);
+  return rc;
+}
+
+void bsp_uart_ring_reset_stats(t_uart_id id)
+{
+  if (id >= UART_NUM) { return; }
+  /* With interrupts off: `peak` is read-modify-written from the ISR, and a
+   * reset that races one loses the write it was zeroing.
+   *
+   * `bytes` is rebased rather than zeroed. _uart_rx_taken is a live pointer
+   * into the ring, not a statistic: setting it to anything would either
+   * discard bytes that are waiting or re-deliver bytes already handed out. */
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  _uart_rx_base[id]     = _uart_rx_taken[id];
+  _uart_rx_lost[id]     = 0U;
+  _uart_rx_peak[id]     = 0U;
+  _uart_rx_restarts[id] = 0U;
+  __set_PRIMASK(primask);
+}
+
+void bsp_uart_ring_health(t_uart_id id, int32_t *start_rc, uint32_t *restarts)
+{
+  if (id >= UART_NUM) { return; }
+  if (start_rc) { *start_rc = _uart_rx_start_rc[id];  }
+  if (restarts) { *restarts = _uart_rx_restarts[id];  }
+}
+
+void bsp_uart_ring_stats(t_uart_id id, uint32_t *bytes, uint32_t *lost,
+                         uint32_t *peak, uint32_t *capacity)
+{
+  if (id >= UART_NUM) { return; }
+  if (bytes)    { *bytes    = _uart_rx_taken[id] - _uart_rx_base[id]; }
+  if (lost)     { *lost     = _uart_rx_lost[id];  }
+  if (peak)     { *peak     = _uart_rx_peak[id];  }
+  if (capacity) { *capacity = UART_RX_RING_SIZE;  }
+}
+
+/* Copy out of the ring. Never arms anything, so reception carries on
+ * regardless of whether anyone is here. */
+static int32_t _ring_read(t_uart_id id, uint8_t *buff, size_t size,
+                          uint32_t timeout)
+{
+  const uint32_t sz    = UART_RX_RING_SIZE;
+  const ULONG    t0    = tx_time_get();
+  const ULONG    limit = (ULONG)((timeout * TX_TIMER_TICKS_PER_SECOND) / 1000U);
+
+  for (;;)
+  {
+    rtos_mutex_acquire(&uart[id].rtos.mtx_rx, true);
+
+    /* An RX error aborts the channel even in circular mode. Put it back
+     * before looking, so a noisy burst costs the bytes it corrupted and not
+     * the link. */
+    if (!_ring_running(id))
+    {
+      _uart_rx_restarts[id]++;
+      (void)_ring_arm(id);
+    }
+
+    _ring_sample(id);
+
+    uint32_t fill = _uart_rx_written[id] - _uart_rx_taken[id];
+    if (fill > sz)
+    {
+      /* The writer went all the way round and past the reader. The oldest
+       * (fill - sz) bytes are already overwritten; keep the newest ring-full
+       * and count the rest as lost, because pretending they were delivered
+       * would put a splice in the middle of an HDLC frame. */
+      _uart_rx_lost[id]  += (fill - sz);
+      _uart_rx_taken[id]  = _uart_rx_written[id] - sz;
+      fill = sz;
+    }
+
+    if (fill > 0U)
+    {
+      uint32_t n = (fill > (uint32_t)size) ? (uint32_t)size : fill;
+      uint32_t t = _uart_rx_taken[id] % sz;
+      uint32_t first = ((t + n) > sz) ? (sz - t) : n;
+      memcpy(buff, &_uart_rx_ring[id][t], first);
+      if (n > first)
+      {
+        memcpy(&buff[first], &_uart_rx_ring[id][0], n - first);
+      }
+      _uart_rx_taken[id] += n;
+      rtos_mutex_acquire(&uart[id].rtos.mtx_rx, false);
+      return (int32_t)n;
+    }
+
+    rtos_mutex_acquire(&uart[id].rtos.mtx_rx, false);
+
+    /* Signed compare, so this stays correct across the tick counter's wrap. */
+    const ULONG spent = (ULONG)(tx_time_get() - t0);
+    if (spent >= limit) { return BSP_ERROR_TIMEOUT; }
+
+    /* Sleep until the ISR says something happened, idle, half, complete or
+     * error, then look again. Nothing is cleared before the wait: a flag
+     * left over from a burst we already drained costs one extra pass round
+     * this loop, whereas clearing it would open a window in which an arrival
+     * between the check above and the wait below is never announced. The cap
+     * is belt and braces on top of that. */
+    ULONG slice = limit - spent;
+    if (slice > (ULONG)(TX_TIMER_TICKS_PER_SECOND / 20U))
+    {
+      slice = (ULONG)(TX_TIMER_TICKS_PER_SECOND / 20U);   /* 50 ms */
+    }
+    if (slice == 0U) { slice = 1U; }
+    ULONG flags = 0U;
+    (void)tx_event_flags_get(&uart[id].rtos.evt_rx,
+                             UART_STATUS_RX_CPLT | UART_STATUS_ERROR,
+                             TX_OR_CLEAR, &flags, slice);
+  }
+}
+
 int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout)
 {
   uint32_t flags = 0U;    /* must be zeroed: the EXIT path reads it even when
@@ -347,6 +733,11 @@ int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout
   if (!uart[id].ready)
   {
     return BSP_ERROR_NO_INIT;
+  }
+
+  if (uart[id].bsp.mode_rx == UART_MODE_RING)
+  {
+    return _ring_read(id, buff, size, timeout);
   }
 
   /* Acquire and clear events */
@@ -676,17 +1067,32 @@ static int32_t _bsp_uart_init_peripheral(t_uart_id id, uint32_t baud, bool swap)
   {
     return BSP_ERROR_PERIPHERAL;
   }
-  status = HAL_UARTEx_SetTxFifoThreshold(&bsp->huart, UART_TXFIFO_THRESHOLD_1_8);
+  /* The 16-byte hardware FIFOs, ON (ScopusQA #23).
+   *
+   * They used to be configured and then switched off one line later:
+   * SetTxFifoThreshold / SetRxFifoThreshold followed by
+   * HAL_UARTEx_DisableFifoMode(), which made both thresholds inert and left
+   * the peripheral moving one character per interrupt or DMA request. At
+   * 115200 that is comfortable and it costs nothing measurable, what it
+   * costs is margin, and margin is exactly what the modem link needs: its
+   * ORE/FE/NE counter is not always zero, and a URC is not re-sent.
+   *
+   * Order matters, and not for the obvious reason: all three of these
+   * functions call UARTEx_SetNbDataToProcess(), which decides how many
+   * characters an ISR moves per entry and returns 1 unless huart->FifoMode
+   * is already ENABLE. Enable first, thresholds after, or the thresholds are
+   * computed against a FIFO the handle still thinks is off. */
+  status = HAL_UARTEx_EnableFifoMode(&bsp->huart);
   if (status != HAL_OK)
   {
     return BSP_ERROR_PERIPHERAL;
   }
-  status = HAL_UARTEx_SetRxFifoThreshold(&bsp->huart, UART_RXFIFO_THRESHOLD_1_8);
+  status = HAL_UARTEx_SetTxFifoThreshold(&bsp->huart, UART_TX_FIFO_THRESH);
   if (status != HAL_OK)
   {
     return BSP_ERROR_PERIPHERAL;
   }
-  status = HAL_UARTEx_DisableFifoMode(&bsp->huart);
+  status = HAL_UARTEx_SetRxFifoThreshold(&bsp->huart, UART_RX_FIFO_THRESH);
   if (status != HAL_OK)
   {
     return BSP_ERROR_PERIPHERAL;
@@ -757,7 +1163,19 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
       continue;
     }
     /* Handle internal */
-    _uart_recv[idx] = size;
+    if (uart[idx].bsp.mode_rx == UART_MODE_RING)
+    {
+      /* Circular mode: this fires on idle, half and complete, and `size` is
+       * a position in the ring rather than a length for a caller. Fold the
+       * DMA's advance in from here as well as from readers, that is what
+       * keeps the monotonic total exact when nobody is reading, which is
+       * precisely the case the ring exists for. */
+      _ring_sample((t_uart_id)idx);
+    }
+    else
+    {
+      _uart_recv[idx] = size;
+    }
     rtos_raise_event(&uart[idx].rtos.evt_rx, UART_STATUS_RX_CPLT);
     if (uart[idx].bsp.irq_cb)
     {

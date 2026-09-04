@@ -88,12 +88,20 @@ typedef enum
   UART_STATUS_ALL     = BITMASK(3U),
 } t_uart_status;
 
-/** UART modes */
+/** UART modes
+ *
+ * UART_MODE_RING is receive-only and is what the modem link runs (ScopusQA
+ * #23). The other three arm a transfer per call, so nothing is receiving
+ * between calls; RING keeps the peripheral receiving continuously into a
+ * driver-owned ring and bsp_uart_read() copies out of it. See the note on
+ * bsp_uart_ring_stats() for why that matters.
+ */
 typedef enum
 {
   UART_MODE_BLOCK = 0x00U,
   UART_MODE_IT,
   UART_MODE_DMA,
+  UART_MODE_RING,
 } t_uart_mode;
 
 /**
@@ -246,6 +254,85 @@ int32_t bsp_uart_read(t_uart_id id, uint8_t* buff, size_t size, uint32_t timeout
  * @return Bytes written or error code
  */
 int32_t bsp_uart_write(t_uart_id id, const uint8_t* buff, size_t size, uint32_t timeout);
+
+/**
+ * @brief Put a UART's receiver into continuous ring mode (ScopusQA #23).
+ *
+ * The other three RX modes are demand-driven: bsp_uart_read() arms a transfer
+ * into the CALLER's buffer and disarms it when the call returns, so nothing is
+ * receiving between calls and anything that arrives in that window has nowhere
+ * to go. With the FIFO off as well, the tolerance was one character, 87 us at
+ * 115200.
+ *
+ * That gap is survivable today only because the modem link is request/response
+ * and the layer above re-sends what it does not get an answer to. Two things
+ * make it a real risk rather than a theoretical one, both of which ITP raised:
+ *
+ *   - A URC (`+SDVRNET: UP`, `+SDVRRDY`, an incoming command) is not a reply
+ *     to anything. Nobody re-sends it, so a lost one is lost.
+ *   - The moment the CPU is allowed to idle with the camera off, the window
+ *     between reads stops being microseconds.
+ *
+ * In ring mode the GPDMA runs a single-node CIRCULAR linked list into a
+ * driver-owned buffer and never stops. The hardware FIFO absorbs bursts ahead
+ * of it. bsp_uart_read() then copies out what has arrived rather than arming
+ * anything, so there is no window at all: reception continues while the caller
+ * is parsing, sleeping, or not there.
+ *
+ * TX is unaffected, it stays whatever mode_tx says.
+ *
+ * @param id  UART to switch. The ring is per-UART and statically allocated.
+ * @return BSP_OK, or an error if the UART is not up or the DMA refuses.
+ */
+/** Which step of bsp_uart_ring_start() failed. Distinct codes because the
+ *  call is a seven-step HAL sequence and "peripheral error" names none of
+ *  them; the modem task prints whichever comes back. */
+#define BSP_UART_RING_ERR_LIST_INIT   (-101)
+#define BSP_UART_RING_ERR_ATTRS       (-102)
+#define BSP_UART_RING_ERR_BUILD       (-103)
+#define BSP_UART_RING_ERR_INSERT      (-104)
+#define BSP_UART_RING_ERR_CIRCULAR    (-105)
+#define BSP_UART_RING_ERR_LINK        (-106)
+#define BSP_UART_RING_ERR_ARM         (-107)
+
+int32_t bsp_uart_ring_start(t_uart_id id);
+
+/**
+ * @brief Ring-mode counters, for proving the link is not losing bytes.
+ *
+ * @param id       UART ID.
+ * @param bytes    Bytes handed to callers since boot.
+ * @param lost     Bytes the DMA overwrote before a reader took them. This is
+ *                 the number that must stay 0; anything else means the ring is
+ *                 too small or nobody is reading.
+ * @param peak     Deepest the ring has ever been, in bytes. Sizing evidence.
+ * @param capacity Ring size in bytes.
+ *
+ * Any pointer may be NULL. Silently does nothing for an invalid id.
+ */
+void bsp_uart_ring_stats(t_uart_id id, uint32_t *bytes, uint32_t *lost,
+                         uint32_t *peak, uint32_t *capacity);
+
+/**
+ * @brief What bsp_uart_ring_start() returned last time, and how many times the
+ *        ring has been re-armed after an RX error.
+ *
+ * The start code is kept because the fallback is silent by design, the link
+ * still works in interrupt mode, so without this a unit that quietly lost its
+ * ring looks exactly like one that has it. `restarts` climbing means the line
+ * is throwing ORE/FE/NE often enough to abort the DMA, which is a wiring or
+ * noise problem, not a software one.
+ */
+void bsp_uart_ring_health(t_uart_id id, int32_t *start_rc, uint32_t *restarts);
+
+/**
+ * @brief Zero the ring's byte, loss, peak and restart counters.
+ *
+ * Not the start code: that describes the ring's configuration and survives.
+ * Called by `mdm stats reset`, so a measurement run can be scoped to itself
+ * rather than to the life of the unit.
+ */
+void bsp_uart_ring_reset_stats(t_uart_id id);
 
 /*-------------------------------------------------------------------------*//**
 * @} <!-- End: PUBLIC_API -->

@@ -393,6 +393,11 @@ void modem_get_stats(t_modem_stats *out)
 void modem_reset_stats(void)
 {
   memset(&_m.stats, 0, sizeof(_m.stats));
+  /* The RX ring's counters are part of the same picture, and a `lost` or
+   * `peak` figure that covers the whole life of the unit cannot answer "did
+   * THIS run lose anything". `mdm stats reset` clears both halves or it
+   * clears neither. */
+  bsp_uart_ring_reset_stats(MODEM_UART);
 }
 
 void modem_set_raw_dump(bool on)
@@ -403,6 +408,32 @@ void modem_set_raw_dump(bool on)
 /*----------------------------------------------------------------------------*/
 /* Link recovery                                                              */
 /*----------------------------------------------------------------------------*/
+
+/* Put USART2's receiver into continuous ring mode (ScopusQA #23).
+ *
+ * Every path that brings this UART up or back up goes through here, because
+ * bsp_uart_reinit() rebuilds the peripheral and the DMA channel underneath -
+ * so the ring has to be re-established with it. Missing one of the three
+ * would leave the link working and silently back on demand-driven RX, which
+ * is exactly the failure this is meant to remove.
+ *
+ * TX stays interrupt-driven. The write path is synchronous and bounded, and
+ * DMA there was measured to buy nothing: there is no "arrived while nobody
+ * was looking" problem in the direction we control.
+ *
+ * On failure the driver leaves RX in UART_MODE_IT, which is the behaviour
+ * the link had before, degraded, not dead. */
+static void _uart_rx_ring_start(void)
+{
+  bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+  int32_t rc = bsp_uart_ring_start(MODEM_UART);
+  if (rc != 0)
+  {
+    LERROR(TRACE_MODEM, "USART2 RX ring failed to start (%ld), falling back "
+           "to interrupt mode; a URC arriving between reads may be lost",
+           (long)rc);
+  }
+}
 
 /* Bring USART2 down and back up at the correct line rate.
  *
@@ -426,7 +457,7 @@ static int32_t _relink_locked(void)
     LERROR(TRACE_MODEM, "relink: USART2 re-init failed: %ld", (long)status);
     return -1;
   }
-  bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+  _uart_rx_ring_start();
 
   /* The decoder may be mid-frame on bytes that will never be completed. */
   hdlc_decoder_init(&_m.dec, _m.dec_out, sizeof(_m.dec_out));
@@ -460,7 +491,7 @@ int32_t modem_test_wedge(uint32_t wrong_baud)
   int32_t status = bsp_uart_reinit(MODEM_UART, wrong_baud, false);
   if (status == 0)
   {
-    bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+    _uart_rx_ring_start();
     _m.wedged_baud = wrong_baud;
   }
   rtos_mutex_acquire(&_m.tx_mtx, false);
@@ -858,7 +889,7 @@ static void _modem_task_run(uint32_t args)
   }
   else
   {
-    bsp_uart_set_mode(MODEM_UART, UART_MODE_IT, UART_MODE_IT);
+    _uart_rx_ring_start();
     LINFO(TRACE_MODEM, "USART2 up @ %u baud (fck=%lu Hz, actual=%lu baud)",
           (unsigned)MODEM_UART_BAUD,
           (unsigned long)bsp_uart_get_kernel_clock(MODEM_UART),
