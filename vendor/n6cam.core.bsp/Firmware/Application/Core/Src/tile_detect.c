@@ -102,6 +102,15 @@ static bool     _cfg_fullpass = true;
  * so those are kept, which is why this tests the two separately. */
 static bool     _cfg_edgedrop = true;
 
+/* Also look at the picture turned 90 degrees (ScopusQA #26). See the note on
+ * tile_cfg_set_rotate() in the header for the measurement that decided this.
+ *
+ * TILE_ROT_FULL by default: one extra inference in thirteen, and it is what
+ * recovers the two scenes ITP reported as "no identification at all". Turning
+ * it up to TILE_ROT_ALL doubles the sweep, so that is offered and not
+ * assumed. */
+static t_tile_rot _cfg_rotate = TILE_ROT_FULL;
+
 /* What fraction of the confidence floor a detection has to hold to keep being
  * believed. 0.75 of the 0.45 default is 0.34 — comfortably below the 0.45-0.50
  * the flickering sixth person in 5_people.jpeg measured at, and comfortably
@@ -129,6 +138,7 @@ void tile_cfg_default(void)
   _cfg_iou   = TILE_DEF_IOU;
   _cfg_fullpass = true;
   _cfg_edgedrop = true;
+  _cfg_rotate   = TILE_ROT_FULL;
 }
 
 void tile_cfg_set_grid(uint16_t cols, uint16_t rows)
@@ -154,6 +164,23 @@ bool tile_cfg_get_fullpass(void)     { return _cfg_fullpass; }
 void tile_cfg_set_edgedrop(bool on)  { _cfg_edgedrop = on; }
 bool tile_cfg_get_edgedrop(void)     { return _cfg_edgedrop; }
 
+void tile_cfg_set_rotate(t_tile_rot r)
+{
+  _cfg_rotate = (r > TILE_ROT_ALL) ? TILE_ROT_FULL : r;
+}
+t_tile_rot tile_cfg_get_rotate(void) { return _cfg_rotate; }
+
+const char *tile_rot_name(t_tile_rot r)
+{
+  switch (r)
+  {
+    case TILE_ROT_OFF:  return "off";
+    case TILE_ROT_FULL: return "full";
+    case TILE_ROT_ALL:  return "all";
+    default:            return "?";
+  }
+}
+
 void tile_cfg_set_thresh(float conf, float iou)
 {
   _cfg_conf = conf;
@@ -174,8 +201,14 @@ void tile_cfg_get(uint16_t *cols, uint16_t *rows, uint16_t *crop,
 
 uint32_t tile_cfg_count(void)
 {
-  return (uint32_t)_cfg_cols * (uint32_t)_cfg_rows
-       + (_cfg_fullpass ? 1U : 0U);
+  uint32_t base = (uint32_t)_cfg_cols * (uint32_t)_cfg_rows
+                + (_cfg_fullpass ? 1U : 0U);
+  switch (_cfg_rotate)
+  {
+    case TILE_ROT_FULL: return base + 1U;    /* the whole frame, turned      */
+    case TILE_ROT_ALL:  return base * 2U;    /* everything, both ways        */
+    default:            return base;
+  }
 }
 
 void tile_cfg_for_live(void)
@@ -217,6 +250,13 @@ void tile_cfg_for_live(void)
   _cfg_iou      = TILE_DEF_IOU;
   _cfg_fullpass = true;
   _cfg_edgedrop = true;
+
+  /* Rotation is NOT re-asserted here. It is the one knob in this list that
+   * the operator sets deliberately and expects to survive, `detect rotate`
+   * persists it in the registry and nn_task restores it at boot, whereas
+   * the four above are experiment settings the main path must never inherit
+   * (ScopusQA #24). Re-asserting it would quietly undo `detect rotate all`
+   * on the next `detect mode tile`. */
 }
 
 /* ── Sweep state ───────────────────────────────────────────────────────── */
@@ -234,6 +274,8 @@ static uint32_t       _sw_n_raw   = 0U;
 static bool           _sw_sat     = false;
 static bool           _sw_full    = false;  /* this sweep has a whole-frame pass */
 static uint32_t       _sw_tiles   = 0U;     /* tile count, excluding that pass   */
+static t_tile_rot     _sw_rot     = TILE_ROT_OFF; /* rotation this sweep is doing */
+static uint32_t       _sw_base    = 0U;     /* steps in the upright block        */
 
 static t_tile_det     _sw_dets[TILE_MAX_DETS];
 
@@ -289,12 +331,40 @@ void tile_axis_origins(uint16_t n, uint16_t span, uint16_t crop,
 
 /* ── Crop + resize ─────────────────────────────────────────────────────── */
 
-/* Bilinear-resize the square region [cx,cy, crop x crop] of an RGB888 frame
- * into the TILE_NN_SIDE^2 NN input. Source coordinates are clamped so we never
- * read outside the frame. */
+/* One bilinear sample of an RGB888 frame at (fx, fy), clamped so we never read
+ * outside it. Its own function because the upright and rotated walks visit the
+ * source in different orders and there must be exactly one copy of the
+ * interpolation for them to agree. */
+static void _bilinear(const uint8_t *src, uint16_t fw, uint16_t fh,
+                      float fx, float fy, uint8_t *d)
+{
+  uint32_t x0 = (uint32_t)fx;
+  if (x0 > (uint32_t)(fw - 2U)) x0 = fw - 2U;
+  uint32_t y0 = (uint32_t)fy;
+  if (y0 > (uint32_t)(fh - 2U)) y0 = fh - 2U;
+  const float wx = fx - (float)x0;
+  const float wy = fy - (float)y0;
+
+  const uint8_t *p00 = src + ((size_t)y0 * fw + x0) * 3U;
+  const uint8_t *p01 = p00 + 3U;
+  const uint8_t *p10 = p00 + (size_t)fw * 3U;
+  const uint8_t *p11 = p10 + 3U;
+
+  for (uint32_t c = 0U; c < 3U; c++)
+  {
+    float top = (float)p00[c] * (1.0f - wx) + (float)p01[c] * wx;
+    float bot = (float)p10[c] * (1.0f - wx) + (float)p11[c] * wx;
+    float v   = top * (1.0f - wy) + bot * wy;
+    d[c] = (uint8_t)(v + 0.5f);
+  }
+}
+
+/* Bilinear-resize the region [cx,cy, cw x ch] of an RGB888 frame into the
+ * TILE_NN_SIDE^2 NN input, optionally turning it 90 degrees clockwise on the
+ * way (ScopusQA #26). */
 static void _resize_crop(const uint8_t *src, uint16_t fw, uint16_t fh,
                          uint16_t cx, uint16_t cy,
-                         uint16_t cw, uint16_t ch, uint8_t *dst)
+                         uint16_t cw, uint16_t ch, bool rot, uint8_t *dst)
 {
   const uint32_t N     = TILE_NN_SIDE;
   /* Separate steps per axis: a tile is square, but the whole-frame pass is
@@ -303,33 +373,36 @@ static void _resize_crop(const uint8_t *src, uint16_t fw, uint16_t fh,
   const float    stepx = (cw > 1U) ? (float)(cw - 1U) / (float)(N - 1U) : 0.0f;
   const float    stepy = (ch > 1U) ? (float)(ch - 1U) / (float)(N - 1U) : 0.0f;
 
+  if (!rot)
+  {
+    for (uint32_t oy = 0U; oy < N; oy++)
+    {
+      const float fy = (float)cy + (float)oy * stepy;
+      for (uint32_t ox = 0U; ox < N; ox++)
+      {
+        _bilinear(src, fw, fh, (float)cx + (float)ox * stepx, fy,
+                  dst + ((size_t)oy * N + ox) * 3U);
+      }
+    }
+    return;
+  }
+
+  /* Turned 90 degrees CLOCKWISE (ScopusQA #26). The source's bottom-left
+   * corner becomes the destination's top-left, so for destination (ox, oy):
+   *
+   *     u = oy / (N-1)          along the source's width
+   *     v = 1 - ox / (N-1)      down the source's height
+   *
+   * tile_sweep_collect() inverts exactly this to put the boxes back. Keep
+   * the two together: a mismatch draws boxes in the wrong place and nothing
+   * but the overlay would show it. */
   for (uint32_t oy = 0U; oy < N; oy++)
   {
-    float    fy = (float)cy + (float)oy * stepy;
-    uint32_t y0 = (uint32_t)fy;
-    if (y0 > (uint32_t)(fh - 2U)) y0 = fh - 2U;
-    float wy = fy - (float)y0;
-
+    const float fx = (float)cx + (float)oy * stepx;
     for (uint32_t ox = 0U; ox < N; ox++)
     {
-      float    fx = (float)cx + (float)ox * stepx;
-      uint32_t x0 = (uint32_t)fx;
-      if (x0 > (uint32_t)(fw - 2U)) x0 = fw - 2U;
-      float wx = fx - (float)x0;
-
-      const uint8_t *p00 = src + ((size_t)y0 * fw + x0) * 3U;
-      const uint8_t *p01 = p00 + 3U;
-      const uint8_t *p10 = p00 + (size_t)fw * 3U;
-      const uint8_t *p11 = p10 + 3U;
-      uint8_t *d = dst + ((size_t)oy * N + ox) * 3U;
-
-      for (uint32_t ch = 0U; ch < 3U; ch++)
-      {
-        float top = (float)p00[ch] * (1.0f - wx) + (float)p01[ch] * wx;
-        float bot = (float)p10[ch] * (1.0f - wx) + (float)p11[ch] * wx;
-        float v   = top * (1.0f - wy) + bot * wy;
-        d[ch] = (uint8_t)(v + 0.5f);
-      }
+      const float fy = (float)cy + (float)((N - 1U) - ox) * stepy;
+      _bilinear(src, fw, fh, fx, fy, dst + ((size_t)oy * N + ox) * 3U);
     }
   }
 }
@@ -406,18 +479,52 @@ static void _nms(uint32_t n, float iou_th)
  * which pixels a detection came from — which would put boxes in the wrong
  * place and be invisible until someone looked at the overlay. */
 static void _step_rect(uint32_t idx, uint16_t *cx, uint16_t *cy,
-                       uint16_t *cw, uint16_t *ch)
+                       uint16_t *cw, uint16_t *ch, bool *rot, bool *is_tile)
 {
-  if (_sw_full && (idx >= _sw_tiles))
+  /* Steps [0, _sw_base) are the upright block. What follows depends on the
+   * rotation setting (ScopusQA #26):
+   *
+   *   TILE_ROT_FULL  exactly one more step, the whole frame, turned.
+   *   TILE_ROT_ALL   a second copy of the whole block, every step turned.
+   *
+   * ROT_FULL adds its whole-frame step whether or not `fullpass` is on: the
+   * two switches answer different questions, and a unit with fullpass off
+   * should still be able to see a person lying down. */
+  bool     turned = false;
+  uint32_t step   = idx;
+
+  if (idx >= _sw_base)
+  {
+    turned = true;
+    step   = (_sw_rot == TILE_ROT_ALL) ? (idx - _sw_base) : _sw_tiles;
+  }
+
+  if (rot) { *rot = turned; }
+
+  const bool whole = (step >= _sw_tiles);
+  if (is_tile) { *is_tile = !whole; }
+
+  if (whole)
   {
     *cx = 0U; *cy = 0U; *cw = _sw_fw; *ch = _sw_fh;
     return;
   }
-  uint16_t c = (uint16_t)(idx % _sw_cols);
-  uint16_t r = (uint16_t)(idx / _sw_cols);
+  uint16_t c = (uint16_t)(step % _sw_cols);
+  uint16_t r = (uint16_t)(step / _sw_cols);
   if (r >= _sw_rows) { r = (uint16_t)(_sw_rows - 1U); }
   *cx = _sw_xs[c]; *cy = _sw_ys[r];
   *cw = _sw_crop;  *ch = _sw_crop;
+}
+
+/* Steps in this sweep, upright block plus whatever rotation adds. */
+static uint32_t _sweep_steps(void)
+{
+  switch (_sw_rot)
+  {
+    case TILE_ROT_FULL: return _sw_base + 1U;
+    case TILE_ROT_ALL:  return _sw_base * 2U;
+    default:            return _sw_base;
+  }
 }
 
 uint32_t tile_sweep_begin(const uint8_t *frame, uint16_t fw, uint16_t fh)
@@ -442,31 +549,33 @@ uint32_t tile_sweep_begin(const uint8_t *frame, uint16_t fw, uint16_t fh)
 
   _sw_tiles = (uint32_t)_sw_cols * (uint32_t)_sw_rows;
   _sw_full  = _cfg_fullpass;
-  return _sw_tiles + (_sw_full ? 1U : 0U);
+  _sw_rot   = _cfg_rotate;
+  _sw_base  = _sw_tiles + (_sw_full ? 1U : 0U);
+  return _sweep_steps();
 }
 
 void tile_sweep_crop(uint32_t idx, uint8_t *dst)
 {
   if ((_sw_frame == NULL) || (_sw_cols == 0U)) return;
-  if (idx >= (_sw_tiles + (_sw_full ? 1U : 0U))) return;
+  if (idx >= _sweep_steps()) return;
 
   uint16_t cx, cy, cw, ch;
-  _step_rect(idx, &cx, &cy, &cw, &ch);
-  _resize_crop(_sw_frame, _sw_fw, _sw_fh, cx, cy, cw, ch, dst);
+  bool     rot;
+  _step_rect(idx, &cx, &cy, &cw, &ch, &rot, NULL);
+  _resize_crop(_sw_frame, _sw_fw, _sw_fh, cx, cy, cw, ch, rot, dst);
 }
 
 void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
 {
   if ((_sw_cols == 0U) || (boxes == NULL)) return;
-  if (idx >= (_sw_tiles + (_sw_full ? 1U : 0U))) return;
+  if (idx >= _sweep_steps()) return;
 
   uint16_t cx, cy, cw, ch;
-  _step_rect(idx, &cx, &cy, &cw, &ch);
+  bool     rot, is_tile;
+  _step_rect(idx, &cx, &cy, &cw, &ch, &rot, &is_tile);
 
   const float inv_fw = 1.0f / (float)_sw_fw;
   const float inv_fh = 1.0f / (float)_sw_fh;
-
-  const bool is_tile = !(_sw_full && (idx >= _sw_tiles));
 
   const float sustain_floor = tile_cfg_conf_sustain();
 
@@ -474,6 +583,23 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
   {
     _sw_n_raw++;
     if (boxes[i].conf < sustain_floor) continue;
+
+    /* Undo the 90-degree clockwise turn _resize_crop applied, so everything
+     * below works in the step's own upright coordinates and neither the edge
+     * rule nor the remap has to know a rotated pass exists. Inverse of
+     * (u, v) = (q, 1 - p): centre swaps axes, width and height swap. */
+    float b_xc = boxes[i].x_center;
+    float b_yc = boxes[i].y_center;
+    float b_w  = boxes[i].width;
+    float b_h  = boxes[i].height;
+    if (rot)
+    {
+      const float xc = b_yc;
+      const float yc = 1.0f - b_xc;
+      const float w  = b_h;
+      const float h  = b_w;
+      b_xc = xc; b_yc = yc; b_w = w; b_h = h;
+    }
 
     /* Below the full floor this is not a detection — it is only evidence that
      * something the sweep already counted has not gone away. Admitted, marked,
@@ -505,10 +631,10 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     if (is_tile && _cfg_edgedrop)
     {
       const float m  = TILE_EDGE_MARGIN;
-      const float x1 = boxes[i].x_center - boxes[i].width  * 0.5f;
-      const float x2 = boxes[i].x_center + boxes[i].width  * 0.5f;
-      const float y1 = boxes[i].y_center - boxes[i].height * 0.5f;
-      const float y2 = boxes[i].y_center + boxes[i].height * 0.5f;
+      const float x1 = b_xc - b_w * 0.5f;
+      const float x2 = b_xc + b_w * 0.5f;
+      const float y1 = b_yc - b_h * 0.5f;
+      const float y2 = b_yc + b_h * 0.5f;
 
       frag = (((x1 < m)        && (cx > 0U))            ||
               ((x2 > 1.0f - m) && ((uint32_t)cx + cw < (uint32_t)_sw_fw)) ||
@@ -523,10 +649,10 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     if (_sw_n_acc >= TILE_MAX_DETS) { _sw_sat = true; continue; }
 
     /* step-normalized -> step px -> full-frame px -> full-frame normalized */
-    float bx = (float)cx + boxes[i].x_center * (float)cw;
-    float by = (float)cy + boxes[i].y_center * (float)ch;
-    float bw = boxes[i].width  * (float)cw;
-    float bh = boxes[i].height * (float)ch;
+    float bx = (float)cx + b_xc * (float)cw;
+    float by = (float)cy + b_yc * (float)ch;
+    float bw = b_w * (float)cw;
+    float bh = b_h * (float)ch;
 
     t_tile_det *d = &_sw_dets[_sw_n_acc++];
     d->x1   = (bx - bw * 0.5f) * inv_fw;

@@ -53,7 +53,7 @@ extern "C" {
  *
  * IMPORTANT: When adding new entries to the registry, increment this version.
  */
-#define REGISTRY_VERSION        7U
+#define REGISTRY_VERSION        8U
 
 /** Notification reason bits — SoW §4.2.
  *
@@ -192,6 +192,15 @@ typedef struct
    * sizeof unchanged, and come up as whatever that padding held. */
   uint32_t  detect_tile_mode;
 
+  /* V7, also look at the picture turned 90 degrees (ScopusQA #26).
+   * 0 = off, 1 = the whole-frame pass runs both ways (+1 inference),
+   * 2 = every step runs both ways (2x inferences). t_tile_rot.
+   *
+   * uint32 for the same reason the two fields above are, see the note on
+   * detect_debounce_ms. A uint8 here would sit in the previous struct's
+   * trailing padding and come up as whatever that padding held. */
+  uint32_t  detect_rotate;
+
 } t_registry_data;
 
 /*-------------------------------------------------------------------------*//**
@@ -247,6 +256,11 @@ const t_registry_data registry_defaults =
    * cliff. The cost is the detection rate — ~1.1 s a sweep instead of ~90 ms
    * — and that was specified as acceptable. */
   .detect_tile_mode            = 1U,
+
+  /* A person lying down is a different object to this network, and at ordinary
+   * sizes it misses them outright (ScopusQA #26). One extra inference in
+   * thirteen buys the whole frame turned 90 degrees, which finds them. */
+  .detect_rotate               = 1U,     /* TILE_ROT_FULL */
 
   /* Wifi */
   .wifi_mode            = 0U,

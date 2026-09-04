@@ -123,6 +123,50 @@ bool     tile_cfg_get_fullpass(void);
 void     tile_cfg_set_edgedrop(bool on);
 bool     tile_cfg_get_edgedrop(void);
 
+/**
+ * @brief Also look at the picture turned 90 degrees (ScopusQA #26).
+ *
+ * The network has a strong upright prior: it was trained on people who are
+ * standing, and a person lying down is a different object to it. Measured on
+ * the bench, one person composited into the same scene at the same pixel
+ * size, upright and on their side, whole-frame pass:
+ *
+ *     scene                     upright   on their side
+ *     street, 500 px            found     found, conf 0.63 -> 0.37
+ *     street, 240 px            found     MISSED, and read as a car
+ *     park,   500 px            found     found
+ *     park,   240 px            found     MISSED
+ *
+ * and the same six pictures turned 90 degrees before the network sees them -
+ * which stands the lying people up and lays the standing ones down, reverses
+ * the result exactly: every lying person is found, every standing one is lost.
+ * So neither orientation is a substitute for the other, and the fix is to run
+ * both and merge, which is what this does.
+ *
+ *   TILE_ROT_OFF   as before, upright only
+ *   TILE_ROT_FULL  one extra step: the WHOLE FRAME turned 90 degrees.
+ *                  +1 inference in 13 (~8%). Recovers a lying person big
+ *                  enough for the whole-frame pass to resolve, which is the
+ *                  case ScopusQA #26 reported.
+ *   TILE_ROT_ALL   every step runs both ways. 2x inferences, so a sweep goes
+ *                  from ~1.5 s to ~3 s. Needed for a lying person too small
+ *                  or too distant for the whole-frame pass.
+ *
+ * Boxes from a rotated step are turned back into frame coordinates before the
+ * merge, so nothing downstream, overlay, counts, notifications, knows this
+ * happened.
+ */
+typedef enum
+{
+  TILE_ROT_OFF = 0,
+  TILE_ROT_FULL,
+  TILE_ROT_ALL,
+} t_tile_rot;
+
+void       tile_cfg_set_rotate(t_tile_rot r);
+t_tile_rot tile_cfg_get_rotate(void);
+const char *tile_rot_name(t_tile_rot r);
+
 void     tile_cfg_get(uint16_t *cols, uint16_t *rows, uint16_t *crop,
                       uint16_t *ovl_h, uint16_t *ovl_v,
                       float *conf, float *iou);

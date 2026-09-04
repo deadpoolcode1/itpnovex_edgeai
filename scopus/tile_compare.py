@@ -138,7 +138,7 @@ def tile_run(cam, tiles):
     """`tile run` is silent for the whole sweep then emits the report at once,
     so the timeout has to cover every tile — ~100 ms of inference each, plus
     the resize, plus slack for a notification landing mid-sweep."""
-    budget = tiles * 0.5 + 8.0
+    budget = tiles * 1.0 + 12.0
     out = cam.n6.send("tile run", "tile run ok", budget)
     if ("owns the engine" in out) or ("NN stopped" in out):
         raise TileRunRefused(out.strip().replace("\n", " ")[-160:])
@@ -165,6 +165,11 @@ def main():
                          "a frame edge (default on, as detect mode tile arms)")
     ap.add_argument("--fullpass", choices=("on", "off"), default="on",
                     help="also run the whole frame as one extra pass")
+    ap.add_argument("--rotate", choices=("off", "full", "all"), default=None,
+                    help="also read the picture turned 90 deg (ScopusQA #26): "
+                         "off, full (whole frame only, +1 inference) or all "
+                         "(every step both ways, 2x). Default: leave the "
+                         "device as it is")
     ap.add_argument("--out", default=None, help="where to write the JSON")
     args = ap.parse_args()
 
@@ -190,6 +195,8 @@ def main():
         cam.send(f"tile thresh {args.conf} {args.iou}", "tile", 4.0)
         cam.send(f"tile edgedrop {args.edgedrop}", "tile", 4.0)
         cam.send(f"tile fullpass {args.fullpass}", "tile", 4.0)
+        if args.rotate:
+            cam.send(f"detect rotate {args.rotate}", "detect rotate", 4.0)
 
         print(f"{'image':38s} {'default':>18s}   {'tile':>18s}")
         print("-" * 80)

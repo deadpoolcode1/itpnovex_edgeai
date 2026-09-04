@@ -462,7 +462,7 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "Board movement: [sense <0..100> <timeout_s>] | [query] | [read] | [selftest] | [simulate 0|1]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | mode default|tile|query | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | mode default|tile|query | rotate off|full|all|query | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
@@ -691,6 +691,7 @@ void _shell_task_init(void)
       nn_task_action_set(reg->detect_action_mask);
       nn_task_debounce_set(reg->detect_debounce_ms);
       nn_task_tile_set(reg->detect_tile_mode != 0U);
+      tile_cfg_set_rotate((t_tile_rot)reg->detect_rotate);
       motion_sens    = reg->motion_sensitivity;
       motion_timeout = reg->motion_no_motion_timeout_s;
       registry_release();
@@ -2510,9 +2511,11 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       CMD_PRINTF(stream, "  upload frame is %ux%u, used by 'tile run' only%s",
                  (unsigned)_tile_fw, (unsigned)_tile_fh, lwshell_eol());
     }
-    CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  -> %lu inferences a sweep%s",
+    CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  rotate %s  -> %lu "
+                       "inferences a sweep%s",
                tile_cfg_get_fullpass() ? "on" : "off",
                tile_cfg_get_edgedrop() ? "on" : "off",
+               tile_rot_name(tile_cfg_get_rotate()),
                (unsigned long)tile_cfg_count(), lwshell_eol());
     CMD_PRINTF(stream, "  main path: %s%s",
                nn_task_tile_get() ? "TILE (detect mode tile)"
@@ -2925,6 +2928,11 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                    tile_cfg_get_edgedrop() ? ""
                      : "  <- counts every fragment; expect a storm",
                    lwshell_eol());
+        CMD_PRINTF(stream, "  rotate %s%s%s",
+                   tile_rot_name(tile_cfg_get_rotate()),
+                   (tile_cfg_get_rotate() == TILE_ROT_OFF)
+                     ? "  <- a person lying down is likely to be missed" : "",
+                   lwshell_eol());
       }
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
@@ -2960,6 +2968,68 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     else
     {
       CMD_PRINTF(stream, "detect mode: default (whole frame, one inference)%s", lwshell_eol());
+    }
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* ScopusQA #26: also look at the picture turned 90 degrees.
+   *
+   * The network was trained on people who are standing up, and a person
+   * lying down is a different object to it, at ordinary sizes it misses
+   * them outright, and sometimes reads them as a car. Turning the picture
+   * stands them up. Measured, and the table is in tile_detect.h. */
+  if (strcmp(sub, "rotate") == 0)
+  {
+    if (argc >= 3U)
+    {
+      const char *m = (const char*)argv[2];
+      t_tile_rot  want;
+      if      (strcmp(m, "off")   == 0) { want = TILE_ROT_OFF;  }
+      else if (strcmp(m, "full")  == 0) { want = TILE_ROT_FULL; }
+      else if (strcmp(m, "all")   == 0) { want = TILE_ROT_ALL;  }
+      else if (strcmp(m, "query") == 0) { want = tile_cfg_get_rotate(); }
+      else
+      {
+        CMD_PRINTF(stream, "detect rotate: use 'off', 'full', 'all' or "
+                           "'query'%s", lwshell_eol());
+        return LWSHELL_OK;
+      }
+      if (strcmp(m, "query") != 0)
+      {
+        tile_cfg_set_rotate(want);
+        t_registry_data *reg = registry_acquire();
+        if (reg) { reg->detect_rotate = (uint32_t)want;
+                   registry_release(); registry_request_save(); }
+      }
+    }
+
+    const t_tile_rot r = tile_cfg_get_rotate();
+    CMD_PRINTF(stream, "detect rotate: %s%s", tile_rot_name(r), lwshell_eol());
+    /* The cost is the whole decision, so print it rather than make the
+     * operator work it out from the grid. */
+    switch (r)
+    {
+      case TILE_ROT_OFF:
+        CMD_PRINTF(stream, "  upright only, a person lying down is likely "
+                           "to be missed%s", lwshell_eol());
+        break;
+      case TILE_ROT_FULL:
+        CMD_PRINTF(stream, "  the whole frame is also read turned 90 deg "
+                           "(+1 inference, %lu a sweep)%s",
+                   (unsigned long)tile_cfg_count(), lwshell_eol());
+        break;
+      default:
+        CMD_PRINTF(stream, "  every step is read both ways (%lu inferences a "
+                           "sweep, about twice the time)%s",
+                   (unsigned long)tile_cfg_count(), lwshell_eol());
+        break;
+    }
+    if (!nn_task_tile_get())
+    {
+      CMD_PRINTF(stream, "  NOTE: the main path is in `detect mode default`, "
+                         "which runs no sweep, this takes effect in "
+                         "`detect mode tile`%s", lwshell_eol());
     }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
