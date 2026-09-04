@@ -327,6 +327,28 @@ static uint8_t  _notify_defer_head;
 static uint8_t  _notify_defer_count;
 static uint32_t _notify_defer_inline;   /* times the ring was full */
 
+/* Events the enable mask threw away, per §4.2 bit.
+ *
+ * ScopusQA #27: a unit configured `detect profile 0x03 0x07` (detect people
+ * AND vehicles) with `notify enable 0x55` (which has no 0x20 in it) detects
+ * every car, photographs every car, and reports none of them. That is exactly
+ * what the two masks were asked for, and from the operator's console it is
+ * indistinguishable from a detector that cannot see cars: the suppression was
+ * traced to the ST-Link port, which QA does not have open, and no command on
+ * the unit would say it had happened.
+ *
+ * So the drops are counted, and `notify query` prints them. A number beside
+ * `vehicle` is the whole answer to "I am not receiving notifications for
+ * vehicles". */
+#define NOTIFY_BITS          6U          /* the §4.2 table, 0x01 .. 0x20 */
+static uint32_t _notify_suppressed[NOTIFY_BITS];
+
+/* §4.2 bit -> name, index 0 = 0x01. Used by every line that prints a mask;
+ * a mask a person cannot read is a mask a person cannot check. */
+static const char *const _notify_bit_name[NOTIFY_BITS] = {
+  "netreg", "motion-start", "motion-stop", "periodic", "people", "vehicle"
+};
+
 /* One command line and its output. Sized against what the shell actually
  * prints: the longest single response, `commands`, is ~1.2 KB. Anything
  * beyond REMOTE_RSP_MAX is truncated with a visible marker rather than
@@ -1317,6 +1339,13 @@ static void _notify_emit_ex(uint32_t rsn, uint32_t rsd, bool force)
     if (reg) { mask = reg->notify_enable_mask; registry_release(); }
     if ((rsn & mask) == 0U)
     {
+      /* Count it under every bit the caller asked for, so `notify query` can
+       * name which event the mask is eating. The trace line stays, but it
+       * goes to the ST-Link port; the counter is what a QA host can read. */
+      for (uint32_t b = 0U; b < NOTIFY_BITS; b++)
+      {
+        if ((rsn & (1UL << b)) != 0U) { _notify_suppressed[b]++; }
+      }
       LINFO(TRACE_SHELL, "notify: rsn=0x%02lx not in enable mask 0x%02lx — "
             "not reported", (unsigned long)rsn, (unsigned long)mask);
       return;
@@ -2785,6 +2814,89 @@ static int32_t _photo_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   return LWSHELL_OK;
 }
 
+/* Print one line naming what the mask reports and what it silences.
+ *
+ * The value alone is not checkable by eye: 0x55 and 0x75 differ by the one
+ * bit that decides whether a car is ever announced, and nothing on the
+ * console said which was which (ScopusQA #27). */
+static void _notify_print_mask(const t_stream *stream, uint32_t mask)
+{
+  CMD_PRINTF(stream, "  on :");
+  bool any = false;
+  for (uint32_t b = 0U; b < NOTIFY_BITS; b++)
+  {
+    if ((mask & (1UL << b)) != 0U)
+    {
+      CMD_PRINTF(stream, " %s", _notify_bit_name[b]);
+      any = true;
+    }
+  }
+  CMD_PRINTF(stream, "%s%s", any ? "" : " (nothing)", lwshell_eol());
+
+  CMD_PRINTF(stream, "  off:");
+  any = false;
+  for (uint32_t b = 0U; b < NOTIFY_BITS; b++)
+  {
+    if ((mask & (1UL << b)) == 0U)
+    {
+      CMD_PRINTF(stream, " %s", _notify_bit_name[b]);
+      any = true;
+    }
+  }
+  CMD_PRINTF(stream, "%s%s", any ? "" : " (nothing)", lwshell_eol());
+}
+
+/* The two masks have to agree, and nothing used to check that they did.
+ *
+ * `detect profile` decides which classes the detector counts and acts on;
+ * `notify enable` decides which reasons leave the unit. A class enabled in
+ * the first and missing from the second is detected, photographed, uploaded
+ *, and never reported. That is a legal configuration, so this is a warning
+ * and not an error, but it is printed by whichever of the two commands the
+ * operator just typed, because "I set it and got nothing" has no other
+ * answer on this console. */
+static void _notify_warn_class_gap(const t_stream *stream,
+                                   uint32_t ntf_mask, uint8_t det_mask)
+{
+  static const struct { uint8_t det_bit; uint32_t rsn; const char *what; }
+  PAIRS[] = {
+    { 0x01U, NOTIFY_RSN_PEOPLE,  "people"   },
+    { 0x02U, NOTIFY_RSN_VEHICLE, "vehicles" },
+  };
+
+  for (uint32_t i = 0U; i < (sizeof(PAIRS) / sizeof(PAIRS[0])); i++)
+  {
+    if (((det_mask & PAIRS[i].det_bit) != 0U) &&
+        ((ntf_mask & PAIRS[i].rsn)     == 0U))
+    {
+      CMD_PRINTF(stream,
+                 "  WARNING: %s are detected (detect profile det_msk 0x%02x) "
+                 "but 0x%02lx is not in the notify mask, they will be "
+                 "photographed and never reported. `notify enable 0x%02lx` "
+                 "adds it.%s",
+                 PAIRS[i].what, (unsigned)det_mask,
+                 (unsigned long)PAIRS[i].rsn,
+                 (unsigned long)(ntf_mask | PAIRS[i].rsn), lwshell_eol());
+    }
+  }
+}
+
+static uint8_t _detect_det_mask_now(void)
+{
+  uint8_t dm = 0U;
+  t_registry_data *reg = registry_acquire();
+  if (reg) { dm = reg->detect_det_mask; registry_release(); }
+  return dm;
+}
+
+static uint32_t _notify_mask_now(void)
+{
+  uint32_t m = 0U;
+  t_registry_data *reg = registry_acquire();
+  if (reg) { m = reg->notify_enable_mask; registry_release(); }
+  return m;
+}
+
 /* SoW §3.1 / §4.2: notify enable <mask> | disable | trigger <code> |
  *                  period <seconds> | query.
  *
@@ -2809,6 +2921,8 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     t_registry_data *reg = registry_acquire();
     if (reg) { reg->notify_enable_mask = (uint32_t)mask; registry_release(); registry_request_save(); }
     CMD_PRINTF(stream, "notify enable: 0x%08lx%s", mask, lwshell_eol());
+    _notify_print_mask(stream, (uint32_t)mask);
+    _notify_warn_class_gap(stream, (uint32_t)mask, _detect_det_mask_now());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2817,6 +2931,8 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     t_registry_data *reg = registry_acquire();
     if (reg) { reg->notify_enable_mask = 0U; registry_release(); registry_request_save(); }
     CMD_PRINTF(stream, "notify enable: 0x00000000%s", lwshell_eol());
+    CMD_PRINTF(stream, "  nothing is reported now, detection included%s",
+               lwshell_eol());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -2850,6 +2966,26 @@ static int32_t _notify_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     if (reg) { m = reg->notify_enable_mask; p = reg->notify_period_s; registry_release(); }
     CMD_PRINTF(stream, "notify: enable_mask=0x%08lx period=%lus num=%lu%s",
                (unsigned long)m, (unsigned long)p, (unsigned long)_notify_num, lwshell_eol());
+    _notify_print_mask(stream, m);
+
+    /* What the mask has actually cost, since boot. Silence with a number
+     * beside it is a configuration; silence with a zero is a quiet scene. */
+    uint32_t total = 0U;
+    for (uint32_t b = 0U; b < NOTIFY_BITS; b++) { total += _notify_suppressed[b]; }
+    if (total > 0U)
+    {
+      CMD_PRINTF(stream, "  dropped by the mask since boot:");
+      for (uint32_t b = 0U; b < NOTIFY_BITS; b++)
+      {
+        if (_notify_suppressed[b] > 0U)
+        {
+          CMD_PRINTF(stream, " %s=%lu", _notify_bit_name[b],
+                     (unsigned long)_notify_suppressed[b]);
+        }
+      }
+      CMD_PRINTF(stream, "%s", lwshell_eol());
+    }
+    _notify_warn_class_gap(stream, m, _detect_det_mask_now());
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -3067,7 +3203,20 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                lwshell_eol());
     /* Also fire the +SDVRNTF the inference loop would have, under the reason
      * code for the class that was asserted. */
-    _notify_emit(vehicle ? NOTIFY_RSN_VEHICLE : NOTIFY_RSN_PEOPLE, boxes);
+    const uint32_t rsn = vehicle ? NOTIFY_RSN_VEHICLE : NOTIFY_RSN_PEOPLE;
+    _notify_emit(rsn, boxes);
+    /* This command exists to prove the report chain, so a mask that eats the
+     * report has to be said out loud here, a silent `simulate` is the exact
+     * shape of ScopusQA #27. `notify trigger` is the way past the mask. */
+    if ((_notify_mask_now() & rsn) == 0U)
+    {
+      CMD_PRINTF(stream, "  no +SDVRNTF: 0x%02lx is not in the notify mask "
+                         "(0x%02lx). `notify enable 0x%02lx` reports it; "
+                         "`notify trigger 0x%02lx` bypasses the mask.%s",
+                 (unsigned long)rsn, (unsigned long)_notify_mask_now(),
+                 (unsigned long)(_notify_mask_now() | rsn),
+                 (unsigned long)rsn, lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -3135,6 +3284,7 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       if (reg) { dm = reg->detect_det_mask; am = reg->detect_action_mask; registry_release(); }
       CMD_PRINTF(stream, "detect profile: det_msk=0x%02x action_msk=0x%02x%s",
                  (unsigned)dm, (unsigned)am, lwshell_eol());
+      _notify_warn_class_gap(stream, _notify_mask_now(), dm);
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
     }
@@ -3159,6 +3309,7 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       nn_task_action_set((uint8_t)am);
       CMD_PRINTF(stream, "detect profile: det_msk=0x%02lx action_msk=0x%02lx%s",
                  (unsigned long)dm, (unsigned long)am, lwshell_eol());
+      _notify_warn_class_gap(stream, _notify_mask_now(), (uint8_t)dm);
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
     }
