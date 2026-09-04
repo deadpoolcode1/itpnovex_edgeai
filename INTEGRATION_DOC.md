@@ -170,7 +170,7 @@ The whole path, including where an injected frame joins it:
 
 Text-line shell on the CDC ACM endpoint. Each command terminated with `\n` (or `\r\n`). Output lines end with `\r\n`. Echo controllable via `echo on|off`. The full surface is the Scopus SoW §4 table — see `tests/run_tests.py` for executable references. Highlights:
 
-- `detect start|stop|profile <det> <act>|profile query|simulate [N]`
+- `detect start|stop|mode default|tile|query|rotate off|full|all|query|profile <det> <act>|profile query|simulate [N]`
 - `notify enable|disable|trigger <code>|period <s>|query`
 - `photo savesd|upload`
 - `img size <H> <W>|quality 1..100|color YCBCR|RGB|CMYK|chroma 0|1|query`
@@ -184,6 +184,8 @@ Text-line shell on the CDC ACM endpoint. Each command terminated with `\n` (or `
 - `mdm <at-cmd>|test echo|test urc <line>` (modem tunnel, see §3.2)
 
 ### 3.2 Modem channel (M3 — N6 side complete, awaiting MangOH)
+
+**Receive path:** USART2's receiver runs continuously into a driver-owned 1 KB ring, fed by a GPDMA single-node circular linked list, with the USART's 16-byte hardware FIFO enabled ahead of it (ScopusQA #23). `bsp_uart_read()` copies out of the ring rather than arming a transfer per call, so there is no window between reads in which an unsolicited line from the modem has nowhere to go. `mdm stats` reports `ring: ... lost=N`; `lost` must be 0.
 
 **Transport:** USART2 @ 115200 8N1 with HDLC framing — `0x7E` start/end flags, `0x7D` escape with `XOR 0x20`, CRC-16/XMODEM appended big-endian. See `vendor/.../Application/Core/Inc/hdlc.h` for the C contract and `tools/hdlc.py` for the host-side mirror.
 

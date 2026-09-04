@@ -1,6 +1,260 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-09-02. Everything below was measured on the bench, not inferred.
+Last updated: 2026-09-04. Everything below was measured on the bench, not inferred.
+
+---
+
+## 2026-09-04: a person lying down is a different object (ScopusQA #26)
+
+ITP: "There is difficulty in identifying a horizontal person. In this picture it
+took about 3 minutes before there was identification. In these 2 pictures there
+was no identification at all." Reuven asked the right question against it:
+**was the model trained for such detections?**
+
+### The measurement that answers it
+
+One person, cut out of ITP's own picture, composited into the same scene at the
+same pixel size, twice: on their side and standing up. Same pixels, same
+background, same scale, so orientation is the only thing that differs. Three
+sizes, two scenes, whole-frame pass:
+
+| long axis in an 800x600 frame | standing | lying |
+|---|---|---|
+| street, 500 px | person 0.63 | person **0.37** |
+| street, 240 px | nothing found | **car 0.50**, the person read as a vehicle |
+| street, 110 px | nothing | **car 0.55, 0.37** |
+| park, 500 px | person 0.55 | person 0.63 |
+| park, 240 px | nothing | nothing |
+
+and then the same six pictures turned 90 degrees before the network sees them,
+which stands the lying people up and lays the standing ones down:
+
+| | upright pass | rotated pass |
+|---|---|---|
+| ITP's park scene, person lying | **0 people** | **1 person** |
+| ITP's grass scene, person lying | **0 people** | **1 person** |
+| the same person standing | 1 person | **0 people** |
+
+**So yes, the model covers it, and no, that is not the whole answer.** A lying
+person is found when they are large and lost at ordinary sizes, and a lying
+person the network does find scores about 0.2 lower than the same person
+standing, which puts them straight onto the 0.45 live floor, and a detection
+that sits on the floor crosses it both ways. That is exactly ITP's "about 3
+minutes before there was identification".
+
+The class confusion is worth stating separately because it is the more
+dangerous half: **a person lying down at 240 px and below was reported as a
+car.** The unit does not miss them quietly, it miscounts them into the other
+class.
+
+### The fix: read the picture the other way up too
+
+`detect rotate off | full | all`, persisted, reachable over the remote command
+channel. Boxes from a rotated step are turned back into frame coordinates
+before the merge, so nothing downstream (overlay, counts, notifications)
+knows it happened.
+
+| | count error | exact | inferences a sweep |
+|---|---|---|---|
+| `off` (the old behaviour) | 7 | 8 / 15 | 13 |
+| **`full`**, the whole frame also read turned 90 deg | **4** | **11 / 15** | 14 |
+| `all`, every tile and the whole frame both ways | 5 | 10 / 15 | 26 |
+
+`full` is the default: it is one extra inference in thirteen, it recovers both
+scenes ITP reported as "no identification at all", and it made nothing worse on
+this set. The sweep on the bench went from ~1525 ms to ~1540 ms, which is
+inside the run-to-run spread and not a cost worth naming. `all` doubles the sweep from ~1.5 s to ~3 s and, on this set, buys
+nothing, it double-counted one scene the single rotated pass got right. It is
+offered because a lying person too small for the whole-frame pass needs it, and
+it is not the default because the evidence here does not support paying for it.
+
+`detect rotate off` reproduces the old numbers exactly, which is the control:
+the rotation code changes nothing when it is switched off.
+
+### What it costs on ordinary, upright scenes
+
+The whole 75-image QA set, run twice, `off` then `full`, nothing else changed.
+**Two images out of 75 answered differently**, both by gaining a detection:
+
+| image | off | full |
+|---|---|---|
+| `2_fat_people .PNG` | 2 people | 3 people (the third at conf 0.67) |
+| `crowd_13.jpg` | 5 people | 5 people + 1 bicycle at 0.50 |
+
+The scored totals are identical between the two runs: over the 30 images whose
+name states a count, default 34 count error / 14 exact, tile 38 / 11, both
+times. So the price of the rotated pass on upright scenes is one extra
+detection on each of two pictures in seventy-five, one of which is wrong, and
+the return is the lying-person table above.
+
+The measurement is repeatable in one command:
+`python3 scopus/tile_compare.py images --rotate off|full|all`.
+
+The 15 lying/upright pictures live on the bench at
+`~/work/itpnovex/edgeai/images_lying/`, alongside the QA set, because images
+are gitignored here. They are built from ITP's own three attachments on
+ScopusQA #26: the person is cut out of their picture and composited into an
+empty scene from the same set at three sizes, once on their side and once
+standing, so the pair differs only in orientation. `images_lying_rot/` is the
+same fifteen turned 90 degrees, which is what showed that each orientation is
+blind to the other.
+
+---
+
+## 2026-09-04: vehicles were detected, photographed, and never reported (ScopusQA #27)
+
+ITP: "I am not receiving notifications for vehicles. I get a picture of vehicles
+but no notification", with the two commands they had run:
+
+```
+detect profile 0x03 0x07      # detect people AND vehicles, all three actions
+notify enable 0x55            # 0x01|0x04|0x10|0x40
+```
+
+**0x55 does not contain 0x20.** The unit was doing exactly what it was told:
+detect vehicles, photograph them, upload the photo, and drop the vehicle
+notification, because the §4.2 enable mask says not to send it. Reproduced on
+the bench in one command, in the state ITP left it in: `detect simulate 2
+vehicle` printed the simulation and no `+SDVRNTF`, while `detect simulate 2`
+printed the people event immediately.
+
+### Why that is a product bug and not a typo
+
+The suppression was real, deliberate and **invisible**. The only trace of it
+went to the ST-Link port, which QA does not have open, and no command on the
+unit would say it had happened. Two masks have to agree and nothing checked
+that they did; from the console, a mask eating every vehicle event is
+indistinguishable from a detector that cannot see cars.
+
+So the masks now explain themselves:
+
+- `notify enable` and `notify query` print the mask in words, which events are
+  on, which are off. 0x55 and 0x75 differ by the one bit that matters and no
+  one can see that in hex.
+- Both `notify enable` and `detect profile` warn when a class the detector is
+  counting has no notification bit, and print the mask value that would fix it.
+- `notify query` reports what the mask has actually cost since boot:
+  `dropped by the mask since boot: vehicle=12`. Silence with a number beside it
+  is a configuration; silence with a zero is a quiet scene.
+- `detect simulate N vehicle` says when its own event was swallowed, because
+  that command exists to prove the report chain.
+
+### And the settings were being wiped by every firmware update
+
+Found while adding the registry field for #26: the bench came back from the
+flash with `det_msk 0x01` and `notify 0x3F`, not the `0x03` / `0x55` ITP had
+left it in. `slib32_registry.c` verified the stored CRC over
+`sizeof(t_registry_data)`, **today's** struct size, while `_reg_load()` had
+read that many bytes out of flash, so on any version bump the bytes past the
+stored end are whatever the erase left behind, the CRC cannot match, and the
+registry is reset to defaults. The migration code immediately below it has
+never once run.
+
+The CRC is now taken over the number of bytes that were actually stored. That
+is the operator's notification mask, detection profile, server endpoints and
+image settings, kept across an update instead of silently reverted.
+
+---
+
+## 2026-09-04: the modem link now receives continuously (ScopusQA #23)
+
+Reuven, after the first answer: *"When we will put CPU into idle (sleep) mode
+with UART enabled, it will take time since data arrival until processing... it
+is better to use hardware FIFO, such that up to 16 bytes, the message will not
+be lost. It is important, especially for URC messages received from the modem,
+as they may not repeat themselves. Please use hardware FIFO with ring function
+as requested."*
+
+Done, both halves.
+
+**The FIFO.** `n6cam_uart.c` configured a threshold and then called
+`HAL_UARTEx_DisableFifoMode()` one line later, which made both threshold calls
+inert and left the peripheral moving one character per interrupt or DMA
+request. FIFO mode is on now, RX threshold 1/2 (8 of 16 bytes). It does not
+change receive-to-idle: the USART raises its DMA request on RXFNE (FIFO not
+empty), so a partial FIFO still drains and a variable-length AT response still
+completes on the gap after the last character.
+
+**The ring.** The STM32N6 GPDMA has no `DMA_CIRCULAR` transfer mode; looping is
+done with the linked-list engine, which is the mechanism Reuven named. USART2's
+receiver now runs a single-node **circular linked list** into a driver-owned
+1 KB buffer and never stops. `bsp_uart_read()` copies out of that ring instead
+of arming a transfer into the caller's buffer, so there is no window between
+reads at all: reception continues while the caller is parsing, sleeping, or
+not there. That is the part that answers the sleep case and the URC case, since
+a URC is not a reply to anything and nobody re-sends it.
+
+Measured on the bench, 60 AT round trips while the camera ran a tiled sweep
+every ~1.5 s, which is the busiest the CPU gets:
+
+```
+round trips: 60 sent, 60 answered, 0 missed, 289 s
+rx: bytes=968 frames=88 badcrc=0 overflow=0 trunc=0 stray=0 err=0
+tx: frames=88 err=0 retries=30   usart2 err(ORE/FE/NE)=0
+ring: on (continuous DMA + 16-byte FIFO)  bytes=990 lost=0 peak=11/1024 restarts=0
+```
+
+`lost` is the number that matters and it is 0: it counts bytes the DMA wrote
+over before anyone read them, which is the one way this path can still drop a
+URC. `peak` is the evidence for the ring's size rather than a guess about it.
+All three are in `mdm stats`.
+
+`peak` is also the clearest evidence that the ring is doing something. On that
+quiet 60-command run it reached 11 bytes; across the two regression suites,
+which include the deliberate link-wedge tests, it reached **402 of 1024**. That
+is 402 bytes that arrived while nobody was reading, and 402 bytes that the old
+demand-driven receiver had nowhere to put.
+
+Three things the build turned up on the way, each worth more than the feature:
+
+- **An RX error aborts the DMA even in circular mode.** `UART_EndRxTransfer`
+  clears `CR3.DMAR` on any ORE/FE/NE, so "the ring runs for ever" is only true
+  if something puts it back. `bsp_uart_read()` checks and re-arms, and counts
+  the re-arms; a climbing `restarts` is a wiring or noise problem, not a
+  software one.
+- **`HAL_DMAEx_List_BuildNode` asserts on `SrcSecure`/`DestSecure`**, because
+  this part is built `CPU_IN_SECURE_STATE` and `IS_DMA_ATTRIBUTES` rejects 0.
+  Leaving them out ran `assert_failed()` on the modem task at 181 ms of every
+  boot.
+- **`Error_Handler()` spins the calling thread for ever and releases the
+  watchdog.** So a failed assert does not reset the board: the other threads
+  carry on, the unit looks alive, and if the thread that died is the shell the
+  console stops answering and the kit can only be recovered over SWD. That is
+  how the first build of this change presented, and the trace said only
+  `FAILURE (modem.task)!`, because the file and line that `assert_failed()` is
+  handed were being thrown away. They are logged now.
+
+### Both suites, after all three changes
+
+```
+run_integration_tests.py   66 total   65 PASS   0 FAIL   0 GAP   1 SKIP
+run_scopus_tests.py        49 total   45 PASS   0 FAIL           4 SKIP
+```
+
+Identical to the last clean run before this work. The one integration SKIP and
+all four per-command SKIPs are the absent SD card.
+
+**The first attempt at that run scored 41/10/15 and none of it was the
+camera.** Ten tests failed on `AT` and `AT+SDVRVER` answering ERROR, and the
+modem's own log named the reason:
+
+```
+UartFilter: modem AT port opened fd=49
+UartFilter: no terminator from modem after 5000ms, synthesising ERROR
+```
+
+sdvrApp forwards those two to the module's own AT interface (`/dev/ttyAT` to
+`/dev/smd8`) and the module was not answering, so the app synthesised an ERROR
+of its own. Commands sdvrApp handles itself (`AT+SDVRUPLSTOP`, `AT+SDVRNTFA`,
+`AT+SDVRNTFPORT`) worked throughout, and the same log showed every command
+arriving over the HDLC channel byte-exact with `badcrc=0` and `ring lost=0`,
+which is what cleared the camera. Restarting sdvrApp did not fix it; rebooting
+the modem did. The 14 group-H skips in that run were the FTDI adapter being
+unplugged, and they came back after the reboot re-enumerated the port.
+
+**Worth remembering as a diagnosis, not a fix:** when the whole D/I/J group
+fails at once, read `/sbin/logread` on the modem before touching the camera.
+`UartFilter: no terminator from modem` means the module, not the link.
 
 ---
 
@@ -1881,10 +2135,14 @@ Three traps, each of which cost a cycle:
   existing copy fails with permission denied. `rm -f` the target first, and
   compare CRC32 on both ends — `n6cam-update.py` prints the CRC it is about to
   send, so a stale flash is visible if you look.
-- **SWD is not available**: the ST-Link is healthy (reports 3.30 V) but every
-  connect mode answers `Unable to get core ID`, because the kit's boot switch
-  is in operation mode. Flashing over SWD would need someone at the bench to
-  move it. The CDC path above avoids the question entirely.
+- **SWD works again, and it is the way out of a wedged console.** The note
+  that used to sit here said SWD answered `Unable to get core ID` because of
+  the boot switch; on 2026-09-04 it connected first time and reset the board:
+  `STM32_Programmer_CLI -c port=SWD mode=HOTPLUG reset=HWrst`, with
+  `LD_LIBRARY_PATH=~/stm32prog/lib` and sudo. That matters because
+  `n6cam-update.py` drives the CDC console, so a kit whose console has stopped
+  answering cannot be reflashed, and this is the only remote way to restart it.
+  The CDC path above is still the normal one.
 - **The CDC port re-enumerates after a flash** and can come back as a different
   `ttyACM<n>`. Wait ~30 s and resolve the by-id symlink again, or the harness
   dies with `OSError(5)`.
@@ -1910,7 +2168,27 @@ embedded string:
 A build whose log looked like 1.3.0 was actually 1.0.11 with the Scopus
 commands missing.
 
-### Current state — the headline use case works
+### Current state, 2026-09-04
+
+- Camera: local `master` build, `Sep 4 2026`. Registry version 8
+  (`detect_rotate`). Tiling is the main path and now reads the whole frame
+  turned 90 degrees as well (`detect rotate full`, 14 inferences a sweep,
+  ~1.5 s).
+- Modem: **1.17.0**. The module's own AT interface wedged on 2026-09-04 and a
+  modem reboot cleared it, see the ScopusQA #23 entry above for how to tell
+  that apart from a camera fault.
+- `run_integration_tests.py` -> **65 PASS / 0 FAIL / 0 GAP / 1 SKIP**.
+- `run_scopus_tests.py` -> **45 PASS / 0 FAIL / 4 SKIP**.
+- Host tests, no kit needed: `python3 tests/test_hdlc_crosscheck.py` and
+  `python3 tests/test_registry_migration.py`.
+- The bench camera can be recovered over SWD when the CDC console stops
+  answering, which is worth knowing because a failed `assert_param` leaves the
+  shell thread spinning and the kit otherwise unreachable:
+  `STM32_Programmer_CLI -c port=SWD mode=HOTPLUG reset=HWrst`
+  (needs `LD_LIBRARY_PATH=~/stm32prog/lib` and sudo). The old note that SWD is
+  unavailable because of the boot switch is out of date.
+
+### The older state note, kept for the recipes below
 
 - Camera: local `master` build with the notification path wired (see §1).
 - Modem: **1.7.1**, 33 AT commands.

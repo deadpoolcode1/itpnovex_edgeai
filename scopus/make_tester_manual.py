@@ -426,19 +426,35 @@ def build():
     expected(doc)
     code(doc, "[camera /dev/ttyACM2] > notify enable 0xff\n"
               "notify enable: 0x000000ff\n"
+              "  on : netreg motion-start motion-stop periodic people vehicle\n"
+              "  off: (nothing)\n"
               "notify enable ok")
     doc.add_paragraph()
     table(doc, ["Command", "Meaning"],
           [["detect profile 0x01 0x03",
             "look for people (0x01); when you find some, both save a picture "
             "to the SD card and report it (0x03). The 'report' half is what "
-            "makes an event reach this PC — with it off the camera detects "
+            "makes an event reach this PC. With it off the camera detects "
             "silently"],
            ["notify enable 0xff", "allow every kind of event to be reported"]])
     doc.add_paragraph()
+    note(doc, "The two lines under 'notify enable' say which events the "
+              "camera will report and which it will keep to itself. Read "
+              "them. A kind of event that is on the 'off' line will be "
+              "detected, photographed and never reported, and nothing later "
+              "in this test will tell you why.")
+    doc.add_paragraph()
+    note(doc, "To look for vehicles as well, use 'detect profile 0x03 0x03' "
+              "and make sure 'vehicle' is on the 'on' line above. Vehicles "
+              "are a separate bit in both settings: 0x02 in the detect "
+              "profile and 0x20 in the notify mask. Setting one without the "
+              "other is the commonest way to end up with pictures of cars "
+              "and no notifications about them, and the camera now warns you "
+              "when you do it.")
+    doc.add_paragraph()
     note(doc, "These two settings go back to their defaults if the camera "
               "restarts. If a later step stops producing events, come back "
-              "and run these two again — see section 15.")
+              "and run these two again, see section 15.")
 
     # ── Step 6 ─────────────────────────────────────────────────────────
     doc.add_heading("Step 6 — Check the two boards are talking", level=1)
@@ -911,7 +927,9 @@ def build():
     code(doc, "rx: bytes=158 frames=10 badcrc=0 stray=1 err=4 timeouts=861\n"
               "tx: frames=102 err=0 retries=3   usart2 err(ORE/FE/NE)=4\n"
               "ntf: queued=3 sent=3 unconfirmed=0 dropped=0\n"
-              "link: relinks=3 consec_timeouts=0")
+              "link: relinks=3 consec_timeouts=0\n"
+              "ring: on (continuous DMA + 16-byte FIFO)  bytes=990 lost=0 "
+              "peak=11/1024 restarts=0")
     table(doc, ["Counter", "What it tells you"],
           [["ntf: queued / sent", "events the camera raised, and events it "
                                   "got to the modem. These should track each "
@@ -925,7 +943,11 @@ def build():
                              "cable. A number that climbs during a test is "
                              "worth reporting."],
            ["rx: badcrc / stray", "corruption on the internal cable. A clean "
-                                  "link reports 0 badcrc."]])
+                                  "link reports 0 badcrc."],
+           ["ring: lost", "bytes the camera received and never got to read. "
+                          "Must be 0. Anything else is worth reporting."],
+           ["ring: peak", "the most the camera ever had waiting, out of the "
+                          "space it has. Information, not a fault."]])
 
     # ── Reporting ──────────────────────────────────────────────────────
     doc.add_heading("16. What to put in your report", level=1)
