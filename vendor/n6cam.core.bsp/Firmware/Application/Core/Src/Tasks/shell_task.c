@@ -121,9 +121,17 @@
 #define FWUPD_HDR_READ_TIMEOUT_MS   10000U
 #define FWUPD_PAYLOAD_TIMEOUT_MS    600000U                /* 10 min — model can be tens of MB */
 
+/* How long `tile inject` stands in for the lens. Long enough to watch several
+ * sweeps and a debounce window settle, short enough that a unit left injecting
+ * goes back to watching the room by itself, the same bargain, and the same
+ * reason, as nn_task's NN_TEST_FRAME_TTL_S. */
+#define TILE_INJECT_TTL_S           300U
+
 /* Common -------------------------------------*/
 #define OPT_AUTO                "auto"
 #define OPT_OFF                 "off"
+#define OPT_ON                  "on"
+#define OPT_QUERY               "query"
 #define OPT_UPDATE              "update"
 #define STATUS_ACTIVE           "active"
 #define STATUS_INACTIVE         "inactive"
@@ -484,12 +492,12 @@ static const t_lwshell_cmd  _shell_cmd[] = {
   {.run = _irled_cmd              , .name = "irled"     , .help = "[on | off | query]" },
   {.run = _motion_cmd             , .name = "motion"    , .help = "Board movement: [sense <0..100> <timeout_s>] | [query] | [read] | [selftest] | [simulate 0|1]" },
   {.run = _img_cmd                , .name = "img"       , .help = "[size H W | quality 1..100 | color YCBCR|RGB|CMYK | chroma 0|1 | query]" },
-  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | mode default|tile|query | rotate off|full|all|query | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
+  {.run = _detect_cmd             , .name = "detect"    , .help = "[start | stop | mode default|tile|query | rotate off|full|auto|all|query | profile <det_msk> <act_msk> (act bit0=SD bit1=report bit2=upload) | profile query | debounce <ms> | debounce query | stats | simulate [N] [people|vehicle]]" },
   {.run = _notify_cmd             , .name = "notify"    , .help = "[enable <mask>|disable|trigger <code>|period <s>|query]" },
   {.run = _photo_cmd              , .name = "photo"     , .help = "[savesd | upload] - capture JPEG and save to SD / upload via modem" },
   {.run = _sd_cmd                 , .name = "sd"        , .help = "[query | ls | format CONFIRM]" },
   {.run = _frame_cmd              , .name = "frame"     , .help = "[upload | load <file.raw> | run | report on|off | grab [nn|live] | clear | query] - inject test frame into NN; grab dumps what the detector sees" },
-  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|fullpass on|off|edgedrop on|off|upload|run|live [n]|query|clear|default] - tiled multi-crop detection" },
+  {.run = _tile_cmd               , .name = "tile"      , .help = "[grid c r|crop px|frame W H|overlap h v|thresh conf iou|fullpass on|off|edgedrop on|off|upload|run|live [n]|inject on|off|query|query|clear|default] - tiled multi-crop detection" },
   {.run = _mdm_cmd                , .name = "mdm"       , .help = "<cmd> | relink | test wedge [baud] | test urc <line> | test echo | stats | raw on|off - MangOH modem pass-through (SoW §4.6)" },
   {.run = _recovery_cmd           , .name = "recovery"  , .help = "Reboot into FSBL recovery (halts chip; useful with provisioned DA cert only)" },
   {.run = _safeboot_cmd           , .name = "safeboot"  , .help = "[status | clear | test] - bootloop counter / safe-mode inspection + drill" },
@@ -2264,7 +2272,9 @@ static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
   uint32_t n_tiles = tile_sweep_begin(frame, fw, fh);
   uint32_t t0 = HAL_GetTick();
 
-  for (uint32_t i = 0U; i < n_tiles; i++)
+  /* `i < tile_sweep_steps()`, not `i < n_tiles`: `detect rotate auto` makes
+   * the sweep longer part-way through, see tile_sweep_steps(). */
+  for (uint32_t i = 0U; i < tile_sweep_steps(); i++)
   {
     tile_sweep_crop(i, _frame_test_buf);
     SCB_CleanInvalidateDCache_by_Addr((uint32_t*)_frame_test_buf, FRAME_EXPECTED_SIZE);
@@ -2285,6 +2295,7 @@ static int32_t _tile_run_source(const t_stream *stream, const uint8_t *frame,
 
   uint32_t kept = tile_sweep_finish();
   uint32_t elapsed = HAL_GetTick() - t0;
+  n_tiles = tile_sweep_steps();          /* what the sweep actually walked  */
 
   uint32_t n_raw = 0U, n_acc = 0U;
   tile_sweep_stats(&n_raw, &n_acc);
@@ -2540,15 +2551,40 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       CMD_PRINTF(stream, "  upload frame is %ux%u, used by 'tile run' only%s",
                  (unsigned)_tile_fw, (unsigned)_tile_fh, lwshell_eol());
     }
+    if (tile_cfg_get_rotate() == TILE_ROT_AUTO)
+    {
+      uint32_t done = 0U, wanted = 0U;
+      tile_sweep_relook_stats(&done, &wanted);
+      CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  rotate auto  -> %lu to "
+                         "%lu inferences a sweep (last: %lu second look(s) of "
+                         "%lu asked for)%s",
+                 tile_cfg_get_fullpass() ? "on" : "off",
+                 tile_cfg_get_edgedrop() ? "on" : "off",
+                 (unsigned long)tile_cfg_count(),
+                 (unsigned long)(tile_cfg_count() + TILE_ROT_AUTO_MAX),
+                 (unsigned long)done, (unsigned long)wanted, lwshell_eol());
+    }
+    else
+    {
     CMD_PRINTF(stream, "  fullpass %s  edgedrop %s  rotate %s  -> %lu "
                        "inferences a sweep%s",
                tile_cfg_get_fullpass() ? "on" : "off",
                tile_cfg_get_edgedrop() ? "on" : "off",
                tile_rot_name(tile_cfg_get_rotate()),
                (unsigned long)tile_cfg_count(), lwshell_eol());
+    }
     CMD_PRINTF(stream, "  main path: %s%s",
                nn_task_tile_get() ? "TILE (detect mode tile)"
                                   : "default (whole frame)", lwshell_eol());
+    {
+      const uint32_t inj = tile_inject_left_s();
+      if (inj > 0U)
+      {
+        CMD_PRINTF(stream, "  INJECT: the live sweep is reading the uploaded "
+                           "frame, not the lens (%lu s left)%s",
+                   (unsigned long)inj, lwshell_eol());
+      }
+    }
     for (uint16_t r = 0U; r < rows; r++)
     {
       for (uint16_t c = 0U; c < cols; c++)
@@ -2564,8 +2600,85 @@ static int32_t _tile_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
   if (strcmp(sub, "clear") == 0)
   {
     nn_task_set_test_frame(NULL);
+    tile_inject_set(NULL, 0U, 0U, 0U);
     _tile_loaded = false;
     CMD_PRINTF(stream, "tile: cleared (NN back to live camera)%s", lwshell_eol());
+    _cmd_ack(stream, argv, argc);
+    return LWSHELL_OK;
+  }
+
+  /* `tile inject on|off|query`, put the uploaded frame in front of the LIVE
+   * sweep, so a known picture drives the counts and the notifications and not
+   * just a console report (ScopusQA #26, reopened). See tile_inject_set(). */
+  if (strcmp(sub, "inject") == 0)
+  {
+    const char *m = (argc >= 3U) ? (const char*)argv[2] : OPT_QUERY;
+
+    if (strcmp(m, OPT_ON) == 0)
+    {
+      if (!_tile_loaded)
+      {
+        CMD_PRINTF(stream, "tile inject: no frame, 'tile frame %u %u' then "
+                           "'tile upload' first%s",
+                   (unsigned)CAMERA_MAIN_WIDTH, (unsigned)CAMERA_MAIN_HEIGHT,
+                   lwshell_eol());
+        return LWSHELL_OK;
+      }
+      /* The live sweep tiles the MAIN PIPE's geometry. A frame of any other
+       * size would be tiled by the same grid over a different picture, which
+       * is a test measuring something the product never does. */
+      if ((_tile_fw != (uint16_t)CAMERA_MAIN_WIDTH) ||
+          (_tile_fh != (uint16_t)CAMERA_MAIN_HEIGHT))
+      {
+        CMD_PRINTF(stream, "tile inject: the frame is %ux%u; the live sweep "
+                           "reads %ux%u, re-upload at that size%s",
+                   (unsigned)_tile_fw, (unsigned)_tile_fh,
+                   (unsigned)CAMERA_MAIN_WIDTH, (unsigned)CAMERA_MAIN_HEIGHT,
+                   lwshell_eol());
+        return LWSHELL_OK;
+      }
+      tile_inject_set(_fwupd_model_buf, _tile_fw, _tile_fh,
+                      TILE_INJECT_TTL_S * 1000U);
+      CMD_PRINTF(stream, "tile inject: on, %ux%u, for %u s%s",
+                 (unsigned)_tile_fw, (unsigned)_tile_fh,
+                 (unsigned)TILE_INJECT_TTL_S, lwshell_eol());
+      if (!nn_task_tile_get())
+      {
+        CMD_PRINTF(stream, "  NOTE: the main path is in `detect mode default`, "
+                           "which runs no sweep, `detect mode tile` first%s",
+                   lwshell_eol());
+      }
+      if (!nn_task_detect_get())
+      {
+        CMD_PRINTF(stream, "  NOTE: detection is stopped, `detect start`%s",
+                   lwshell_eol());
+      }
+      /* The lens is only borrowed for the DETECTOR. Anything that takes a
+       * picture still takes it of the room, and a test that did not know
+       * that would read the .jpg as a failure. */
+      CMD_PRINTF(stream, "  NOTE: counts and notifications come from this "
+                         "frame; a photo or upload still captures the live "
+                         "camera%s", lwshell_eol());
+    }
+    else if (strcmp(m, OPT_OFF) == 0)
+    {
+      tile_inject_set(NULL, 0U, 0U, 0U);
+      CMD_PRINTF(stream, "tile inject: off (the sweep is back on the live "
+                         "camera)%s", lwshell_eol());
+    }
+    else
+    {
+      const uint32_t left = tile_inject_left_s();
+      CMD_PRINTF(stream, "tile inject: %s%s",
+                 (left > 0U) ? "on" : "off", lwshell_eol());
+      if (left > 0U)
+      {
+        CMD_PRINTF(stream, "  the live sweep is reading the uploaded %ux%u "
+                           "frame, %lu s left%s",
+                   (unsigned)_tile_fw, (unsigned)_tile_fh,
+                   (unsigned long)left, lwshell_eol());
+      }
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }
@@ -3064,11 +3177,32 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
                    tile_cfg_get_edgedrop() ? ""
                      : "  <- counts every fragment; expect a storm",
                    lwshell_eol());
+        uint32_t rl_done = 0U, rl_wanted = 0U;
+        tile_sweep_relook_stats(&rl_done, &rl_wanted);
         CMD_PRINTF(stream, "  rotate %s%s%s",
                    tile_rot_name(tile_cfg_get_rotate()),
                    (tile_cfg_get_rotate() == TILE_ROT_OFF)
-                     ? "  <- a person lying down is likely to be missed" : "",
+                     ? "  <- a person lying down is likely to be missed"
+                     : ((tile_cfg_get_rotate() == TILE_ROT_FULL)
+                        ? "  <- whole frame only; 'auto' is what finds one at "
+                          "ordinary range" : ""),
                    lwshell_eol());
+        if (tile_cfg_get_rotate() == TILE_ROT_AUTO)
+        {
+          CMD_PRINTF(stream, "    last sweep: %lu turned second look(s), "
+                             "%lu tile(s) asked%s",
+                     (unsigned long)rl_done, (unsigned long)rl_wanted,
+                     lwshell_eol());
+        }
+        {
+          const uint32_t inj = tile_inject_left_s();
+          if (inj > 0U)
+          {
+            CMD_PRINTF(stream, "  INJECT: reading an uploaded frame, NOT the "
+                               "camera (%lu s left), `tile inject off`%s",
+                       (unsigned long)inj, lwshell_eol());
+          }
+        }
       }
       _cmd_ack(stream, argv, argc);
       return LWSHELL_OK;
@@ -3123,12 +3257,13 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
       t_tile_rot  want;
       if      (strcmp(m, "off")   == 0) { want = TILE_ROT_OFF;  }
       else if (strcmp(m, "full")  == 0) { want = TILE_ROT_FULL; }
+      else if (strcmp(m, "auto")  == 0) { want = TILE_ROT_AUTO; }
       else if (strcmp(m, "all")   == 0) { want = TILE_ROT_ALL;  }
       else if (strcmp(m, "query") == 0) { want = tile_cfg_get_rotate(); }
       else
       {
-        CMD_PRINTF(stream, "detect rotate: use 'off', 'full', 'all' or "
-                           "'query'%s", lwshell_eol());
+        CMD_PRINTF(stream, "detect rotate: use 'off', 'full', 'auto', 'all' "
+                           "or 'query'%s", lwshell_eol());
         return LWSHELL_OK;
       }
       if (strcmp(m, "query") != 0)
@@ -3154,11 +3289,39 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
         CMD_PRINTF(stream, "  the whole frame is also read turned 90 deg "
                            "(+1 inference, %lu a sweep)%s",
                    (unsigned long)tile_cfg_count(), lwshell_eol());
+        CMD_PRINTF(stream, "  NOTE: that is a 3.1x downscale, a person on the "
+                           "ground at ordinary range needs 'auto'%s",
+                   lwshell_eol());
         break;
+      case TILE_ROT_AUTO:
+      {
+        uint32_t done = 0U, wanted = 0U;
+        tile_sweep_relook_stats(&done, &wanted);
+        CMD_PRINTF(stream, "  the whole frame turned 90 deg, plus a turned "
+                           "second look at up to %u tiles that hold a box "
+                           "wide enough to be a person on the ground%s",
+                   (unsigned)TILE_ROT_AUTO_MAX, lwshell_eol());
+        CMD_PRINTF(stream, "  %lu to %lu inferences a sweep; last sweep took "
+                           "%lu second look(s)%s",
+                   (unsigned long)tile_cfg_count(),
+                   (unsigned long)(tile_cfg_count() + TILE_ROT_AUTO_MAX),
+                   (unsigned long)done, lwshell_eol());
+        if (wanted > done)
+        {
+          CMD_PRINTF(stream, "  (%lu tile(s) asked for one and the cap "
+                             "allowed %u, the widest boxes won)%s",
+                     (unsigned long)wanted, (unsigned)TILE_ROT_AUTO_MAX,
+                     lwshell_eol());
+        }
+        break;
+      }
       default:
         CMD_PRINTF(stream, "  every step is read both ways (%lu inferences a "
                            "sweep, about twice the time)%s",
                    (unsigned long)tile_cfg_count(), lwshell_eol());
+        CMD_PRINTF(stream, "  NOTE: the debounce window is two sweeps, so this "
+                           "also doubles the delay before a notification%s",
+                   lwshell_eol());
         break;
     }
     if (!nn_task_tile_get())
@@ -3229,6 +3392,32 @@ static int32_t _detect_cmd(const t_stream *stream, uint8_t **argv, size_t argc)
     nn_task_upload_stats(&skipped, &busy);
     CMD_PRINTF(stream, "detect stats: auto-upload skipped=%lu busy=%lu%s",
                (unsigned long)skipped, (unsigned long)busy, lwshell_eol());
+
+    /* What the detector is seeing RIGHT NOW, which nothing else would say.
+     * Until this line, the only way to ask the unit what it counts was to
+     * wait for a notification, so a test of a detection change had to be a
+     * test of the notification chain as well, and a scene the detector was
+     * getting right but the mask was eating looked identical to one it was
+     * getting wrong (ScopusQA #26, #27). */
+    uint32_t people = 0U, vehicles = 0U;
+    nn_task_counts_get(&people, &vehicles);
+    CMD_PRINTF(stream, "  counting now: people=%lu vehicles=%lu%s",
+               (unsigned long)people, (unsigned long)vehicles, lwshell_eol());
+    if (nn_task_tile_get())
+    {
+      uint32_t sweeps = 0U, last_ms = 0U, steps = 0U;
+      uint32_t rl_done = 0U, rl_wanted = 0U;
+      nn_task_tile_stats(&sweeps, &last_ms, &steps);
+      tile_sweep_relook_stats(&rl_done, &rl_wanted);
+      CMD_PRINTF(stream, "  last sweep: %lu step(s), %lu ms",
+                 (unsigned long)steps, (unsigned long)last_ms);
+      if (tile_cfg_get_rotate() == TILE_ROT_AUTO)
+      {
+        CMD_PRINTF(stream, ", %lu turned second look(s) of %lu asked",
+                   (unsigned long)rl_done, (unsigned long)rl_wanted);
+      }
+      CMD_PRINTF(stream, "%s", lwshell_eol());
+    }
     _cmd_ack(stream, argv, argc);
     return LWSHELL_OK;
   }

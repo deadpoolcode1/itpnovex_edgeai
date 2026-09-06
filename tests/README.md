@@ -46,7 +46,16 @@ Output:
 
 ## Host tests (no kit needed)
 
-Two of them, both self-checking and both runnable on any machine with `gcc`:
+Three of them, all self-checking and all runnable on any machine with `gcc`:
+
+- `python3 tests/test_tile_rotate.py` builds the real `tile_detect.c` against
+  the stubs in `tests/c/stubs/` and checks the turned second look
+  (ScopusQA #26): that a sweep GROWS when tiles are nominated and a caller that
+  cached the first step count would silently run none of them, that a tall box
+  nominates nothing and a wide one nominates the tile it lies in, that the cap
+  holds and the widest boxes win it, that the appended step really is that tile
+  and really is turned, that a turned step contributes people and not vehicles,
+  and that `tile inject` expires on time.
 
 ```bash
 python3 tests/test_hdlc_crosscheck.py      # C encoder vs the Python one

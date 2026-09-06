@@ -170,7 +170,12 @@ The whole path, including where an injected frame joins it:
 
 Text-line shell on the CDC ACM endpoint. Each command terminated with `\n` (or `\r\n`). Output lines end with `\r\n`. Echo controllable via `echo on|off`. The full surface is the Scopus SoW §4 table — see `tests/run_tests.py` for executable references. Highlights:
 
-- `detect start|stop|mode default|tile|query|rotate off|full|all|query|profile <det> <act>|profile query|simulate [N]`
+- `detect start|stop|mode default|tile|query|rotate off|full|auto|all|query|profile <det> <act>|profile query|stats|simulate [N]`
+  (`detect stats` also reports what the detector counts right now, and what the
+  last sweep cost)
+- `tile ...|inject on|off|query` (`tile inject` puts an uploaded 800x600 frame
+  in front of the LIVE sweep, so counts, debounce and §4.2 notifications run on
+  a known picture; expires after 300 s)
 - `notify enable|disable|trigger <code>|period <s>|query`
 - `photo savesd|upload`
 - `img size <H> <W>|quality 1..100|color YCBCR|RGB|CMYK|chroma 0|1|query`

@@ -1,9 +1,218 @@
 # Scopus integration — status / resume point
 
-Last updated: 2026-09-04. Everything below was measured on the bench, not inferred.
+Last updated: 2026-09-06. Everything below was measured on the bench, not inferred.
 
 ---
 
+## 2026-09-06: the turned pass had to be at tile resolution (ScopusQA #26, reopened)
+
+ITP reopened #26 the day after it was closed. Omer: *"I repeated the test in the
+3 modes: off full all. In off and full mode there is still no detection. In all
+mode there was detection but it takes a long time compared to a vertical
+person."*
+
+Both halves of that are right, and the first one was not visible from the
+measurement that closed the issue.
+
+### Why `full` was not enough
+
+`full` turns the WHOLE 800x600 frame into the network's 256x256 input, which is
+a 3.1x downscale. That is enough for a person who fills much of the frame (the
+composited pictures the first fix was measured on) and nothing like enough for
+one at the size ITP actually tests at.
+
+The measurement that shows it runs every step of a sweep separately and reads
+the raw boxes off each one (`scopus/step_probe.py`, 15 pictures, 26 steps each):
+
+| best confidence for the person | upright | rotated whole frame | rotated TILE |
+|---|---|---|---|
+| ITP's grass scene | 0.50 | 0.50 | **0.78** |
+| ITP's park scene | 0.63 | 0.63 | **0.78** |
+| ITP's street scene | 0.71 | 0.78 | **0.81** |
+| park, person 240 px | 0.45 | **missed** | **0.81** |
+| street, person 240 px | 0.55 | 0.33 | **0.71** |
+| park, person 500 px | 0.55 | 0.78 | **0.81** |
+| street, person 500 px | 0.67 | 0.71 | **0.86** |
+| either scene, person 110 px | missed | missed | missed |
+
+A rotated **tile** is worth 0.71 to 0.86 on every recoverable picture. The
+rotated whole frame is worth 0.00 to 0.78 and twice lands under the 0.45 floor.
+So the resolution matters as much as the rotation, and only `all` had both,
+which is why `all` was the only mode that worked for ITP, and `all` doubles the
+sweep and therefore the notification delay.
+
+### The fix: `detect rotate auto`, the new default
+
+Pay for the resolution where it is needed instead of everywhere. A person lying
+down is reported by the upright pass as a **wide box** (0.55x0.18, 0.67x0.16,
+0.75x0.22, whatever class it lands on) while a standing person is 0.11x0.54.
+So: run the upright block, then the rotated whole frame as `full` does, then a
+rotated second look at the tiles holding a wide box, up to four, widest first.
+
+Over the same 15 pictures:
+
+| | tiles nominated | what a look found |
+|---|---|---|
+| every lying scene | 2 to 5 | the person, 0.63 to 0.86 |
+| every upright scene | **0** | nothing to run, nothing to pay |
+
+That last row is the cost claim and it is also a correctness one: `all` runs a
+rotated pass over standing people too, and on one of these pictures it invented
+a second person at 0.45 from a man it had already counted.
+
+### On ITP's own two pictures, through the product's own path
+
+Not `tile run`, which reports to the console: the LIVE sweep, the live counts,
+the debounce, and the §4.2 notification over the UART to the modem. Bench,
+2026-09-06, with the pictures attached to #26:
+
+**The 12-scene street sheet** ("no identification at all"):
+
+| rotate | people | vehicles | steps | sweep | second looks | notification |
+|---|---|---|---|---|---|---|
+| `off` | **0** | 3 | 13 | 1402 ms | n/a | vehicles only, `rsn:32 rsd:3` |
+| `full` | **0** | 3 | 14 | 1544 ms | n/a | none |
+| **`auto`** | **1** | 3 | 18 | 1995 ms | 4 of 6 asked | `rsn:16 rsd:1` at +9.4 s |
+| `all` | 1 | 3 | 26 | 2889 ms | n/a | (count already 1, nothing to report) |
+
+**The grass scene** ("no identification at all"):
+
+| rotate | people | steps | sweep | second looks | notification |
+|---|---|---|---|---|---|
+| `off` | **0** | 13 | 1399 ms | n/a | none |
+| `full` | **0** | 14 | 1542 ms | n/a | none |
+| **`auto`** | **1** | 15 | 1657 ms | 1 of 1 asked | `rsn:16 rsd:1` at +8.0 s |
+| `all` | 1 | 26 | 2897 ms | n/a | (count already 1) |
+
+`off` and `full` reproduce ITP's report exactly. `auto` finds both, and costs
+1657 to 1995 ms against `full`'s 1540 and `all`'s 2890. The `all` rows report
+no notification because the count was already 1 by the time that mode ran: a
+§4.2 event is a CHANGE, and nothing changed.
+
+### One person, counted twice: found while measuring this
+
+With a rotated tile added, ITP's street scene came back as **2 people**. The
+turned view frames the same man differently from the upright one, the two boxes
+measured IoU 0.35 against a 0.40 threshold, and NMS kept both.
+
+A turned step is a SECOND LOOK at pixels the upright block already read, so
+what it finds where something was already found is the same object seen better.
+`_merge_rotated()` says so: same class, at least one side turned, half of
+either box inside the other, keep the better one. That took the lying set from
+5 count errors back to 4, and it fixed the same double count in `all`, which
+had it before this work and nobody had noticed.
+
+### And the reason the two sides could not compare tests: `tile inject`
+
+#26 was closed on a bench measurement and reopened on a live test, and neither
+side could run the other's. The bench measurement drove `tile run`, the offline
+sweep, which reports to the console. ITP drove the product: the live sweep,
+which reports counts and notifications. There was no way to put a known
+picture through the live path, because nn_task's frame override wins over
+tiling and hands the whole picture to the network in one pass.
+
+```bash
+python3 scopus/rotate_live_test.py <image>        # the table above, one command
+```
+
+`tile inject on` parks the uploaded 800x600 frame in front of the live sweep,
+so the merge, the counts, the debounce and the §4.2 notifications are the real
+ones and only the lens is stood in for. It expires after 300 s by itself, says
+so in the trace when it does, and `tile query` / `detect mode query` both
+report it while it is on. A unit reading a file must never look like one
+watching the room. Photos and uploads still capture the live camera, and the
+command says so when you arm it.
+
+`detect stats` also answers "what do you count right now", which nothing did
+before: until now the only way to ask was to wait for a notification, so a
+detection problem and a notification-mask problem looked alike (#26 and #27
+both spent a round on that).
+
+### What it costs on ordinary scenes
+
+The 77-image QA set, `off` then `auto`, nothing else changed:
+
+The 77-image QA set, `off` then `auto`, nothing else changed:
+
+| | count error over the 30 labelled scenes | exact | inferences a sweep |
+|---|---|---|---|
+| `off` | 38 | 11 | 13 |
+| **`auto`** | **38** | **11** | **14 to 18, 15.6 on average** |
+
+**One picture in 74 answers differently**: `2_fat_people .PNG` gains a third
+person at 0.67, which is the same picture and the same detection `full` has
+been gaining since it shipped, not something `auto` introduced. Every other
+answer is identical, and the scored totals are identical.
+
+And on the lying set, `auto` is worth what `all` is worth for 15.3 inferences a
+sweep instead of 26:
+
+| rotate | count error over 15 | exact | inferences a sweep |
+|---|---|---|---|
+| `off` | 7 | 8 | 13 |
+| `full` | 4 | 11 | 14 |
+| **`auto`** | **4** | **11** | **14 to 18, 15.3 on average** |
+| `all` | 4 | 11 | 26 |
+
+That table is also the reason the lying set alone could not have found this
+bug: on pictures where the person fills much of the frame, `full` is already
+enough, and only ITP's live scene separates the three.
+
+Getting there took two corrections that are worth more than the feature:
+
+- **A turned view renames what it sees.** The first `auto` build scored 41
+  against `off`'s 38, and every one of the six disagreements was a vehicle the
+  upright pass had already found coming back from a turned step under a
+  different class name, a car at 0.84 returning as a "train" at 0.45 over a
+  box 93% identical, a person and a car together returning as one
+  "motorcycle". Class-aware NMS cannot merge those, so one car was counted
+  twice.
+- **So a turned step now contributes people and nothing else.** Rotation is
+  not a general second opinion; it corrects one specific thing, that the
+  network was trained on people standing up. A car is not more canonical on
+  its side, and a turned view of one is a view the network never trained on.
+  Not one of those six extra vehicles was a real object the upright pass had
+  missed. This also cleans up `full`, which has been adding a phantom bicycle
+  to `crowd_13.jpg` since it shipped.
+
+Boxes that ARE the same object under two names are merged instead: same place,
+one view turned, the more confident view names it. That is what turns #26's
+miscount (a person on the ground read as a car) into a person.
+
+And two more corrections, both found by measuring rather than by reading, and
+both of them one line of arithmetic:
+
+- **Containment has to be mutual.** "Half of EITHER box inside the other" says
+  yes to any small box that happens to fall inside a big one, and on
+  `crowd_13.jpg` a 0.45 person standing beside a larger turned box was retired
+  into it: 5 people to 4, on six sweeps out of six, not flicker. Two views of
+  one person frame it at about the same size, so each holds most of the other;
+  requiring both directions keeps the merge and gives the fifth person back.
+- **When both views already count the object, the upright one keeps it**,
+  whatever the confidences say. The turned view is the better detector of a
+  person on the ground and the worse describer of where they are, since it
+  frames them from a picture the network never trained on. The count is the
+  same either way, so there is nothing to pay for keeping the better box.
+
+### The regression suites
+
+```
+run_integration_tests.py   66 total   65 PASS   0 FAIL   0 GAP   1 SKIP
+run_scopus_tests.py        49 total   45 PASS   0 FAIL           4 SKIP
+```
+
+Both on the bench, on the delivered build. Identical to the last clean run; the
+one integration SKIP and all four per-command SKIPs are the absent SD card.
+
+And a host test that needs no kit, `python3 tests/test_tile_rotate.py`: 26
+checks over the real `tile_detect.c`, including that the appended step really
+is the nominated tile and really is turned, that the cap holds, and that the
+injection expires. It exists because the one way this feature can fail without
+any output looking wrong is a caller that trusts the step count
+`tile_sweep_begin()` returned: the sweep GROWS part way through, and a caller
+that stopped at 14 would run no second looks at all and say nothing about it.
+
+---
 ## 2026-09-04: a person lying down is a different object (ScopusQA #26)
 
 ITP: "There is difficulty in identifying a horizontal person. In this picture it
@@ -2170,9 +2379,10 @@ commands missing.
 
 ### Current state, 2026-09-04
 
-- Camera: local `master` build, `Sep 4 2026`. Registry version 8
-  (`detect_rotate`). Tiling is the main path and now reads the whole frame
-  turned 90 degrees as well (`detect rotate full`, 14 inferences a sweep,
+- Camera: local `master` build, `Sep 6 2026`. Registry version 8
+  (`detect_rotate`, default now 3 = `auto`). Tiling is the main path and reads
+  the picture turned 90 degrees as well, the whole frame, plus up to four
+  tiles that hold a wide box (`detect rotate auto`, 14 to 18 inferences a sweep,
   ~1.5 s).
 - Modem: **1.17.0**. The module's own AT interface wedged on 2026-09-04 and a
   modem reboot cleared it, see the ScopusQA #23 entry above for how to tell

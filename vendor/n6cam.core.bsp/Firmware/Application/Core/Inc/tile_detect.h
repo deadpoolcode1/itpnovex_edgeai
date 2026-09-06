@@ -63,6 +63,7 @@ typedef struct
   bool    keep;      /* survived NMS and is above the confidence floor       */
   bool    sustain;   /* survived NMS, floor or sustain floor — see below     */
   bool    frag;      /* cut by a tile edge that is not a frame edge          */
+  bool    rot;       /* came from a step read turned 90 degrees             */
 } t_tile_det;
 
 /**
@@ -145,27 +146,86 @@ bool     tile_cfg_get_edgedrop(void);
  *
  *   TILE_ROT_OFF   as before, upright only
  *   TILE_ROT_FULL  one extra step: the WHOLE FRAME turned 90 degrees.
- *                  +1 inference in 13 (~8%). Recovers a lying person big
- *                  enough for the whole-frame pass to resolve, which is the
- *                  case ScopusQA #26 reported.
+ *                  +1 inference in 13 (~8%).
+ *   TILE_ROT_AUTO  the rotated whole frame, PLUS a rotated second look at the
+ *                  few tiles that hold something a lying person could be.
+ *                  0 to 4 extra inferences on top of FULL, and 0 is the
+ *                  ordinary case. The default.
  *   TILE_ROT_ALL   every step runs both ways. 2x inferences, so a sweep goes
- *                  from ~1.5 s to ~3 s. Needed for a lying person too small
- *                  or too distant for the whole-frame pass.
+ *                  from ~1.5 s to ~3 s, and the debounce window is two sweeps,
+ *                  so every notification is late by the same factor.
  *
  * Boxes from a rotated step are turned back into frame coordinates before the
  * merge, so nothing downstream, overlay, counts, notifications, knows this
  * happened.
+ *
+ * Why AUTO exists, when FULL was shipped as the answer to #26 (reopened
+ * 2026-09-06: "in off and full mode there is still no detection; in all mode
+ * there was detection but it takes a long time")
+ * ------------------------------------------------------------------------
+ * FULL rotates the whole 800x600 frame into a 256x256 input, a 3.1x downscale.
+ * That is enough for a person who fills much of the frame and nothing like
+ * enough for one at ordinary range, which is the case QA was pointing at. The
+ * per-step measurement, 15 pictures, every step of a sweep run separately and
+ * its raw boxes read off (`scopus/step_probe.py`):
+ *
+ *   best person confidence      upright   rotated whole frame   rotated TILE
+ *   ITP's grass scene              0.50            0.50             0.78
+ *   ITP's park scene               0.63            0.63             0.78
+ *   ITP's street scene             0.71            0.78             0.81
+ *   park, person fills 240 px      0.45            MISSED           0.81
+ *   street, person fills 240 px    0.55            0.33             0.71
+ *   park, person fills 500 px      0.55            0.78             0.81
+ *   street, person fills 500 px    0.67            0.71             0.86
+ *
+ * A rotated tile is worth 0.71 to 0.86 on every one of them; the rotated whole
+ * frame is worth 0.00 to 0.78 and twice lands under the 0.45 floor. So the
+ * resolution matters at least as much as the rotation, and only ALL had it.
+ *
+ * What AUTO adds is a trigger, so the resolution can be paid for where it is
+ * needed instead of everywhere. A person lying down is reported by the upright
+ * pass as a WIDE box - 0.55x0.18, 0.67x0.16, 0.75x0.22 - whatever class it
+ * lands on, while a standing person is 0.11x0.54. Over the same 15 pictures:
+ *
+ *   every lying scene           2 to 5 tiles hold a wide box, and a rotated
+ *                               look at one of them finds the person
+ *   every upright scene         NO tile holds a wide box: AUTO costs nothing
+ *                               and cannot introduce a second count of a
+ *                               person it already has
+ *
+ * That last line is the one that pays for the complexity: ALL runs a rotated
+ * pass over standing people too, and on one of these pictures it invented a
+ * second person at 0.45 from a man who was already counted.
  */
 typedef enum
 {
   TILE_ROT_OFF = 0,
   TILE_ROT_FULL,
   TILE_ROT_ALL,
+  TILE_ROT_AUTO,      /* appended, not inserted: the registry stores this  */
 } t_tile_rot;
 
 void       tile_cfg_set_rotate(t_tile_rot r);
 t_tile_rot tile_cfg_get_rotate(void);
 const char *tile_rot_name(t_tile_rot r);
+
+/** Most tiles TILE_ROT_AUTO will take a second, rotated look at in one sweep.
+ *  Four, because five was the most any of the fifteen measured scenes asked
+ *  for and a busy street must not be able to double the sweep by accident. */
+#define TILE_ROT_AUTO_MAX   4U
+
+/** How much wider than tall a box has to be before the thing it frames could
+ *  be a person lying down. A standing person measures 0.2, a lying one 3 to 6,
+ *  and a car 4 or so, the gap is wide enough that this number is not a
+ *  tuning parameter. A car triggering a look costs one inference and answers
+ *  the question the look is asking, since a lying person at range IS read as
+ *  a car (#26, and see the miscount note above). */
+#define TILE_ROT_WIDE_RATIO 1.2f
+
+/** How many tiles the last sweep took a second look at, and how many it would
+ *  have looked at with no cap, `detect rotate query` prints both, so a scene
+ *  that is over the cap says so instead of quietly losing looks. */
+void     tile_sweep_relook_stats(uint32_t *done, uint32_t *wanted);
 
 void     tile_cfg_get(uint16_t *cols, uint16_t *rows, uint16_t *crop,
                       uint16_t *ovl_h, uint16_t *ovl_v,
@@ -216,6 +276,17 @@ void     tile_axis_origins(uint16_t n, uint16_t span, uint16_t crop,
 uint32_t tile_sweep_begin(const uint8_t *frame, uint16_t fw, uint16_t fh);
 
 /**
+ * @brief How many steps this sweep has, RE-READ AFTER EVERY STEP.
+ *
+ * tile_sweep_begin()'s return value is only the count a sweep starts with.
+ * Under TILE_ROT_AUTO the sweep grows when the upright block closes, by the
+ * number of tiles it nominated for a rotated second look, so a caller that
+ * cached the first number stops the sweep before those steps run and the
+ * feature silently does nothing.
+ */
+uint32_t tile_sweep_steps(void);
+
+/**
  * @brief Render tile `idx` into `dst` (TILE_NN_SIDE^2 * 3 bytes, RGB888).
  *        Bilinear, source coordinates clamped to the frame.
  */
@@ -264,6 +335,43 @@ bool     tile_sweep_saturated(void);
  * frame that `tile upload` parked in the firmware-update buffer.
  */
 uint8_t *tile_capture_live(uint16_t *fw_out, uint16_t *fh_out);
+
+/* ── Standing in for the lens ──────────────────────────────────────────── */
+
+/**
+ * @brief Have the LIVE tiled sweep read an uploaded picture instead of the
+ *        camera, for `ttl_ms` (0 = clear it now).
+ *
+ * Why this exists. The single-frame override in nn_task wins over tiling: the
+ * comment there says so in as many words, and it hands the whole 256x256 input
+ * to the network in one pass. So until now an uploaded picture could be run through
+ * the OFFLINE sweep (`tile run`, which reports to the console) or through the
+ * live single-frame path (`frame run`), and there was NO way to put a known
+ * picture through the sweep that actually drives the product: the merge, the
+ * count, the debounce, the §4.2 notification.
+ *
+ * ScopusQA #26 was reopened on exactly that ambiguity. QA reported that a
+ * setting did not work on their live scene while the same setting measured
+ * correct on the bench, and neither side could run the other's test: the bench
+ * had no lying person in front of a lens, and QA had no way to feed the live
+ * path a picture. This closes that, the sweep, the counts and the
+ * notifications all run, on pixels both sides can hold in a file.
+ *
+ * The frame is BORROWED, and it must be RGB888 and stay valid until the
+ * injection expires. It expires on its own for the same reason the
+ * single-frame override does: a unit left injecting is a unit that is not
+ * watching anything, and nobody remembers.
+ */
+void     tile_inject_set(const uint8_t *frame, uint16_t fw, uint16_t fh,
+                         uint32_t ttl_ms);
+
+/** The injected frame, or NULL when there is none or it has expired.
+ *  Expiry is reported once through `*expired_out` so the caller can say so. */
+const uint8_t *tile_inject_get(uint16_t *fw_out, uint16_t *fh_out,
+                               bool *expired_out);
+
+/** Seconds left on the injection, 0 when nothing is injected. */
+uint32_t tile_inject_left_s(void);
 
 #ifdef __cplusplus
 }

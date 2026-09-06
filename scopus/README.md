@@ -123,7 +123,8 @@ together whenever anything moved.
 
 `detect mode tile` sweeps a 4x3 grid of 256 px crops over the live 800x600 main
 pipe, merges across tiles with NMS, and drives the counts, the overlay and the
-§4.2 notifications from the merged result. ~13 inferences, ~1.36 s a detection.
+§4.2 notifications from the merged result. 13 inferences upright, 14 to 18 with
+the turned pass below, ~1.4 to 2.0 s a detection.
 `detect mode default` is one inference on the whole downscaled frame. The
 setting persists and is reachable over MQTT like any other shell command.
 
@@ -179,6 +180,69 @@ makes the count slow to come back down. Rises are unaffected.
 In tile mode the debounce is floored at two sweeps, because a window shorter
 than the sampling period debounces nothing. `detect debounce query` reports the
 effective value when it differs from the configured one.
+
+## A person lying down (ScopusQA #26)
+
+The network was trained on people who are standing up, and a person on the
+ground is a different object to it: at ordinary range it misses them, and it
+sometimes reads them as a car. Turning the picture stands them back up.
+
+```bash
+python3 scopus/cam.py "detect rotate auto"     # off | full | auto | all | query
+```
+
+| | what it runs | inferences a sweep | finds a person lying down at |
+|---|---|---|---|
+| `off` | upright only | 13 | nothing but point blank |
+| `full` | + the whole frame turned 90 deg | 14 | most of the frame wide |
+| **`auto`** | + a turned look at up to 4 tiles that hold a wide box | **14 to 18** | **ordinary range** |
+| `all` | every step both ways | 26 | ordinary range, at twice the sweep |
+
+**`auto` is the default and the one to leave on.** `full` was the first answer
+to #26 and it is not enough: it turns the whole 800x600 frame into a 256x256
+input, a 3.1x downscale, so it only recovers a person who fills much of the
+picture. What actually finds one is a turned look at a 320 px TILE: measured
+over 15 pictures, 0.71 to 0.86 against the rotated whole frame's 0.00 to 0.78.
+
+`auto` gets that resolution without `all`'s doubled sweep by looking only where
+a person could be lying: the upright pass reports one as a box far wider than
+it is tall (0.55x0.18, 0.67x0.16), whatever class it puts on it, while a
+standing person is 0.11x0.54. On the same 15 pictures every lying scene
+nominated 2 to 5 tiles and every upright scene nominated none, so a scene with
+nobody on the ground costs exactly what `full` cost.
+
+`detect rotate query`, `detect mode query` and `detect stats` all report how
+many second looks the last sweep took and how many tiles asked for one; when
+more tiles ask than the cap of four allows, they say that too.
+
+## Testing the live path with a file (`tile inject`)
+
+The offline sweep (`tile run`) and the live sweep are the same arithmetic on
+different clocks, but only the live one produces counts, debounce and §4.2
+notifications. Until this existed there was no way to put a known picture
+through it, because nn_task's frame override wins over tiling, so a bench measurement
+and a QA field test could disagree with no way to run each other's test. That
+is how #26 came to be closed and reopened.
+
+```bash
+python3 scopus/rotate_live_test.py images_lying/1_person_lying_omer_park.png
+```
+
+```
+rotate    people  vehicles  steps   sweep  2nd looks  notifications
+off            0         3     13  1402ms     0 of 0    0
+full           0         3     14  1545ms     0 of 0    0
+auto           1         3     18  1995ms     4 of 6    1, 1st 9.0s
+all            1         3     26  2891ms     0 of 0    1
+```
+
+By hand it is three commands (`tile frame 800 600`, `tile upload`, `tile
+inject on`) and the sweep reads that frame instead of the lens until `tile
+inject off` or 300 s, whichever comes first. The frame must be 800x600, the
+live pipe's own size, or the grid would be tiling a picture the product never
+sees. **Counts and notifications come from the injected frame; a photo or an
+upload still captures the live camera**, and the unit says so when you arm it,
+in `tile query`, and in `detect mode query`.
 
 ## Manual end-to-end test
 

@@ -105,11 +105,13 @@ static bool     _cfg_edgedrop = true;
 /* Also look at the picture turned 90 degrees (ScopusQA #26). See the note on
  * tile_cfg_set_rotate() in the header for the measurement that decided this.
  *
- * TILE_ROT_FULL by default: one extra inference in thirteen, and it is what
- * recovers the two scenes ITP reported as "no identification at all". Turning
- * it up to TILE_ROT_ALL doubles the sweep, so that is offered and not
- * assumed. */
-static t_tile_rot _cfg_rotate = TILE_ROT_FULL;
+ * TILE_ROT_AUTO by default: the rotated whole frame that TILE_ROT_FULL was,
+ * plus a rotated second look at the handful of tiles holding a box wide enough
+ * to be a person on the ground. On a scene with nobody lying down that is the
+ * same 14 inferences FULL costs; on one with somebody it buys the tile
+ * resolution that is what actually finds them, without ALL's doubled sweep and
+ * doubled notification delay. */
+static t_tile_rot _cfg_rotate = TILE_ROT_AUTO;
 
 /* What fraction of the confidence floor a detection has to hold to keep being
  * believed. 0.75 of the 0.45 default is 0.34 — comfortably below the 0.45-0.50
@@ -121,6 +123,10 @@ static t_tile_rot _cfg_rotate = TILE_ROT_FULL;
  * only to slow the count's descent, and a sweep that dropped a real detection
  * to make room for one would be worse off than before. */
 #define TILE_WEAK_LIMIT     ((TILE_MAX_DETS * 3U) / 4U)
+
+/* COCO's person. The only class a turned step may contribute, see the note in
+ * tile_sweep_collect(). */
+#define TILE_CLASS_PERSON   0
 
 /* How close to a tile edge counts as touching it, as a fraction of the tile.
  * Generous on purpose: a detector rarely puts a fragment's box exactly on the
@@ -138,7 +144,7 @@ void tile_cfg_default(void)
   _cfg_iou   = TILE_DEF_IOU;
   _cfg_fullpass = true;
   _cfg_edgedrop = true;
-  _cfg_rotate   = TILE_ROT_FULL;
+  _cfg_rotate   = TILE_ROT_AUTO;
 }
 
 void tile_cfg_set_grid(uint16_t cols, uint16_t rows)
@@ -166,7 +172,7 @@ bool tile_cfg_get_edgedrop(void)     { return _cfg_edgedrop; }
 
 void tile_cfg_set_rotate(t_tile_rot r)
 {
-  _cfg_rotate = (r > TILE_ROT_ALL) ? TILE_ROT_FULL : r;
+  _cfg_rotate = (r > TILE_ROT_AUTO) ? TILE_ROT_AUTO : r;
 }
 t_tile_rot tile_cfg_get_rotate(void) { return _cfg_rotate; }
 
@@ -177,6 +183,7 @@ const char *tile_rot_name(t_tile_rot r)
     case TILE_ROT_OFF:  return "off";
     case TILE_ROT_FULL: return "full";
     case TILE_ROT_ALL:  return "all";
+    case TILE_ROT_AUTO: return "auto";
     default:            return "?";
   }
 }
@@ -206,6 +213,7 @@ uint32_t tile_cfg_count(void)
   switch (_cfg_rotate)
   {
     case TILE_ROT_FULL: return base + 1U;    /* the whole frame, turned      */
+    case TILE_ROT_AUTO: return base + 1U;    /* ...and 0..4 more, on demand  */
     case TILE_ROT_ALL:  return base * 2U;    /* everything, both ways        */
     default:            return base;
   }
@@ -276,6 +284,29 @@ static bool           _sw_full    = false;  /* this sweep has a whole-frame pass
 static uint32_t       _sw_tiles   = 0U;     /* tile count, excluding that pass   */
 static t_tile_rot     _sw_rot     = TILE_ROT_OFF; /* rotation this sweep is doing */
 static uint32_t       _sw_base    = 0U;     /* steps in the upright block        */
+
+/* TILE_ROT_AUTO's second look (ScopusQA #26, reopened).
+ *
+ * `_sw_wide[t]` is the widest box the upright block put over tile t, as a
+ * width/height ratio; anything at or above TILE_ROT_WIDE_RATIO could be a
+ * person on the ground and is worth one rotated inference. `_sw_relook` is the
+ * shortlist that survived the cap, filled once the upright block is done, and
+ * `_sw_n_wanted` is how long the list would have been without the cap, a
+ * number worth reporting rather than hiding, because it is the one that says
+ * the scene is over budget. */
+static float          _sw_wide[TILE_MAX_AXIS * TILE_MAX_AXIS];
+static uint16_t       _sw_relook[TILE_ROT_AUTO_MAX];
+static uint32_t       _sw_n_relook  = 0U;
+static uint32_t       _sw_n_wanted  = 0U;
+static bool           _sw_auto_done = false;
+
+/* The same two numbers, latched, for anyone asking from outside the sweep.
+ * The live loop starts the next sweep the moment it finishes one, so a command
+ * that read the working counters would nearly always catch them at zero, part
+ * way through the upright block, and report that no second look was taken on a
+ * unit taking one every sweep. */
+static uint32_t       _sw_last_relook = 0U;
+static uint32_t       _sw_last_wanted = 0U;
 
 static t_tile_det     _sw_dets[TILE_MAX_DETS];
 
@@ -496,7 +527,23 @@ static void _step_rect(uint32_t idx, uint16_t *cx, uint16_t *cy,
   if (idx >= _sw_base)
   {
     turned = true;
-    step   = (_sw_rot == TILE_ROT_ALL) ? (idx - _sw_base) : _sw_tiles;
+    if (_sw_rot == TILE_ROT_ALL)
+    {
+      step = idx - _sw_base;
+    }
+    else if ((_sw_rot == TILE_ROT_AUTO) && (idx > _sw_base))
+    {
+      /* The rotated whole frame first, exactly as FULL does it, then the
+       * shortlist. Modulo so a step index that outran the list cannot read
+       * past it, it cannot happen, and a crop of the wrong tile would be
+       * invisible in every output. */
+      const uint32_t k = (idx - _sw_base - 1U) % TILE_ROT_AUTO_MAX;
+      step = (k < _sw_n_relook) ? (uint32_t)_sw_relook[k] : _sw_tiles;
+    }
+    else
+    {
+      step = _sw_tiles;
+    }
   }
 
   if (rot) { *rot = turned; }
@@ -522,9 +569,132 @@ static uint32_t _sweep_steps(void)
   switch (_sw_rot)
   {
     case TILE_ROT_FULL: return _sw_base + 1U;
+    case TILE_ROT_AUTO: return _sw_base + 1U + _sw_n_relook;
     case TILE_ROT_ALL:  return _sw_base * 2U;
     default:            return _sw_base;
   }
+}
+
+/* ── TILE_ROT_AUTO: where a second, rotated look is worth an inference ───
+ *
+ * The upright pass does not go quiet over a person lying down. It reports a
+ * box that is far wider than it is tall, and it puts some class or other on
+ * it, person, car, boat, whichever, the class is the part it gets wrong. So
+ * the trigger is the SHAPE and not the class: mark every tile a wide box
+ * touches, and take a rotated look at the best few once the upright block is
+ * done. Measured over the fifteen #26 pictures: every lying scene marks 2 to 5
+ * tiles and a rotated look at one of them finds the person at 0.63 to 0.86;
+ * every upright scene marks none, so the ordinary case pays nothing.
+ *
+ * One look per box, not one per tile the box touches. The live tiles overlap
+ * by half, so a person on the ground sits wholly inside three or four of them
+ * at once, and marking all of them would spend the whole budget looking at the
+ * same body from almost the same place. The tile that frames the box BEST wins
+ * it: most of the box inside, and, between tiles that hold all of it, the one
+ * whose centre the box is nearest, which is the one least likely to cut it at
+ * a seam when it is looked at again.
+ *
+ * A box nominates from wherever it was seen, including the whole-frame pass,
+ * so an object too big for the tile that reported it still gets looked at in
+ * the tile it actually lies in. */
+static void _auto_mark(uint16_t cx, uint16_t cy, uint16_t cw, uint16_t ch,
+                       const t_nn_box *b)
+{
+  const float bw = b->width  * (float)cw;      /* the step's px, = frame px */
+  const float bh = b->height * (float)ch;
+  if ((bh <= 0.0f) || (bw <= 0.0f)) return;
+
+  const float ratio = bw / bh;
+  if (ratio < TILE_ROT_WIDE_RATIO) return;
+
+  const float bx = (float)cx + b->x_center * (float)cw;
+  const float by = (float)cy + b->y_center * (float)ch;
+  const float x1 = bx - bw * 0.5f, x2 = bx + bw * 0.5f;
+  const float y1 = by - bh * 0.5f, y2 = by + bh * 0.5f;
+  const float area = bw * bh;
+
+  uint32_t best      = _sw_tiles;
+  float    best_in   = 0.0f;
+  float    best_dist = 0.0f;
+
+  for (uint32_t t = 0U; t < _sw_tiles; t++)
+  {
+    const float tx1 = (float)_sw_xs[t % _sw_cols];
+    const float ty1 = (float)_sw_ys[t / _sw_cols];
+    const float tx2 = tx1 + (float)_sw_crop;
+    const float ty2 = ty1 + (float)_sw_crop;
+
+    const float iw = ((x2 < tx2) ? x2 : tx2) - ((x1 > tx1) ? x1 : tx1);
+    const float ih = ((y2 < ty2) ? y2 : ty2) - ((y1 > ty1) ? y1 : ty1);
+    if ((iw <= 0.0f) || (ih <= 0.0f)) continue;
+
+    const float inside = (iw * ih) / area;
+    const float dx     = bx - (tx1 + (float)_sw_crop * 0.5f);
+    const float dy     = by - (ty1 + (float)_sw_crop * 0.5f);
+    const float dist   = (dx * dx) + (dy * dy);
+
+    /* More of the box first, and only then nearer its middle: a tile that
+     * holds all of it beats one that holds most of it, however well centred
+     * the second is. The 0.01 is there so two tiles that both hold the whole
+     * box are decided on distance rather than on float noise. */
+    const bool better = (best == _sw_tiles) ||
+                        (inside > best_in + 0.01f) ||
+                        ((inside > best_in - 0.01f) && (dist < best_dist));
+    if (better)
+    {
+      best      = t;
+      best_in   = inside;
+      best_dist = dist;
+    }
+  }
+
+  if ((best < _sw_tiles) && (ratio > _sw_wide[best]))
+  {
+    _sw_wide[best] = ratio;
+  }
+}
+
+/* Turn the marks into the shortlist, widest first, capped. Widest first
+ * because the ratio is the evidence: a car is wide, a person on the ground is
+ * wider still relative to a standing one, and when a scene offers more
+ * candidates than the budget the flattest boxes are the ones to spend it on.
+ * Called once, when the upright block closes. */
+static void _auto_finalize(void)
+{
+  if (_sw_auto_done) return;
+  _sw_auto_done = true;
+
+  _sw_n_relook = 0U;
+  _sw_n_wanted = 0U;
+
+  for (uint32_t t = 0U; t < _sw_tiles; t++)
+  {
+    if (_sw_wide[t] <= 0.0f) continue;
+    _sw_n_wanted++;
+  }
+
+  while (_sw_n_relook < TILE_ROT_AUTO_MAX)
+  {
+    uint32_t best = _sw_tiles;
+    for (uint32_t t = 0U; t < _sw_tiles; t++)
+    {
+      if (_sw_wide[t] <= 0.0f) continue;
+      if ((best == _sw_tiles) || (_sw_wide[t] > _sw_wide[best])) best = t;
+    }
+    if (best == _sw_tiles) break;
+
+    _sw_relook[_sw_n_relook++] = (uint16_t)best;
+    _sw_wide[best] = 0.0f;              /* taken */
+  }
+
+  _sw_last_relook = _sw_n_relook;
+  _sw_last_wanted = _sw_n_wanted;
+}
+
+void tile_sweep_relook_stats(uint32_t *done, uint32_t *wanted)
+{
+  if (done)   *done   = _sw_last_relook;
+  if (wanted) *wanted = _sw_last_wanted;
 }
 
 uint32_t tile_sweep_begin(const uint8_t *frame, uint16_t fw, uint16_t fh)
@@ -551,8 +721,21 @@ uint32_t tile_sweep_begin(const uint8_t *frame, uint16_t fw, uint16_t fh)
   _sw_full  = _cfg_fullpass;
   _sw_rot   = _cfg_rotate;
   _sw_base  = _sw_tiles + (_sw_full ? 1U : 0U);
+
+  memset(_sw_wide, 0, sizeof(_sw_wide));
+  _sw_n_relook  = 0U;
+  _sw_n_wanted  = 0U;
+  _sw_auto_done = false;
+  if (_sw_rot != TILE_ROT_AUTO)
+  {
+    _sw_last_relook = 0U;             /* nothing to report in the other modes */
+    _sw_last_wanted = 0U;
+  }
+
   return _sweep_steps();
 }
+
+uint32_t tile_sweep_steps(void) { return _sweep_steps(); }
 
 void tile_sweep_crop(uint32_t idx, uint8_t *dst)
 {
@@ -567,8 +750,15 @@ void tile_sweep_crop(uint32_t idx, uint8_t *dst)
 
 void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
 {
-  if ((_sw_cols == 0U) || (boxes == NULL)) return;
+  if (_sw_cols == 0U) return;
   if (idx >= _sweep_steps()) return;
+
+  /* A step that found nothing is still a step, and it still closes the upright
+   * block. Returning early on it used to skip the shortlist below, so on a
+   * scene whose LAST upright step happened to be empty, which is most quiet
+   * scenes, `detect rotate auto` took no second look at all and there was
+   * nothing anywhere to say so. */
+  if (boxes == NULL) { n = 0U; }
 
   uint16_t cx, cy, cw, ch;
   bool     rot, is_tile;
@@ -582,7 +772,36 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
   for (uint32_t i = 0U; i < n; i++)
   {
     _sw_n_raw++;
+
+    /* Nominate tiles for a rotated second look BEFORE any floor is applied:
+     * a person on the ground is exactly the detection that sits under the
+     * counting floor, and a trigger that only fired on boxes already good
+     * enough to count would fire only where it was not needed. */
+    if ((_sw_rot == TILE_ROT_AUTO) && !rot && !_sw_auto_done)
+    {
+      _auto_mark(cx, cy, cw, ch, &boxes[i]);
+    }
+
     if (boxes[i].conf < sustain_floor) continue;
+
+    /* A turned step contributes PEOPLE and nothing else.
+     *
+     * Rotation is not a general second opinion, it is a correction for one
+     * specific thing the network does: it was trained on people standing up,
+     * so it reads a person on the ground as some other object, or as nothing.
+     * A car is not more canonical on its side, a turned view of one is a view
+     * the network never trained on, and what comes back is noise wearing a
+     * class name. Measured over the 77-image QA set: every disagreement `auto`
+     * had with `off` was a turned step inventing a vehicle over something the
+     * upright pass had already counted, a car returning as a "train", a
+     * person and a car together returning as a "motorcycle" spanning both, a
+     * "bicycle" in the corner of a crowd. Not one was a real object the
+     * upright pass had missed.
+     *
+     * So the turned steps are held to what they are for. This also cleans up
+     * `full`, which has been adding that bicycle to crowd_13 since it
+     * shipped. */
+    if (rot && (boxes[i].class_index != TILE_CLASS_PERSON)) continue;
 
     /* Undo the 90-degree clockwise turn _resize_crop applied, so everything
      * below works in the step's own upright coordinates and neither the edge
@@ -662,8 +881,17 @@ void tile_sweep_collect(uint32_t idx, const t_nn_box *boxes, uint32_t n)
     d->conf    = boxes[i].conf;
     d->cls     = boxes[i].class_index;
     d->frag    = frag;
+    d->rot     = rot;
     d->keep    = !weak && !frag;
     d->sustain = true;
+  }
+
+  /* The upright block has just closed, so the shortlist is complete and the
+   * sweep can grow by however many looks it earned. Callers re-read
+   * tile_sweep_steps() every step for exactly this reason. */
+  if ((_sw_rot == TILE_ROT_AUTO) && (idx + 1U >= _sw_base))
+  {
+    _auto_finalize();
   }
 }
 
@@ -714,6 +942,119 @@ static bool _stitches_with(const t_tile_det *a, const t_tile_det *b)
 
   return ((min_h > 0.0f) && ((oy / min_h) >= TILE_STITCH_FRAC))
       || ((min_w > 0.0f) && ((ox / min_w) >= TILE_STITCH_FRAC));
+}
+
+/* Two views of one object, when one of the views was turned (ScopusQA #26).
+ *
+ * A turned step is a SECOND LOOK at pixels the upright block already read, so
+ * anything it finds where the upright pass already found something is the same
+ * object seen better, not another one. NMS alone does not say so: the two
+ * boxes frame the same person differently, one flat and one upright-ish, and
+ * on ITP's street scene they measured IoU 0.35 against a 0.40 threshold, so
+ * both survived and one man was counted twice.
+ *
+ * Containment answers it where IoU cannot, for the same reason it does for
+ * fragments: the question is "is this the thing we already have", and two
+ * boxes can share most of one of them while sharing little of their union.
+ *
+ * MUTUAL containment, though, and that is not a detail. Two views of one
+ * person frame it at about the same size, so each holds most of the other. A
+ * one-directional test says yes to any small box that falls inside a big one,
+ * and on `crowd_13.jpg` that ate a person: a 0.45 detection sitting inside a
+ * larger turned box was retired into it, 5 people to 4, on every sweep.
+ *
+ * Restricted to pairs where at least one side was turned, so a sweep with
+ * rotation off, or one where nothing was nominated, merges exactly as it did
+ * before this existed. */
+#define TILE_ROT_SAME_FRAC   0.40f
+
+/* And the same object under two different CLASS names.
+ *
+ * A turned look does not only move a box, it can rename it: over the 77-image
+ * QA set, `auto` added a vehicle on six pictures and every one of them was a
+ * car the upright pass had already found, coming back from the turned look as
+ * a "train" at 0.45 over a box 93% identical to the car's at 0.84. Class-aware
+ * NMS cannot merge those, by design, since two classes usually mean two
+ * objects, so one car was counted twice.
+ *
+ * The class is the part this network gets wrong about a turned object; that is
+ * the whole finding behind #26, where a person on the ground comes back as a
+ * car. So when one of the two views is turned and the boxes are all but the
+ * same box, they are one object and the more confident view names it. Which
+ * fixes the miscount in both directions: the car stays a car at 0.84, and a
+ * person the upright pass called a car at 0.50 becomes the person the turned
+ * look sees at 0.78.
+ *
+ * MUTUAL containment, and a high bar, because the failure to avoid is a person
+ * standing in front of a car: the person is mostly inside the car's box, but
+ * the car is not inside the person's, so that pair is not "the same box" and
+ * both survive. Two views of one object are inside each other both ways. */
+#define TILE_ROT_SAME_CLASS_FRAC  0.70f
+
+static void _merge_rotated(uint32_t n)
+{
+  for (uint32_t i = 0U; i < n; i++)
+  {
+    if (!_sw_dets[i].sustain) continue;
+    for (uint32_t j = i + 1U; j < n; j++)
+    {
+      if (!_sw_dets[j].sustain) continue;
+      if (!_sw_dets[i].rot && !_sw_dets[j].rot) continue;
+
+      const float a = _inside_of(&_sw_dets[i], &_sw_dets[j]);
+      const float b = _inside_of(&_sw_dets[j], &_sw_dets[i]);
+      const bool  same_class = (_sw_dets[j].cls == _sw_dets[i].cls);
+
+      if (!same_class)
+      {
+        if ((a < TILE_ROT_SAME_CLASS_FRAC) ||
+            (b < TILE_ROT_SAME_CLASS_FRAC)) continue;
+      }
+      else if ((a < TILE_ROT_SAME_FRAC) || (b < TILE_ROT_SAME_FRAC))
+      {
+        continue;
+      }
+
+      /* Who survives.
+       *
+       * When BOTH views already count the object, the upright one keeps it,
+       * whatever the confidences say. The turned view is the better detector
+       * of a person on the ground and the worse describer of where they are:
+       * it frames them from a picture the network was never trained on, and
+       * its box drifts. On `crowd_13.jpg` that cost a person, repeatably, not
+       * as flicker: the turned box won the merge, and being larger it then
+       * swallowed a fifth person standing beside it, 5 people to 4 on six
+       * sweeps out of six. Keeping the upright geometry when the upright pass
+       * already had the object costs nothing (the count is the same either
+       * way) and gives that person back.
+       *
+       * Otherwise the more confident view wins, which is what makes the two
+       * cases this exists for come out right: when only the turned view counts
+       * the object, it is the recovery; and when the two views DISAGREE ABOUT
+       * THE CLASS, the turned one is the one that gets a person on the ground
+       * right, so the person at 0.78 replaces the "car" at 0.50 rather than
+       * standing next to it. A whole box still beats a fragment, as in the NMS
+       * above. */
+      const bool i_frag = _sw_dets[i].frag;
+      const bool j_frag = _sw_dets[j].frag;
+      const bool geometry_call = same_class && _sw_dets[i].keep &&
+                                 _sw_dets[j].keep &&
+                                 (_sw_dets[i].rot != _sw_dets[j].rot);
+      const bool j_wins = (i_frag != j_frag)
+                        ? i_frag
+                        : geometry_call
+                          ? _sw_dets[i].rot
+                          : (_sw_dets[j].conf > _sw_dets[i].conf);
+      if (j_wins)
+      {
+        _sw_dets[i].sustain = false;
+        _sw_dets[i].keep    = false;
+        break;
+      }
+      _sw_dets[j].sustain = false;
+      _sw_dets[j].keep    = false;
+    }
+  }
 }
 
 /* How much of a fragment has to sit inside a counted box before that box is
@@ -791,6 +1132,7 @@ static void _rescue_fragments(uint32_t n)
 uint32_t tile_sweep_finish(void)
 {
   _nms(_sw_n_acc, _cfg_iou);
+  _merge_rotated(_sw_n_acc);
   _rescue_fragments(_sw_n_acc);
 
   uint32_t kept = 0U;
@@ -849,4 +1191,55 @@ uint8_t *tile_capture_live(uint16_t *fw_out, uint16_t *fh_out)
   if (fw_out) *fw_out = mw;
   if (fh_out) *fh_out = mh;
   return _live_rgb;
+}
+
+/* ── Standing in for the lens ──────────────────────────────────────────── */
+
+static const uint8_t *_inj_frame   = NULL;
+static uint16_t       _inj_fw      = 0U;
+static uint16_t       _inj_fh      = 0U;
+static uint32_t       _inj_until   = 0U;   /* HAL tick the loan runs out at */
+static bool           _inj_lapsed  = false;/* expired and not yet announced */
+
+void tile_inject_set(const uint8_t *frame, uint16_t fw, uint16_t fh,
+                     uint32_t ttl_ms)
+{
+  if ((frame == NULL) || (ttl_ms == 0U) || (fw == 0U) || (fh == 0U))
+  {
+    _inj_frame  = NULL;
+    _inj_lapsed = false;
+    return;
+  }
+  _inj_frame  = frame;
+  _inj_fw     = fw;
+  _inj_fh     = fh;
+  _inj_until  = HAL_GetTick() + ttl_ms;
+  _inj_lapsed = false;
+}
+
+const uint8_t *tile_inject_get(uint16_t *fw_out, uint16_t *fh_out,
+                               bool *expired_out)
+{
+  if (expired_out) { *expired_out = false; }
+  if (_inj_frame == NULL) return NULL;
+
+  /* Signed compare so the deadline stays correct across the tick wrap. */
+  if ((int32_t)(HAL_GetTick() - _inj_until) >= 0)
+  {
+    _inj_frame = NULL;
+    if (expired_out) { *expired_out = true; }
+    _inj_lapsed = true;
+    return NULL;
+  }
+
+  if (fw_out) *fw_out = _inj_fw;
+  if (fh_out) *fh_out = _inj_fh;
+  return _inj_frame;
+}
+
+uint32_t tile_inject_left_s(void)
+{
+  if (_inj_frame == NULL) return 0U;
+  const int32_t left = (int32_t)(_inj_until - HAL_GetTick());
+  return (left <= 0) ? 0U : ((uint32_t)left + 999U) / 1000U;
 }

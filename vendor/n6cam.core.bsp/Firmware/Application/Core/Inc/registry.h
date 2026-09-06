@@ -194,7 +194,9 @@ typedef struct
 
   /* V7, also look at the picture turned 90 degrees (ScopusQA #26).
    * 0 = off, 1 = the whole-frame pass runs both ways (+1 inference),
-   * 2 = every step runs both ways (2x inferences). t_tile_rot.
+   * 2 = every step runs both ways (2x inferences), 3 = the whole-frame pass
+   * plus a turned second look at up to 4 tiles that hold a box wide enough to
+   * be a person on the ground (+1 to +5). t_tile_rot.
    *
    * uint32 for the same reason the two fields above are, see the note on
    * detect_debounce_ms. A uint8 here would sit in the previous struct's
@@ -258,9 +260,12 @@ const t_registry_data registry_defaults =
   .detect_tile_mode            = 1U,
 
   /* A person lying down is a different object to this network, and at ordinary
-   * sizes it misses them outright (ScopusQA #26). One extra inference in
-   * thirteen buys the whole frame turned 90 degrees, which finds them. */
-  .detect_rotate               = 1U,     /* TILE_ROT_FULL */
+   * sizes it misses them outright (ScopusQA #26). The whole frame turned 90
+   * degrees is one extra inference and finds only a person who fills much of
+   * it; the turned second look at the few tiles that could hold one is what
+   * finds them at ordinary range, and it costs nothing on a scene with nobody
+   * on the ground. */
+  .detect_rotate               = 3U,     /* TILE_ROT_AUTO */
 
   /* Wifi */
   .wifi_mode            = 0U,

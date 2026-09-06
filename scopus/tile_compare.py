@@ -151,6 +151,16 @@ def tile_run(cam, tiles):
     return int(m.group(1)), dets, out
 
 
+def sweep_cost(out):
+    """Steps walked and milliseconds spent, off the sweep's own report line.
+
+    `detect rotate auto` makes this vary per picture, that is the whole point
+    of it, so a comparison that does not record it cannot say what a setting
+    cost."""
+    m = re.search(r"tile \w+: (\d+) tiles .*?, (\d+) ms", out, re.S)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir", nargs="?",
@@ -165,11 +175,14 @@ def main():
                          "a frame edge (default on, as detect mode tile arms)")
     ap.add_argument("--fullpass", choices=("on", "off"), default="on",
                     help="also run the whole frame as one extra pass")
-    ap.add_argument("--rotate", choices=("off", "full", "all"), default=None,
+    ap.add_argument("--rotate", choices=("off", "full", "auto", "all"),
+                    default=None,
                     help="also read the picture turned 90 deg (ScopusQA #26): "
-                         "off, full (whole frame only, +1 inference) or all "
-                         "(every step both ways, 2x). Default: leave the "
-                         "device as it is")
+                         "off, full (whole frame only, +1 inference), auto "
+                         "(full, plus a turned look at up to 4 tiles holding a "
+                         "wide box, the default on the unit) or all (every "
+                         "step both ways, 2x). Default: leave the device as "
+                         "it is")
     ap.add_argument("--out", default=None, help="where to write the JSON")
     args = ap.parse_args()
 
@@ -218,8 +231,10 @@ def main():
             # ── tile leg ───────────────────────────────────────────────
             ok, detail = tile_upload(cam, img, LIVE_W, LIVE_H)
             if ok:
-                kept, pairs, _ = tile_run(cam, GRID_C * GRID_R)
-                row["tile"] = {"count": kept, "classes": _classes(pairs)}
+                kept, pairs, out = tile_run(cam, GRID_C * GRID_R)
+                steps, ms = sweep_cost(out)
+                row["tile"] = {"count": kept, "classes": _classes(pairs),
+                               "steps": steps, "ms": ms}
             else:
                 row["tile"] = {"error": detail}
             cam.send("tile clear", "tile", 4.0)
@@ -249,6 +264,13 @@ def main():
     # Absolute count error, because the count IS the product: `rsd` in a §4.2
     # notification is what the customer's server acts on. Nineteen people where
     # there are five is not a richer answer, it is a wrong one.
+    steps = [r["tile"]["steps"] for r in rows
+             if isinstance(r.get("tile"), dict) and r["tile"].get("steps")]
+    if steps:
+        print(f"sweep cost: {min(steps)} to {max(steps)} inferences, "
+              f"{sum(steps) / len(steps):.1f} on average over "
+              f"{len(steps)} image(s)")
+
     err = {"default": [], "tile": []}
     print("-" * 80)
     print(f"{'labelled image':38s} {'truth':>8s} {'default':>10s} {'tile':>10s}")

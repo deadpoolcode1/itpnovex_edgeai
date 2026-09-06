@@ -247,6 +247,7 @@ uint32_t nn_task_resume_thread(void)
 static volatile bool    _nn_tile_mode      = false;
 static uint32_t         _nn_tile_idx       = 0U;   /* next tile in the sweep */
 static uint32_t         _nn_tile_n         = 0U;   /* tiles in this sweep    */
+static uint32_t         _nn_tile_steps     = 0U;   /* steps the last one walked */
 static uint32_t         _nn_tile_sweeps    = 0U;   /* completed sweeps       */
 static uint32_t         _nn_tile_ms        = 0U;   /* last sweep, ms         */
 static uint32_t         _nn_tile_t0        = 0U;
@@ -612,6 +613,7 @@ void nn_task_tile_set(bool enable)
   _nn_tile_mode    = enable;
   _nn_tile_idx     = 0U;
   _nn_tile_n       = 0U;
+  _nn_tile_steps   = 0U;
   _nn_tile_pub_n   = 0U;
   _nn_tile_starved = false;
   if (enable)
@@ -629,7 +631,7 @@ void nn_task_tile_stats(uint32_t *sweeps, uint32_t *last_ms, uint32_t *tiles)
 {
   if (sweeps)  *sweeps  = _nn_tile_sweeps;
   if (last_ms) *last_ms = _nn_tile_ms;
-  if (tiles)   *tiles   = _nn_tile_n;
+  if (tiles)   *tiles   = (_nn_tile_steps > 0U) ? _nn_tile_steps : _nn_tile_n;
 }
 void nn_task_action_set(uint8_t mask)  { _nn_action_mask = mask; }
 
@@ -958,7 +960,21 @@ static void _nn_task_run(uint32_t args)
         if (_nn_tile_idx == 0U)
         {
           uint16_t fw = 0U, fh = 0U;
-          uint8_t *full = tile_capture_live(&fw, &fh);
+          bool     lapsed = false;
+
+          /* A picture pushed in with `tile inject` stands in for the lens, so
+           * the sweep, the merge, the count, the debounce and the §4.2
+           * notification all run on pixels a test can hold in a file
+           * (ScopusQA #26). It expires by itself; say so when it does, because
+           * a unit that quietly went back to watching the room after a test
+           * looks exactly like one that never took the test. */
+          uint8_t *full = (uint8_t *)tile_inject_get(&fw, &fh, &lapsed);
+          if (lapsed)
+          {
+            LWARNING(TRACE_NN, "tile inject expired, the sweep is back on the "
+                               "live camera");
+          }
+          if (full == NULL) { full = tile_capture_live(&fw, &fh); }
           if (full == NULL)
           {
             /* Camera not streaming. Say it once per outage, not per frame. */
@@ -1021,6 +1037,12 @@ static void _nn_task_run(uint32_t args)
 
         tile_sweep_collect(_nn_tile_idx, raw, n_raw);
 
+        /* Re-read the length rather than trusting the one tile_sweep_begin()
+         * returned: `detect rotate auto` appends its second looks once the
+         * upright block has said where they are worth taking, so the sweep is
+         * longer at the end than it was at the start. */
+        _nn_tile_n = tile_sweep_steps();
+
         _nn_tile_idx++;
         if (_nn_tile_idx < _nn_tile_n)
         {
@@ -1075,8 +1097,9 @@ static void _nn_task_run(uint32_t args)
         _nn_vehicles_now = vehicles;
         rtos_mutex_acquire(&_nn_task.pp_box_mtx, false);
 
-        _nn_tile_ms = HAL_GetTick() - _nn_tile_t0;
-        _nn_tile_sweeps++;
+        _nn_tile_ms    = HAL_GetTick() - _nn_tile_t0;
+        _nn_tile_steps = _nn_tile_n;   /* latched: the next sweep is already  */
+        _nn_tile_sweeps++;             /* under way by the time anyone asks   */
 
         if (tile_sweep_saturated())
         {
